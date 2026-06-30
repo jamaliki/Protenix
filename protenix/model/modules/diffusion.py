@@ -388,15 +388,6 @@ class DiffusionModule(nn.Module):
             return nullcontext()
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
-    def prepare_transformer_pair_z(
-        self,
-        pair_z: torch.Tensor,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        z_pair = expand_at_dim(pair_z, dim=-4, n=1)
-        z = self.normalize(z_pair.to(dtype=dtype))
-        return permute_final_dims(z, [2, 0, 1]).contiguous()
-
     def f_forward(
         self,
         r_noisy: torch.Tensor,
@@ -412,7 +403,6 @@ class DiffusionModule(nn.Module):
         chunk_size: Optional[int] = None,
         use_conditioning: bool = True,
         enable_efficient_fusion: bool = False,
-        z_pair_transformer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """The raw network to be trained.
         As in EDM equation (7), this is F_theta(c_in * x, c_noise(sigma)).
@@ -545,15 +535,8 @@ class DiffusionModule(nn.Module):
                 self.layernorm_s(s_single)
             )  # [..., N_sample, N_token, c_token]
         if enable_efficient_fusion:
-            if (
-                z_pair_transformer is not None
-                and z_pair_transformer.dtype == transformer_dtype
-                and z_pair_transformer.device == z_pair.device
-            ):
-                z = z_pair_transformer
-            else:
-                z = self.normalize(z_pair.to(dtype=transformer_dtype))
-                z = permute_final_dims(z, [2, 0, 1]).contiguous()
+            z = self.normalize(z_pair.to(dtype=transformer_dtype))
+            z = permute_final_dims(z, [2, 0, 1]).contiguous()
         else:
             z = z_pair.to(dtype=transformer_dtype)
         with self._profile_block("transformer"), torch.profiler.record_function(
@@ -618,7 +601,6 @@ class DiffusionModule(nn.Module):
         chunk_size: Optional[int] = None,
         use_conditioning: bool = True,
         enable_efficient_fusion: bool = False,
-        z_pair_transformer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """One step denoise: x_noisy, noise_level -> x_denoised
 
@@ -676,7 +658,6 @@ class DiffusionModule(nn.Module):
             chunk_size=chunk_size,
             use_conditioning=use_conditioning,
             enable_efficient_fusion=enable_efficient_fusion,
-            z_pair_transformer=z_pair_transformer,
         )
 
         # Rescale updates to positions and combine with input positions
