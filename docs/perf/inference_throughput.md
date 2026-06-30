@@ -889,3 +889,43 @@ Next:
   more precise boundary, such as preserving vendor GEMMs while fusing epilogues,
   or a shape-specific kernel that demonstrates a hotspot win before touching
   the full inference path.
+
+### Round 20 - rejected BF16 confidence head
+
+Status: rejected and reverted
+
+Hypothesis:
+- At `N_sample=320`, confidence scoring is a material part of forward time.
+  The base-model inference config explicitly disables AMP for the confidence
+  head. Allowing the confidence head to run under the outer BF16 autocast might
+  reduce tensor-core and copy/cast cost without skipping confidence outputs.
+
+Change:
+- Added opt-in `PROTENIX_BF16_CONFIDENCE=1`, overriding
+  `configs.skip_amp.confidence_head` only for `run_confidence_head`.
+
+Experiment:
+- Paired one-H100 N160 gate on `gpu-14`, commit `e649b11`, current promoted
+  stack, one warmup 7r6r item and one timed 7r6r item per variant.
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round21_bf16_confidence_gate_n160_20260630_232642`.
+
+Results:
+| run | aggregate samples/sec | forward samples/sec | forward sec | confidence | diffusion | peak allocated MiB | finite coords | delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| BF16 confidence off | 6.081 | 6.144 | 26.041 | 2.721 s | 18.926 s | 9429 | yes | baseline |
+| BF16 confidence on | 5.961 | 6.020 | 26.577 | 3.067 s | 18.952 s | 9405 | yes | -2.0% aggregate |
+
+Interpretation:
+- The candidate made the confidence head slower despite slightly lower peak
+  allocated memory. This is likely a case where the confidence kernels or
+  numerics benefit from the existing FP32 policy.
+
+Decision:
+- Reject and revert. Keep the base confidence head AMP-disabled.
+
+Next:
+- Treat confidence as a semantic/output-level tradeoff, not a dtype free win.
+  Skipping or deferring confidence may be useful for design-only coordinate
+  generation, but it changes the inference product and should not be counted as
+  a default model throughput optimization without an explicit user decision.
