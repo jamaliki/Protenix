@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import os
 import random
 import time
 from typing import Any, Optional
@@ -349,9 +350,17 @@ class Protenix(nn.Module):
         Returns:
             Any: The output of the confidence head.
         """
-        return autocasting_disable_decorator(self.configs.skip_amp.confidence_head)(
-            self.confidence_head
-        )(*args, **kwargs)
+        disable_amp = self.configs.skip_amp.confidence_head
+        if os.getenv("PROTENIX_BF16_CONFIDENCE", "0").lower() not in {
+            "0",
+            "false",
+            "off",
+            "no",
+        }:
+            disable_amp = False
+        return autocasting_disable_decorator(disable_amp)(self.confidence_head)(
+            *args, **kwargs
+        )
 
     def main_inference_loop(
         self,
