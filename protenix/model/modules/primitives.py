@@ -62,6 +62,28 @@ def _try_triton_local_attention(
     )
 
 
+def _try_triton_full_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_bias: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    if os.getenv("PROTENIX_TRITON_FULL_ATTN", "0").lower() in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }:
+        return None
+    try:
+        from protenix.model.modules.full_attention_triton import (
+            triton_full_attention,
+        )
+    except Exception:
+        return None
+    return triton_full_attention(q=q, k=k, v=v, attn_bias=attn_bias)
+
+
 def attention_force_fp32() -> bool:
     return os.getenv("PROTENIX_ATTENTION_FORCE_FP32", "1").lower() not in {
         "0",
@@ -381,6 +403,9 @@ def _attention(
             attn_bias = attn_bias.to(dtype=torch.float32)
 
     if use_efficient_implementation:
+        triton_out = _try_triton_full_attention(q, k, v, attn_bias)
+        if triton_out is not None:
+            return triton_out
         with torch.amp.autocast("cuda", enabled=not force_fp32_attention):
             return _scaled_dot_product_attention(q, k, v, attn_bias)
 
