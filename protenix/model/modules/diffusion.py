@@ -492,7 +492,6 @@ class DiffusionModule(nn.Module):
         blocks_per_ckpt = self.blocks_per_ckpt
         if not torch.is_grad_enabled():
             blocks_per_ckpt = None
-        shared_pair_z = pair_z
         # Conditioning, shared across difference samples
         # Diffusion_conditioning consumes 7-8G when token num is 768,
         # use checkpoint here if blocks_per_ckpt is not None.
@@ -589,13 +588,8 @@ class DiffusionModule(nn.Module):
             )  # [..., N_sample, N_token, c_token]
         precomputed_z_biases = None
         if enable_efficient_fusion and self._cache_transformer_pair_bias_enabled():
-            z_pair_for_cache = (
-                expand_at_dim(shared_pair_z, dim=-4, n=1)
-                if shared_pair_z is not None
-                else z_pair
-            )
             precomputed_z_biases = self._cached_transformer_pair_biases(
-                z_pair_for_cache, transformer_dtype
+                z_pair, transformer_dtype
             )
             z = z_pair
         elif enable_efficient_fusion:
