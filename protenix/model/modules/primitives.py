@@ -33,7 +33,6 @@ from protenix.model.utils import (
 from protenix.model.modules.fused_elementwise_triton import (
     fused_sigmoid_mul,
     fused_sigmoid_mul_add,
-    triton_silu_mul,
 )
 
 
@@ -331,14 +330,10 @@ class Transition(nn.Module):
             for chunk in chunks:
                 y = self.layernorm1(chunk)
                 a = self.linear_no_bias_a(y)
+                a = F.silu(a, True)
                 b = self.linear_no_bias_b(y)
                 del y
-                fused_b = triton_silu_mul(a, b)
-                if fused_b is None:
-                    a = F.silu(a, True)
-                    b *= a
-                else:
-                    b = fused_b
+                b *= a
                 del a
                 b = self.linear_no_bias(b)
                 outputs[start : start + b.shape[0]] = b
