@@ -735,3 +735,111 @@ Next:
   kernel and its projection/bias boundary, remove residual FP32 LayerNorm and
   elementwise traffic where numerically safe, or find GEMM epilogue fusions that
   preserve vendor tensor-core kernels.
+
+### Round 17 - current-best profile after BF16 atom attention
+
+Status: complete
+
+Experiment:
+- Full PyTorch/CUPTI trace of the current promoted stack after Round 16,
+  commit `f3f5405`, one Sandpit Tokyo H100.
+- Shape: `N_sample=160`, `N_step=200`, true unchunked diffusion, full promoted
+  stack including `PROTENIX_BF16_ATOM_ATTENTION=1`.
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round17_profile_bf16_atom_best_20260630_225215`.
+- Note: CUPTI inflated the profiled forward wall time to `464.4 s`; throughput
+  from this run is invalid. Kernel rankings and launch counts are the useful
+  signal.
+
+Top kernel families:
+| family | calls | CUDA time |
+| --- | ---: | ---: |
+| BF16 tensor-core GEMM (`nvjet_sm90_tst_..._TNT`) | 43,200 | 3.49 s |
+| cuDNN flash SDPA | 4,800 | 2.09 s |
+| Triton atom local attention | 1,203 | 1.53 s |
+| BF16 tensor-core GEMM with bias | 24,000 | 1.16 s |
+| fast LayerNorm BF16 | 25,560 | 0.94 s |
+| Triton SiLU-mul | 6,003 | 0.82 s |
+| Triton sigmoid-mul-add | 9,600 | 0.79 s |
+| BF16 elementwise add | 14,602 | 0.72 s |
+| BF16 copy/cast kernel | 61,546 | 0.71 s |
+| fast LayerNorm FP32 | 12,706 | 0.63 s |
+
+Runtime launch/copy families:
+| family | calls | runtime/API time |
+| --- | ---: | ---: |
+| `cudaLaunchKernel` | 404,061 | 4.31 s |
+| `cuLaunchKernelEx` | 142,506 | 3.18 s |
+| `cudaMemsetAsync` | 102,789 | 1.84 s |
+| `cudaMemcpyAsync` | 53,231 | 0.34 s |
+
+Interpretation:
+- BF16 atom attention substantially reduced the local-attention side of the
+  profile. The remaining cost is now spread across tensor-core GEMMs, cuDNN
+  SDPA, local attention, LayerNorm, and residual elementwise/copy traffic.
+- The trace still showed `aten::conv2d`/BF16 GEMM work for trunk pair-bias
+  projection. Because the diffusion pair embedding and block weights are fixed
+  across all denoising steps, a per-block pair-bias cache was a plausible next
+  candidate.
+
+Decision:
+- Use this as the post-Round-16 bottleneck map. Do not replace cuDNN SDPA with
+  a broad Triton attention kernel; that was already slower in Round 13.
+
+### Round 18 - rejected diffusion transformer pair-bias cache
+
+Status: rejected and reverted
+
+Hypothesis:
+- The previous pair-z layout cache only removed normalization/layout work. A
+  more ambitious cache would precompute the 24 block-specific projected trunk
+  pair biases (`[1, n_heads, N_token, N_token]`) once per model forward and
+  reuse them across all 200 denoising steps, removing repeated `conv2d`/GEMM
+  launches without replacing cuDNN SDPA.
+
+Change:
+- Added an opt-in `PROTENIX_CACHE_DIFFUSION_TRANSFORMER_PAIR_BIAS=1` path that
+  threaded precomputed pair biases through `DiffusionTransformerBlock` and
+  `AttentionPairBias`.
+- First implementation keyed the cache after `DiffusionConditioning.forward`.
+  In the real inference path `inplace_safe=True` clones the shared pair tensor,
+  so the cache missed every denoising step. A follow-up keyed the cache on the
+  original shared `pair_z` argument before that clone.
+
+Experiment:
+- Broken-cache gate: one-H100 N160 run on `gpu-8`, commit `650bd90`,
+  run directory
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round18_pair_bias_cache_gate_n160_20260630_231026`.
+  This run was also thermally anomalous (`gpu-8` reported 77-84 C before
+  execution) and both variants were much slower than the current baseline, so
+  it was not used for the decision.
+- Fixed-cache gate: one-H100 N160 run on `gpu-14`, commit `6c8d755`,
+  true unchunked diffusion, current promoted stack, one warmup 7r6r item and
+  one timed 7r6r item per variant.
+- Fixed-cache run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round19_pair_bias_cache_fixed_gate_n160_20260630_231659`.
+
+Results:
+| run | aggregate samples/sec | forward samples/sec | forward sec | diffusion transformer | peak allocated MiB | peak reserved MiB | finite coords | delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| pair-bias cache off | 6.038 | 6.099 | 26.236 | 11.190 s | 9429 | 14198 | yes | baseline |
+| pair-bias cache on | 6.072 | 6.137 | 26.072 | 11.071 s | 9429 | 14278 | yes | +0.6% aggregate |
+
+Interpretation:
+- The fixed cache did engage and moved the intended transformer timer by about
+  `0.12 s`, but the representative workload win was below the promotion
+  threshold and smaller than normal single-run cluster noise.
+- The implementation adds cross-module plumbing and a persistent tensor cache
+  for only a sub-1% N160 gain, with a small reserved-memory increase. At N320
+  the same absolute saved work would be a smaller relative gain because the
+  projected pair bias is broadcast over samples.
+
+Decision:
+- Reject and revert both pair-bias cache commits. Do not carry this default-off
+  complexity.
+
+Next:
+- The remaining credible targets need to move larger measured families: reduce
+  the number of linear/GEMM launches without losing tensor-core efficiency, or
+  target LayerNorm/elementwise/copy traffic inside the diffusion transformer and
+  atom encoder/decoder where a full-block replacement is not required.
