@@ -33,6 +33,15 @@ def str_bool(value: str | bool) -> bool:
     raise argparse.ArgumentTypeError(f"expected boolean, got {value!r}")
 
 
+def optional_int(value: str | int | None) -> int | None:
+    if value is None or isinstance(value, int):
+        return value
+    normalized = value.strip().lower()
+    if normalized in {"none", "null", "-1"}:
+        return None
+    return int(value)
+
+
 def parse_seeds(seed_arg: str, count: int | None) -> list[int]:
     if count is not None:
         base = int(seed_arg.split(",")[0]) if seed_arg else 101
@@ -306,6 +315,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-fusion", type=str_bool, default=True)
     parser.add_argument("--enable-tf32", type=str_bool, default=True)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--chunk-size", type=optional_int, default=None)
+    parser.add_argument("--sample-diffusion-chunk-size", type=optional_int, default=5)
     parser.add_argument("--deterministic", type=str_bool, default=False)
     parser.add_argument("--dump", type=str_bool, default=True)
     parser.add_argument("--empty-cache", type=str_bool, default=True)
@@ -355,6 +366,11 @@ def main() -> None:
     load_sec = time.perf_counter() - load_start
     runner.configs.input_json_path = args.input_json
     runner.configs.num_workers = args.num_workers
+    if args.chunk_size is not None:
+        runner.configs.infer_setting.chunk_size = args.chunk_size
+    runner.configs.infer_setting.sample_diffusion_chunk_size = (
+        args.sample_diffusion_chunk_size
+    )
 
     dataset = InferenceDataset(runner.configs)
     work_items = make_work_items(

@@ -72,6 +72,8 @@ ARGS=(
   --enable-fusion "${ENABLE_FUSION:-true}"
   --enable-tf32 "${ENABLE_TF32:-true}"
   --num-workers "${NUM_WORKERS:-0}"
+  --chunk-size "${CHUNK_SIZE:-none}"
+  --sample-diffusion-chunk-size "${SAMPLE_DIFFUSION_CHUNK_SIZE:-5}"
   --dump "${DUMP_OUTPUTS:-true}"
   --torch-profile "${TORCH_PROFILE:-false}"
 )
