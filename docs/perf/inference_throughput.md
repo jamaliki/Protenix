@@ -362,6 +362,10 @@ Rejected screen:
 - `torch.compile` on a single trunk block gave only `2.735 -> 2.664 ms`
   (`1.027x`) and hit graph breaks on the custom fast-LayerNorm extension.
   This is too small and brittle to promote.
+- A stride-aware attention-gate Triton variant for the non-contiguous SDPA
+  output did not earn its complexity: the fused hotspot stayed effectively
+  unchanged (`2.395 -> 2.395 ms` at N160 and `4.512 -> 4.503 ms` at N320).
+  It was reverted.
 
 Hotspot screen:
 | shape | baseline block | fused block | speedup | notes |
@@ -396,7 +400,7 @@ Next:
 - The remaining trunk time is dominated by tensor-core GEMMs and cuDNN SDPA.
   Replacing these with a broad hand-written "mega-kernel" is unlikely to win
   unless it preserves tensor-core efficiency and removes enough memory traffic.
-- The next credible kernel target is a stride-aware attention gate fusion that
-  handles the non-contiguous SDPA output without adding a `contiguous()` copy,
-  or a more ambitious fused transition epilogue that combines GEMM outputs with
-  SiLU/mul/output gating without replacing the GEMMs themselves.
+- The next credible kernel target is a more ambitious fused transition epilogue
+  that combines GEMM outputs with SiLU/mul/output gating without replacing the
+  GEMMs themselves, or a true GEMM-epilogue integration rather than another
+  standalone elementwise launch.
