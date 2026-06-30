@@ -70,6 +70,26 @@ def _can_use_triton(*tensors: torch.Tensor) -> bool:
     return tensors[0].numel() > 0
 
 
+def _can_use_triton_strided_y(x: torch.Tensor, y: torch.Tensor) -> bool:
+    if not triton_fused_elementwise_enabled():
+        return False
+    if not triton_fused_elementwise_available():
+        return False
+    if torch.is_grad_enabled():
+        return False
+    if x.shape != y.shape:
+        return False
+    if x.dtype != y.dtype or x.dtype not in _SUPPORTED_DTYPES:
+        return False
+    if not x.is_cuda or not y.is_cuda:
+        return False
+    if x.ndim != 4:
+        return False
+    if not x.is_contiguous():
+        return False
+    return y.numel() > 0
+
+
 if triton_fused_elementwise_available():
 
     @triton.jit
@@ -85,6 +105,42 @@ if triton_fused_elementwise_available():
         mask = offsets < n_elements
         x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        out = (1.0 / (1.0 + tl.exp(-x))) * y
+        tl.store(out_ptr + offsets, out, mask=mask)
+
+    @triton.jit
+    def _sigmoid_mul_4d_strided_y_kernel(
+        x_ptr,
+        y_ptr,
+        out_ptr,
+        dim0: tl.constexpr,
+        dim1: tl.constexpr,
+        dim2: tl.constexpr,
+        dim3: tl.constexpr,
+        y_stride0: tl.constexpr,
+        y_stride1: tl.constexpr,
+        y_stride2: tl.constexpr,
+        y_stride3: tl.constexpr,
+        n_elements: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = pid * block_size + tl.arange(0, block_size)
+        mask = offsets < n_elements
+        d3 = offsets % dim3
+        t = offsets // dim3
+        d2 = t % dim2
+        t = t // dim2
+        d1 = t % dim1
+        d0 = t // dim1
+        y_offsets = (
+            d0 * y_stride0
+            + d1 * y_stride1
+            + d2 * y_stride2
+            + d3 * y_stride3
+        )
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        y = tl.load(y_ptr + y_offsets, mask=mask, other=0.0).to(tl.float32)
         out = (1.0 / (1.0 + tl.exp(-x))) * y
         tl.store(out_ptr + offsets, out, mask=mask)
 
@@ -128,11 +184,30 @@ def _grid(n_elements: int) -> tuple[int]:
 
 
 def triton_sigmoid_mul(x: torch.Tensor, y: torch.Tensor) -> Optional[torch.Tensor]:
-    if not _can_use_triton(x, y):
+    if _can_use_triton(x, y):
+        out = torch.empty_like(y)
+        _sigmoid_mul_kernel[_grid(y.numel())](
+            x, y, out, y.numel(), block_size=_BLOCK_SIZE, num_warps=4
+        )
+        return out
+    if not _can_use_triton_strided_y(x, y):
         return None
-    out = torch.empty_like(y)
-    _sigmoid_mul_kernel[_grid(y.numel())](
-        x, y, out, y.numel(), block_size=_BLOCK_SIZE, num_warps=4
+    out = torch.empty_like(y, memory_format=torch.contiguous_format)
+    _sigmoid_mul_4d_strided_y_kernel[_grid(y.numel())](
+        x,
+        y,
+        out,
+        y.shape[0],
+        y.shape[1],
+        y.shape[2],
+        y.shape[3],
+        y.stride(0),
+        y.stride(1),
+        y.stride(2),
+        y.stride(3),
+        y.numel(),
+        block_size=_BLOCK_SIZE,
+        num_warps=4,
     )
     return out
 
