@@ -49,6 +49,12 @@ def parse_seeds(seed_arg: str, count: int | None) -> list[int]:
     return [int(seed.strip()) for seed in seed_arg.split(",") if seed.strip()]
 
 
+def parse_input_indices(indices_arg: str) -> list[int] | None:
+    if not indices_arg.strip():
+        return None
+    return [int(index.strip()) for index in indices_arg.split(",") if index.strip()]
+
+
 def default_model_params(model_name: str) -> tuple[int, int]:
     if model_name in {
         "protenix_base_default_v0.5.0",
@@ -211,11 +217,15 @@ def run_one(
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     row["forward_sec"] = time.perf_counter() - forward_start
+    row["model_log"] = getattr(runner, "last_log_dict", {})
     row.update(cuda_memory())
 
     n_prediction_samples = prediction_sample_count(prediction, args.n_sample)
     row["prediction_samples"] = n_prediction_samples
     row["forward_samples_per_sec"] = n_prediction_samples / row["forward_sec"]
+    coordinate = prediction.get("coordinate")
+    if isinstance(coordinate, torch.Tensor):
+        row["coordinate_all_finite"] = bool(torch.isfinite(coordinate).all().item())
 
     dump_start = time.perf_counter()
     if dump:
@@ -293,6 +303,11 @@ def aggregate_metrics(out_dir: Path) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-json", required=True)
+    parser.add_argument(
+        "--input-indices",
+        default="",
+        help="Comma-separated input indices from --input-json to benchmark; default is all.",
+    )
     parser.add_argument("--dump-dir", required=True)
     parser.add_argument("--model-name", default="protenix_base_default_v1.0.0")
     parser.add_argument("--seeds", default="101")
@@ -373,6 +388,15 @@ def main() -> None:
     )
 
     dataset = InferenceDataset(runner.configs)
+    selected_indices = parse_input_indices(args.input_indices)
+    if selected_indices is not None:
+        n_available = len(dataset.inputs)
+        if any(index < 0 or index >= n_available for index in selected_indices):
+            raise ValueError(
+                f"--input-indices {selected_indices} out of range for "
+                f"{n_available} inputs"
+            )
+        dataset.inputs = [dataset.inputs[index] for index in selected_indices]
     work_items = make_work_items(
         n_inputs=len(dataset.inputs),
         seeds=seeds,

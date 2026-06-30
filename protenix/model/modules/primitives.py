@@ -13,12 +13,14 @@
 # limitations under the License.
 
 import math
+import os
 from functools import partial
 from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from protenix.model.triangular.layers import LayerNorm, trunc_normal_init_
 from protenix.model.utils import (
@@ -28,6 +30,87 @@ from protenix.model.utils import (
     pad_at_dim,
     reshape_at_dim,
 )
+
+
+def attention_force_fp32() -> bool:
+    return os.getenv("PROTENIX_ATTENTION_FORCE_FP32", "1").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
+_NON_CUDNN_SDPA_BACKENDS = [
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
+_CUDNN_SDPA_FAILED_SIGNATURES: set[tuple] = set()
+
+
+def _sdpa_signature(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_bias: Optional[torch.Tensor],
+) -> tuple:
+    return (
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        None if attn_bias is None else tuple(attn_bias.shape),
+        q.dtype,
+        k.dtype,
+        v.dtype,
+        None if attn_bias is None else attn_bias.dtype,
+        q.device.type,
+        q.device.index,
+    )
+
+
+def _sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    return F.scaled_dot_product_attention(
+        query=q,
+        key=k,
+        value=v,
+        attn_mask=attn_bias,
+        scale=1.0,
+    )
+
+
+def _sdpa_without_cudnn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    with sdpa_kernel(_NON_CUDNN_SDPA_BACKENDS):
+        return _sdpa(q, k, v, attn_bias)
+
+
+def _scaled_dot_product_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    signature = _sdpa_signature(q, k, v, attn_bias)
+    if signature in _CUDNN_SDPA_FAILED_SIGNATURES:
+        return _sdpa_without_cudnn(q, k, v, attn_bias)
+
+    try:
+        return _sdpa(q, k, v, attn_bias)
+    except RuntimeError as exc:
+        if q.is_cuda and "cudnn" in str(exc).lower():
+            _CUDNN_SDPA_FAILED_SIGNATURES.add(signature)
+            return _sdpa_without_cudnn(q, k, v, attn_bias)
+        raise
 
 
 class Linear(nn.Linear):
@@ -252,22 +335,24 @@ def _attention(
     """
     assert k.shape == v.shape
 
-    # Upcast to compute attn_weights
     input_dtype = q.dtype
-    q = q.to(dtype=torch.float32)
-    k = k.to(dtype=torch.float32)
-    if attn_bias is not None:
-        attn_bias = attn_bias.to(dtype=torch.float32)
+    # Local atom attention has small 32x128 windows. On H100/cuDNN this path is
+    # faster and more reliable in FP32, while full token attention benefits from
+    # BF16 when PROTENIX_ATTENTION_FORCE_FP32=0.
+    force_fp32_attention = (
+        attention_force_fp32() or q.dim() >= 5 or q.shape[-2] != k.shape[-2]
+    )
+    if force_fp32_attention:
+        # Upcast to compute attn_weights
+        q = q.to(dtype=torch.float32)
+        k = k.to(dtype=torch.float32)
+        v = v.to(dtype=torch.float32)
+        if attn_bias is not None:
+            attn_bias = attn_bias.to(dtype=torch.float32)
 
     if use_efficient_implementation:
-        attn_output = F.scaled_dot_product_attention(
-            query=q,
-            key=k,
-            value=v,
-            attn_mask=attn_bias,
-            scale=1.0,
-        )
-        return attn_output
+        with torch.amp.autocast("cuda", enabled=not force_fp32_attention):
+            return _scaled_dot_product_attention(q, k, v, attn_bias)
 
     with torch.amp.autocast("cuda", enabled=False):
         # [..., n_kv, d] -> [..., d, n_kv]

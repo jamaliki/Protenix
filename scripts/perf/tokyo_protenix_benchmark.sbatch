@@ -54,6 +54,7 @@ nvidia-smi
 
 ARGS=(
   --input-json "${INPUT_JSON:-examples/example.json}"
+  --input-indices "${INPUT_INDICES:-}"
   --dump-dir "$RUN_DIR"
   --model-name "${MODEL_NAME:-protenix_base_default_v1.0.0}"
   --seeds "${SEEDS:-101}"

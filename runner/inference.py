@@ -225,13 +225,14 @@ class InferenceRunner(object):
 
         data = to_device(data, self.device)
         with enable_amp:
-            prediction, _, _ = self.model(
+            prediction, _, log_dict = self.model(
                 input_feature_dict=data["input_feature_dict"],
                 label_full_dict=None,
                 label_dict=None,
                 mode="inference",
                 mc_dropout_apply_rate=self.configs.mc_dropout_apply_rate,
             )
+        self.last_log_dict = log_dict
 
         return prediction
 

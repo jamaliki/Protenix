@@ -107,3 +107,123 @@ Next:
 - If that improves per-GPU throughput, add an H100-oriented auto-chunk policy.
 - Profile the best per-GPU setting with a smaller trace window, then evaluate
   CUDA graph capture for the fixed-shape denoising loop.
+
+### Round 01 - unchunk diffusion for high-throughput inference
+
+Status: promoted as an opt-in throughput setting
+
+Hypothesis:
+- For protein-design throughput, large `N_sample` batches should run through the
+  diffusion denoiser as one chunk on H100 instead of Protenix's default chunks
+  of 5 samples.
+
+Results:
+| run | aggregate samples/sec | forward samples/sec | peak allocated MiB | speedup vs default |
+| --- | ---: | ---: | ---: | ---: |
+| default `N_sample=5`, chunk 5 | 0.528 | 0.544 | 2414 | 1.00x |
+| `N_sample=80`, chunk `None` | 2.436 | 2.457 | 5487 | 4.61x |
+
+Decision:
+- Keep the harness support for `sample_diffusion_chunk_size=None`. This is the
+  largest clean per-GPU win so far and does not change model math.
+
+### Round 02 - diffusion hotspot timing
+
+Status: complete
+
+Experiment:
+- Added CUDA-event timing inside `DiffusionModule`, exported through the
+  inference harness as `model_log.time.*`.
+- Representative screen: `N_step=20`, `N_sample=80`, unchunked, 7r6r, one H100.
+
+Results:
+| component | time at N20/N80 |
+| --- | ---: |
+| pairformer | ~2.6 s |
+| diffusion total | ~2.0-2.8 s depending dtype policy |
+| confidence | ~1.3 s |
+| diffusion atom encoder | ~0.7-1.1 s |
+| diffusion transformer | ~0.7-1.1 s |
+| diffusion atom decoder | ~0.56-0.95 s |
+| conditioning/input/output rescale | negligible |
+
+Interpretation:
+- At high `N_sample`, launch overhead is not the dominant remaining issue.
+  The diffusion loop is dominated by atom local attention plus the token
+  diffusion transformer.
+- Whole-model mega-kernels are not the right next unit. The right unit is
+  local atom attention and its bias/projection path, plus dtype/backend policy
+  for token attention.
+
+### Round 03 - rejected broad fusions and CUDA graphs
+
+Status: rejected
+
+Results:
+| candidate | result | decision |
+| --- | ---: | --- |
+| Attention q/k/v/g projection concat fusion | full N200/N80 forward ~33.04 s | rejected; slower than unchunked baseline |
+| Transition a1/a2 projection concat fusion | full N200/N80 forward ~32.89 s | rejected; slower than unchunked baseline |
+| CUDA graph replay for denoiser | full N200/N80 forward ~36.35 s | rejected; slower, likely memory/copy and graph-management overhead |
+| BF16 atom attention | finite but atom encoder/decoder slower | rejected |
+| Atom-conditioning cache | N20/N80 forward 7.043 -> 7.002 s | rejected alone; too small for persistent-cache complexity |
+
+Decision:
+- Do not carry these experimental paths in the branch. They were removed after
+  measurement.
+
+### Round 04 - GPU augmentation and diffusion transformer BF16
+
+Status: partially promoted behind explicit environment flags
+
+Hypothesis:
+- The SciPy/CPU random rotation path inside every diffusion step is avoidable
+  for inference.
+- The token diffusion transformer can use BF16 arithmetic on H100, while atom
+  local attention should stay FP32 unless a dedicated kernel replaces it.
+
+Change:
+- `PROTENIX_GPU_RANDOM_AUGMENT=1`: generate random rotations/translations on GPU
+  for inference calls with no mask and no gradients.
+- `PROTENIX_BF16_DIFFUSION_CORE=1`: run the token diffusion transformer under
+  BF16 autocast and cast back to FP32 before the atom decoder.
+- `PROTENIX_ATTENTION_FORCE_FP32=0`: allow full token attention to stay BF16,
+  but the implementation now forces local atom-attention shapes back to FP32.
+- Added shape-specific SDPA fallback for cuDNN "no valid execution plan"
+  failures; only the failing signature is routed to non-cuDNN SDPA backends.
+
+Results:
+| run | aggregate samples/sec | forward samples/sec | forward sec | peak allocated MiB | speedup vs default |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| default `N_sample=5`, chunk 5 | 0.528 | 0.544 | 9.198 for 5 samples | 2414 | 1.00x |
+| `N_sample=80`, unchunked | 2.436 | 2.457 | 32.55 | 5487 | 4.61x |
+| GPU aug + BF16 transformer, `N_sample=80` | 3.247 | 3.282 | 24.37 | 5865 | 6.15x |
+| GPU aug + split attention policy, `N_sample=160` | 3.397 | 3.417 | 46.83 | 9425 | 6.43x |
+
+Guardrails:
+- Timed `N20/N80` split-policy smoke: finite coordinates, 6.873 s forward,
+  diffusion 2.041 s, pairformer 2.581 s, confidence 1.344 s.
+- Full `N200/N160` split-policy gate: finite coordinates, 47.09 s end-to-end
+  for the timed item, 9.4 GiB peak allocated.
+
+Rejected dtype/backend variants:
+| candidate | result | decision |
+| --- | ---: | --- |
+| unguarded BF16 SDPA everywhere | crashes for `N20/N80` with cuDNN no-plan | rejected |
+| global sticky non-cuDNN SDPA fallback | `N200/N160` 3.25 samples/sec | rejected; slows valid token-attention shapes |
+| always-FP32 q/k/v attention inside BF16 core | `N200/N160` 3.01 samples/sec | rejected; robust but too slow |
+| BF16/fallback for atom local attention | atom encoder+decoder N20/N80 2.05 s vs 1.29 s split policy | rejected |
+
+Decision:
+- Promote the robust split policy as the current branch candidate, but it is
+  still short of the 10x target. Current best robust per-GPU speedup is ~6.4x.
+- The earlier unsafe `N160` screen reached 3.655 samples/sec, but it is not
+  acceptable as a default because smaller `N20/N80` shapes can crash in cuDNN
+  SDPA.
+
+Next:
+- The remaining meat is atom local attention. A credible next attempt is a
+  dedicated Triton/CUDA local attention kernel for the fixed `n_queries=32`,
+  `n_keys=128`, `n_heads=4`, `c_atom=128` atom transformer path, including pair
+  bias. A whole-block mega-kernel is too broad; the right fusion boundary is
+  local q/k/v projection + bias application + SDPA for the 32x128 windows.

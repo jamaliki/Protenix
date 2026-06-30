@@ -559,6 +559,8 @@ class Protenix(nn.Module):
         else:
             cache["pair_z"] = None
             cache["p_lm/c_l"] = [None, None]
+        if hasattr(self.diffusion_module, "reset_perf_stats"):
+            self.diffusion_module.reset_perf_stats()
         pred_dict["coordinate"] = self.sample_diffusion(
             denoise_net=self.diffusion_module,
             input_feature_dict=input_feature_dict,
@@ -576,6 +578,8 @@ class Protenix(nn.Module):
 
         step_diffusion = time.time()
         time_tracker.update({"diffusion": step_diffusion - step_trunk})
+        if hasattr(self.diffusion_module, "consume_perf_stats"):
+            time_tracker.update(self.diffusion_module.consume_perf_stats())
         # Distogram logits: log contact_probs only, to reduce the dimension
         pred_dict["contact_probs"] = autocasting_disable_decorator(True)(
             sample_confidence.compute_contact_prob
