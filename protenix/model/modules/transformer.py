@@ -28,6 +28,10 @@ from protenix.model.modules.primitives import (
     LinearNoBias,
     rearrange_qk_to_dense_trunk,
 )
+from protenix.model.modules.fused_elementwise_triton import (
+    fused_sigmoid_mul,
+    fused_silu_mul,
+)
 from protenix.model.triangular.layers import LayerNorm
 from protenix.model.utils import (
     aggregate_atom_to_token,
@@ -588,9 +592,9 @@ class ConditionedTransitionBlock(nn.Module):
                 [..., N, c_a]
         """
         a = self.adaln(a, s)
-        b = F.silu((self.linear_nobias_a1(a))) * self.linear_nobias_a2(a)
+        b = fused_silu_mul(self.linear_nobias_a1(a), self.linear_nobias_a2(a))
         # Output projection (from adaLN-Zero [27])
-        a = torch.sigmoid(self.linear_s(s)) * self.linear_nobias_b(b)
+        a = fused_sigmoid_mul(self.linear_s(s), self.linear_nobias_b(b))
         return a
 
 

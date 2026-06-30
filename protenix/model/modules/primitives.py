@@ -30,6 +30,10 @@ from protenix.model.utils import (
     pad_at_dim,
     reshape_at_dim,
 )
+from protenix.model.modules.fused_elementwise_triton import (
+    fused_sigmoid_mul,
+    fused_sigmoid_mul_add,
+)
 
 
 def _try_triton_local_attention(
@@ -242,7 +246,7 @@ class AdaptiveLayerNorm(nn.Module):
         """
         a = self.layernorm_a(a)
         s = self.layernorm_s(s)
-        a = torch.sigmoid(self.linear_s(s)) * a + self.linear_nobias_s(s)
+        a = fused_sigmoid_mul_add(self.linear_s(s), a, self.linear_nobias_s(s))
         return a
 
 
@@ -888,11 +892,11 @@ class Attention(nn.Module):
             torch.Tensor: the output of attention
         """
         if self.linear_g is not None:
-            g = self.sigmoid(self.linear_g(q_x))
+            g = self.linear_g(q_x)
 
             # [*, G/Q, H, C_hidden]
             g = g.view(g.shape[:-1] + (self.num_heads, -1))
-            o = o * g
+            o = fused_sigmoid_mul(g, o)
 
         # [*, Q, H * C_hidden]
         o = flatten_final_dims(o, num_dims=2)
