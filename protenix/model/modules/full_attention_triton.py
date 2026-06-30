@@ -147,6 +147,7 @@ if triton_full_attention_available():
                 mask=n_mask[:, None] & d_mask[None, :],
                 other=0.0,
             )
+            v = v.to(tl.float32)
             acc = acc * old_scale[:, None] + tl.dot(
                 probs, v, input_precision=dot_input_precision
             )
