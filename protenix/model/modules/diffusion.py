@@ -388,6 +388,15 @@ class DiffusionModule(nn.Module):
             return nullcontext()
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
+    def _atom_attention_autocast(self):
+        if (
+            os.getenv("PROTENIX_BF16_ATOM_ATTENTION", "0").lower()
+            in {"0", "false", "off", "no"}
+            or not torch.cuda.is_available()
+        ):
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
     def f_forward(
         self,
         r_noisy: torch.Tensor,
@@ -481,47 +490,48 @@ class DiffusionModule(nn.Module):
         with self._profile_block("atom_encoder"), torch.profiler.record_function(
             "protenix/atom_attention_encoder"
         ):
-            if blocks_per_ckpt and self.use_fine_grained_checkpoint:
-                checkpoint_fn = get_checkpoint_fn()
-                a_token, q_skip, c_skip, p_skip = checkpoint_fn(
-                    self.atom_attention_encoder,
-                    input_feature_dict["atom_to_token_idx"],
-                    input_feature_dict["ref_pos"],
-                    input_feature_dict["ref_charge"],
-                    input_feature_dict["ref_mask"],
-                    input_feature_dict["ref_atom_name_chars"],
-                    input_feature_dict["ref_element"],
-                    input_feature_dict["d_lm"],
-                    input_feature_dict["v_lm"],
-                    input_feature_dict["pad_info"],
-                    r_noisy,
-                    s_trunk,
-                    z_pair,
-                    p_lm,
-                    c_l,
-                    inplace_safe,
-                    chunk_size,
-                )
-            else:
-                # Sequence-local Atom Attention and aggregation to coarse-grained tokens
-                a_token, q_skip, c_skip, p_skip = self.atom_attention_encoder(
-                    input_feature_dict["atom_to_token_idx"],
-                    input_feature_dict["ref_pos"],
-                    input_feature_dict["ref_charge"],
-                    input_feature_dict["ref_mask"],
-                    input_feature_dict["ref_atom_name_chars"],
-                    input_feature_dict["ref_element"],
-                    input_feature_dict["d_lm"],
-                    input_feature_dict["v_lm"],
-                    input_feature_dict["pad_info"],
-                    r_l=r_noisy,
-                    s=s_trunk,
-                    z=z_pair,
-                    p_lm=p_lm,
-                    c_l=c_l,
-                    inplace_safe=inplace_safe,
-                    chunk_size=chunk_size,
-                )
+            with self._atom_attention_autocast():
+                if blocks_per_ckpt and self.use_fine_grained_checkpoint:
+                    checkpoint_fn = get_checkpoint_fn()
+                    a_token, q_skip, c_skip, p_skip = checkpoint_fn(
+                        self.atom_attention_encoder,
+                        input_feature_dict["atom_to_token_idx"],
+                        input_feature_dict["ref_pos"],
+                        input_feature_dict["ref_charge"],
+                        input_feature_dict["ref_mask"],
+                        input_feature_dict["ref_atom_name_chars"],
+                        input_feature_dict["ref_element"],
+                        input_feature_dict["d_lm"],
+                        input_feature_dict["v_lm"],
+                        input_feature_dict["pad_info"],
+                        r_noisy,
+                        s_trunk,
+                        z_pair,
+                        p_lm,
+                        c_l,
+                        inplace_safe,
+                        chunk_size,
+                    )
+                else:
+                    # Sequence-local Atom Attention and aggregation to coarse-grained tokens
+                    a_token, q_skip, c_skip, p_skip = self.atom_attention_encoder(
+                        input_feature_dict["atom_to_token_idx"],
+                        input_feature_dict["ref_pos"],
+                        input_feature_dict["ref_charge"],
+                        input_feature_dict["ref_mask"],
+                        input_feature_dict["ref_atom_name_chars"],
+                        input_feature_dict["ref_element"],
+                        input_feature_dict["d_lm"],
+                        input_feature_dict["v_lm"],
+                        input_feature_dict["pad_info"],
+                        r_l=r_noisy,
+                        s=s_trunk,
+                        z=z_pair,
+                        p_lm=p_lm,
+                        c_l=c_l,
+                        inplace_safe=inplace_safe,
+                        chunk_size=chunk_size,
+                    )
         transformer_dtype = self._diffusion_core_dtype(a_token.dtype)
         a_token = a_token.to(dtype=transformer_dtype)
 
@@ -560,29 +570,30 @@ class DiffusionModule(nn.Module):
         with self._profile_block("atom_decoder"), torch.profiler.record_function(
             "protenix/atom_attention_decoder"
         ):
-            if blocks_per_ckpt and self.use_fine_grained_checkpoint:
-                checkpoint_fn = get_checkpoint_fn()
-                r_update = checkpoint_fn(
-                    self.atom_attention_decoder,
-                    input_feature_dict["atom_to_token_idx"],
-                    a_token,
-                    q_skip,
-                    c_skip,
-                    p_skip,
-                    inplace_safe,
-                    chunk_size,
-                )
-            else:
-                # Broadcast token activations to atoms and run Sequence-local Atom Attention
-                r_update = self.atom_attention_decoder(
-                    atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
-                    a=a_token,
-                    q_skip=q_skip,
-                    c_skip=c_skip,
-                    p_skip=p_skip,
-                    inplace_safe=inplace_safe,
-                    chunk_size=chunk_size,
-                )
+            with self._atom_attention_autocast():
+                if blocks_per_ckpt and self.use_fine_grained_checkpoint:
+                    checkpoint_fn = get_checkpoint_fn()
+                    r_update = checkpoint_fn(
+                        self.atom_attention_decoder,
+                        input_feature_dict["atom_to_token_idx"],
+                        a_token,
+                        q_skip,
+                        c_skip,
+                        p_skip,
+                        inplace_safe,
+                        chunk_size,
+                    )
+                else:
+                    # Broadcast token activations to atoms and run Sequence-local Atom Attention
+                    r_update = self.atom_attention_decoder(
+                        atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+                        a=a_token,
+                        q_skip=q_skip,
+                        c_skip=c_skip,
+                        p_skip=p_skip,
+                        inplace_safe=inplace_safe,
+                        chunk_size=chunk_size,
+                    )
 
         return r_update
 
