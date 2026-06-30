@@ -303,3 +303,100 @@ Next:
   bias on the fly.
 - Promote only if it moves real `diffusion_transformer`, pairformer, or
   confidence timings in the full inference gate.
+
+### Round 10 - trunk block launch diagnosis and gated elementwise fusion
+
+Status: promoted behind an explicit environment flag
+
+Hypothesis:
+- The next large measured component after atom local attention is the
+  diffusion token transformer. A fused pair-bias/attention "mega-kernel" would
+  only be worthwhile if pair-bias materialization is material in the real
+  layout. If the real bottleneck is instead many elementwise gates around
+  cuDNN SDPA and GEMMs, narrower forward-only Triton elementwise fusion should
+  move the trunk without replacing high-quality tensor-core kernels.
+
+Diagnostics:
+- Real model shape is 24 trunk blocks, 16 heads, `c_token=768`, `c_s=384`,
+  `c_z=128`, head dim 48, token count 245 for 7r6r.
+- `z_pair` is expanded with a singleton sample dimension and broadcast across
+  `N_sample`; the efficient path receives `z` as `[1, 128, 245, 245]`, not
+  `[N_sample, 128, 245, 245]`.
+- Faithful trunk hotspot at `N_sample=160`, BF16 token attention:
+  - full block: `2.74 ms`
+  - attention-pair-bias half: `1.34 ms`
+  - conditioned transition: `1.12 ms`
+  - pair-bias projection: only `0.03 ms`
+- Therefore fusing pair-bias projection into SDPA is not the next meat for this
+  benchmark; it would target well under 2% of trunk block time.
+
+Top CUDA launch families in one full trunk block (`N_sample=160`, `z_samples=1`):
+| family | launches | CUDA time |
+| --- | ---: | ---: |
+| BF16 tensor-core GEMM kernels (`nvjet_sm90_tst_..._TNT`) | 9 | 0.721 ms |
+| cuDNN flash SDPA | 1 | 0.432 ms |
+| BF16 vectorized multiply kernels | 6 | 0.427 ms |
+| BF16 vectorized add kernels | 4 | 0.244 ms |
+| BF16 tensor-core GEMM kernels with bias | 5 | 0.241 ms |
+| BF16 sigmoid kernels | 5 | 0.210 ms |
+| fast LayerNorm kernels | 4 | 0.155 ms |
+| BF16 SiLU kernel | 1 | 0.082 ms |
+
+Runtime launch profile for the same block:
+- 60 CUDA kernel launches total.
+- `cudaLaunchKernel`: 44 calls, `0.270 ms` runtime API time.
+- `cuLaunchKernelEx`: 15 calls, `0.074 ms` runtime API time.
+- `cudaMemsetAsync`: 15 calls, `0.069 ms` runtime API time.
+
+Change:
+- Added `PROTENIX_TRITON_FUSED_ELEMENTWISE=1`, a guarded inference-only Triton
+  path for repeated contiguous elementwise gates:
+  - `sigmoid(x) * y + z` in `AdaptiveLayerNorm`
+  - `sigmoid(x) * y` in attention/output gating
+  - `silu(x) * y` in `ConditionedTransitionBlock`
+- The path falls back automatically when Triton is unavailable, gradients are
+  enabled, tensors are non-CUDA, dtypes differ, shapes differ, or tensors are
+  non-contiguous.
+
+Rejected screen:
+- `torch.compile` on a single trunk block gave only `2.735 -> 2.664 ms`
+  (`1.027x`) and hit graph breaks on the custom fast-LayerNorm extension.
+  This is too small and brittle to promote.
+
+Hotspot screen:
+| shape | baseline block | fused block | speedup | notes |
+| --- | ---: | ---: | ---: | --- |
+| `N_sample=160`, `z_samples=1` | 2.728 ms | 2.395 ms | 1.14x | transition 1.118 -> 0.902 ms |
+| `N_sample=320`, `z_samples=1` | 5.154 ms | 4.512 ms | 1.14x | transition 2.119 -> 1.735 ms |
+
+Numerical check:
+- Same-weight trunk block comparison at `N_sample=160`:
+  - finite outputs for both paths
+  - max abs diff `0.03125`
+  - mean abs diff `8.5e-5`
+  - sampled p99 abs diff `0.00390625`
+  - high max relative differences are only near zero-valued references.
+
+Representative full inference gates:
+| run | aggregate samples/sec | forward samples/sec | forward sec | diffusion transformer | peak allocated MiB | delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| N160, fused off | 5.016 | 5.056 | 31.64 | 12.83 s | 9425 | baseline |
+| N160, fused on | 5.370 | 5.418 | 29.53 | 11.15 s | 9425 | +7.1% aggregate |
+| N320, fused off | 5.352 | 5.376 | 59.52 | 24.77 s | 16545 | baseline |
+| N320, fused on | 5.707 | 5.734 | 55.81 | 21.56 s | 16545 | +6.6% aggregate |
+
+Decision:
+- Promote the guarded elementwise fusion flag. It moves the measured
+  diffusion-transformer component in the real workload and raises the best
+  per-GPU 7r6r throughput from `5.347` to `5.707` aggregate samples/sec.
+- The campaign is now `10.81x` over the original default aggregate baseline
+  (`5.707 / 0.528`) on one H100, without using extra GPUs.
+
+Next:
+- The remaining trunk time is dominated by tensor-core GEMMs and cuDNN SDPA.
+  Replacing these with a broad hand-written "mega-kernel" is unlikely to win
+  unless it preserves tensor-core efficiency and removes enough memory traffic.
+- The next credible kernel target is a stride-aware attention gate fusion that
+  handles the non-contiguous SDPA output without adding a `contiguous()` copy,
+  or a more ambitious fused transition epilogue that combines GEMM outputs with
+  SiLU/mul/output gating without replacing the GEMMs themselves.
