@@ -72,15 +72,6 @@ def attention_force_fp32() -> bool:
     }
 
 
-def triton_fused_transition_enabled() -> bool:
-    return os.getenv("PROTENIX_TRITON_FUSED_TRANSITION", "0").lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
-
-
 _NON_CUDNN_SDPA_BACKENDS = [
     SDPBackend.FLASH_ATTENTION,
     SDPBackend.EFFICIENT_ATTENTION,
@@ -342,11 +333,7 @@ class Transition(nn.Module):
                 a = self.linear_no_bias_a(y)
                 b = self.linear_no_bias_b(y)
                 del y
-                fused_b = (
-                    triton_silu_mul(a, b)
-                    if triton_fused_transition_enabled()
-                    else None
-                )
+                fused_b = triton_silu_mul(a, b)
                 if fused_b is None:
                     a = F.silu(a, True)
                     b *= a
