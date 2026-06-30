@@ -167,6 +167,7 @@ class AttentionPairBias(nn.Module):
         z: torch.Tensor,
         inplace_safe: bool = False,
         enable_efficient_fusion: bool = False,
+        precomputed_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Used by Algorithm 7/20
 
@@ -185,12 +186,10 @@ class AttentionPairBias(nn.Module):
                 [..., N_token, c_a]
         """
 
-        # Multi-head attention bias
-        if enable_efficient_fusion:
-            weight = (self.linear_nobias_z.weight * self.layernorm_z.weight[None, :])[
-                :, :, None, None
-            ]
-            bias = F.conv2d(z, weight)
+        if precomputed_bias is not None:
+            bias = precomputed_bias
+        elif enable_efficient_fusion:
+            bias = self.project_z_bias_efficient(z)
         else:
             bias = self.linear_nobias_z(self.layernorm_z(z))
             bias = permute_final_dims(
@@ -202,6 +201,12 @@ class AttentionPairBias(nn.Module):
 
         return q
 
+    def project_z_bias_efficient(self, z: torch.Tensor) -> torch.Tensor:
+        weight = (self.linear_nobias_z.weight * self.layernorm_z.weight[None, :])[
+            :, :, None, None
+        ]
+        return F.conv2d(z, weight)
+
     def forward(
         self,
         a: torch.Tensor,
@@ -212,6 +217,7 @@ class AttentionPairBias(nn.Module):
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
         enable_efficient_fusion: bool = False,
+        precomputed_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Details are given in local_forward and standard_forward"""
         # Input projections
@@ -230,6 +236,8 @@ class AttentionPairBias(nn.Module):
 
         # Multihead attention with pair bias
         if n_queries and n_keys:
+            if precomputed_bias is not None:
+                raise ValueError("precomputed_bias is only valid for standard attention")
             a = self.local_multihead_attention(
                 a,
                 kv if self.cross_attention_mode else a,
@@ -246,6 +254,7 @@ class AttentionPairBias(nn.Module):
                 z,
                 inplace_safe=inplace_safe,
                 enable_efficient_fusion=enable_efficient_fusion,
+                precomputed_bias=precomputed_bias,
             )
 
         # Output projection (from adaLN-Zero [27])
@@ -314,6 +323,7 @@ class DiffusionTransformerBlock(nn.Module):
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
         enable_efficient_fusion: bool = False,
+        precomputed_z_bias: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -345,6 +355,7 @@ class DiffusionTransformerBlock(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
                 enable_efficient_fusion=enable_efficient_fusion,
+                precomputed_bias=precomputed_z_bias,
             )
         )
         if inplace_safe:
@@ -414,7 +425,12 @@ class DiffusionTransformer(nn.Module):
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
         enable_efficient_fusion: bool = False,
+        precomputed_z_biases: Optional[tuple[torch.Tensor, ...]] = None,
     ) -> list[Callable]:
+        if precomputed_z_biases is not None and len(precomputed_z_biases) != len(
+            self.blocks
+        ):
+            raise ValueError("precomputed_z_biases must match transformer block count")
         blocks = [
             partial(
                 b,
@@ -423,10 +439,21 @@ class DiffusionTransformer(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
                 enable_efficient_fusion=enable_efficient_fusion,
+                precomputed_z_bias=(
+                    None
+                    if precomputed_z_biases is None
+                    else precomputed_z_biases[i]
+                ),
             )
-            for b in self.blocks
+            for i, b in enumerate(self.blocks)
         ]
         return blocks
+
+    def prepare_pair_biases_efficient(self, z: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            block.attention_pair_bias.project_z_bias_efficient(z)
+            for block in self.blocks
+        )
 
     def forward(
         self,
@@ -438,6 +465,7 @@ class DiffusionTransformer(nn.Module):
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
         enable_efficient_fusion: bool = False,
+        precomputed_z_biases: Optional[tuple[torch.Tensor, ...]] = None,
     ) -> torch.Tensor:
         """
                 Args:
@@ -461,6 +489,7 @@ class DiffusionTransformer(nn.Module):
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
             enable_efficient_fusion=enable_efficient_fusion,
+            precomputed_z_biases=precomputed_z_biases,
         )
         blocks_per_ckpt = self.blocks_per_ckpt
         if not torch.is_grad_enabled():
