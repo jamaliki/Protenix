@@ -843,3 +843,49 @@ Next:
   the number of linear/GEMM launches without losing tensor-core efficiency, or
   target LayerNorm/elementwise/copy traffic inside the diffusion transformer and
   atom encoder/decoder where a full-block replacement is not required.
+
+### Round 19 - rejected fused self-QKV projection
+
+Status: rejected and reverted
+
+Hypothesis:
+- The current-best trace is dominated by many linear/GEMM launches. For
+  standard self-attention where `q_x` and `kv_x` are the same tensor, computing
+  Q/K/V with one concatenated `F.linear` could reduce launches and improve GEMM
+  shape efficiency while leaving cuDNN SDPA unchanged.
+
+Change:
+- Added a guarded inference-only `PROTENIX_FUSED_SELF_QKV=1` path in
+  `Attention._prep_qkv`. It only activated for CUDA self-attention with matching
+  q/k/v input dimensions and no k/v bias. Concatenated weights/biases were
+  cached by parameter pointer/version.
+
+Hotspot screen:
+- Hardware: one Sandpit Tokyo H100 (`gpu-14`), commit `5e9ecba`.
+- Shape: diffusion trunk attention block,
+  `scripts/perf/trunk_attention_hotspot.py --samples 160 --z-samples 1
+  --tokens 245 --dtype bfloat16 --warmup 10 --iters 60
+  --efficient-fusion 1`.
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round20_fused_self_qkv_hotspot_20260630_232415`.
+
+Results:
+| run | full block | attention qkv/sdpa/gate/out | pair bias projection | transition | peak allocated MiB | finite |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| fused self-QKV off | 2.424 ms | 1.002 ms | 0.033 ms | 0.915 ms | 1086 | yes |
+| fused self-QKV on | 2.426 ms | 1.029 ms | 0.033 ms | 0.911 ms | 1156 | yes |
+
+Interpretation:
+- The candidate directly worsened the targeted attention subrange and increased
+  memory. A larger single GEMM did not beat the existing separate projection
+  path for this H100 shape.
+
+Decision:
+- Reject after hotspot; do not spend a full inference gate. Revert the
+  implementation.
+
+Next:
+- Do not pursue naive projection concatenation. Future GEMM-side work needs a
+  more precise boundary, such as preserving vendor GEMMs while fusing epilogues,
+  or a shape-specific kernel that demonstrates a hotspot win before touching
+  the full inference path.
