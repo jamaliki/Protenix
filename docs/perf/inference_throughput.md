@@ -508,3 +508,51 @@ Next:
   fusion. The next candidate should target a launch family that remains material
   after TF32 local attention, not a generic helper that only looks plausible from
   code structure.
+
+### Round 13 - rejected Triton full-token attention replacement
+
+Status: rejected and reverted
+
+Hypothesis:
+- The diffusion trunk full-token attention has the stable shape
+  `[N_sample, 16 heads, 245 tokens, head_dim 48]` with broadcast pair bias. A
+  Triton flash-style forward kernel might extend the atom-attention approach to
+  trunk attention and remove cuDNN SDPA dispatch/materialization overhead.
+
+Change:
+- Added an opt-in `PROTENIX_TRITON_FULL_ATTN=1` prototype for full-token
+  attention with broadcast `[1|N_sample, 1|heads, N, N]` pair bias.
+- The first compile attempt exposed a Triton dot dtype mismatch in the value
+  matmul (`fp32` softmax probabilities times `bf16` values); that was fixed by
+  casting values to `fp32`, matching the atom local-attention kernel pattern.
+
+Hotspot screen:
+- Hardware: one Sandpit Tokyo H100.
+- Command shape: `scripts/perf/trunk_attention_hotspot.py --samples 160
+  --z-samples 1 --tokens 245 --dtype bfloat16 --warmup 10 --iters 40
+  --efficient-fusion 1`.
+- Shared env: `PROTENIX_ATTENTION_FORCE_FP32=0`,
+  `PROTENIX_TRITON_FUSED_ELEMENTWISE=1`.
+
+Results:
+| run | full block | attention-pair-bias half | attention qkv/sdpa/gate/out | transition | notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| current cuDNN SDPA path | 2.411 ms | 1.203 ms | 0.993 ms | 0.946 ms | finite |
+| `PROTENIX_TRITON_FULL_ATTN=1` | 3.063 ms | 1.423 ms | 1.125 ms | 1.158 ms | finite, slower |
+
+Interpretation:
+- This is the wrong fusion boundary. cuDNN SDPA is already efficient for the
+  245-token trunk shape, and a broad replacement loses more attention time than
+  it can recover from launch/bias overhead.
+- Fusing pair-bias projection into such a kernel would not rescue it for this
+  benchmark: the measured pair-bias projection is only about `0.033 ms/block`.
+
+Decision:
+- Reject and revert. Do not carry a full-attention replacement path unless a
+  future profile shows cuDNN SDPA itself has become the dominant, inefficient
+  kernel or a kernel design preserves cuDNN-level tensor-core efficiency.
+
+Next:
+- Focus on remaining material launch families that do not replace strong
+  vendor kernels: copy/cast/layout traffic, confidence/pairformer overhead, or
+  true GEMM epilogues where the tensor-core GEMM remains the compute engine.
