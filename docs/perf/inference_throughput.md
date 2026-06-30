@@ -556,3 +556,100 @@ Next:
 - Focus on remaining material launch families that do not replace strong
   vendor kernels: copy/cast/layout traffic, confidence/pairformer overhead, or
   true GEMM epilogues where the tensor-core GEMM remains the compute engine.
+
+### Round 14 - current-best full trace diagnosis
+
+Status: complete
+
+Experiment:
+- Full PyTorch/CUPTI trace of the current promoted path after the Round 13
+  cleanup, commit `392146b`, one Sandpit Tokyo H100.
+- Shape: `N_sample=160`, `N_step=200`, true unchunked diffusion,
+  `PROTENIX_TRITON_LOCAL_ATTN=1`,
+  `PROTENIX_TRITON_FUSED_ELEMENTWISE=1`, standard-TF32 local attention.
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round13_profile_current_best_srun_20260630_220939`.
+- Note: CUPTI inflated the profiled forward wall time to `468.7 s`; throughput
+  from this run is invalid. Kernel launch families and CUDA totals are the
+  useful signal.
+
+Top kernel families:
+| family | calls | CUDA time |
+| --- | ---: | ---: |
+| BF16 tensor-core GEMM (`nvjet_sm90_tst_..._TNT`) | 43,200 | 9.06 s |
+| cuDNN flash SDPA | 4,800 | 5.81 s |
+| Triton atom local attention | 1,203 | 5.55 s |
+| cublas TF32 GEMM | 21,005 | 3.34 s |
+| BF16 tensor-core GEMM with bias | 24,000 | 2.94 s |
+| FP32 elementwise multiply | 14,361 | 2.14 s |
+| fast LayerNorm FP32 | 14,306 | 2.14 s |
+| fast LayerNorm BF16 | 23,960 | 2.02 s |
+| Triton SiLU-mul | 6,003 | 1.55 s |
+| FP32 elementwise add | 5,362 | 1.35 s |
+| Triton sigmoid-mul | 10,803 | 1.21 s |
+| Triton sigmoid-mul-add | 9,600 | 1.15 s |
+
+Runtime launch/copy families:
+| family | calls | runtime/API time |
+| --- | ---: | ---: |
+| `cudaLaunchKernel` | 383,312 | 11.83 s |
+| `cuLaunchKernelEx` | 123,106 | 10.30 s |
+| `cudaMemsetAsync` | 108,389 | 10.11 s |
+| `cudaMemcpyAsync` | 53,231 | 0.38 s |
+
+Interpretation:
+- The remaining cost is no longer one obvious unfused PyTorch op. It is a mix of
+  vendor tensor-core GEMMs, cuDNN SDPA, custom local attention, fast LayerNorm,
+  and residual elementwise/copy traffic.
+- Replacing cuDNN SDPA with a broad Triton attention kernel was already shown to
+  lose. Future wins need to preserve strong vendor kernels and remove adjacent
+  traffic, or improve the already-owned local-attention kernel.
+
+Decision:
+- Use this as the current bottleneck map. Do not optimize from code aesthetics
+  alone.
+
+### Round 15 - rejected diffusion transformer pair-z cache
+
+Status: rejected and reverted
+
+Hypothesis:
+- The diffusion trunk receives the same pair embedding `z_pair` on every
+  denoising step. Precomputing the efficient-fusion transformer layout
+  (`normalize -> permute -> contiguous`) once per sampled structure might remove
+  repeated dtype/layout work without replacing cuDNN SDPA or tensor-core GEMMs.
+
+Change:
+- Added an opt-in `PROTENIX_CACHE_DIFFUSION_TRANSFORMER_Z=1` path that prepared
+  the transformer `z` tensor once after the shared diffusion pair cache and
+  reused it inside `DiffusionModule.f_forward`.
+
+Experiment:
+- Paired one-H100 gate on `gpu-8`, commit `f5ba324`, `N_sample=160`,
+  `N_step=200`, true unchunked diffusion, accepted Round 11 flags, one warmup
+  item and one timed 7r6r item per variant.
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round14_cache_transformer_z_gate_20260630_223013`.
+
+Results:
+| run | aggregate samples/sec | forward samples/sec | forward sec | diffusion transformer | peak allocated MiB | delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| cache off | 5.795 | 5.851 | 27.346 | 11.137 s | 9425 | baseline |
+| cache on | 5.742 | 5.797 | 27.599 | 11.136 s | 9440 | -0.9% aggregate |
+
+Interpretation:
+- The target timer did not move: `diffusion_transformer_sec` was effectively
+  identical. The extra cached tensor slightly increased peak memory and full
+  forward time.
+- The repeated pair-z layout work is not currently a material bottleneck in the
+  real workload, despite looking plausible from code inspection and trace
+  counts.
+
+Decision:
+- Reject and revert. Do not carry this default-off cache path.
+
+Next:
+- Use the full trace as the map: remaining material work is mostly tensor-core
+  GEMMs, cuDNN SDPA, the already-custom atom local attention, fast LayerNorm,
+  and residual elementwise/copy traffic. Future candidates need to move one of
+  those measured families directly.
