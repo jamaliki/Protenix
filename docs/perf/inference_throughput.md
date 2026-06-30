@@ -469,3 +469,42 @@ Next:
   is much smaller now; remaining material costs are likely tensor-core GEMMs,
   cuequivariance pairformer/confidence kernels, trunk SDPA, and host-visible
   copy/cast traffic.
+
+### Round 12 - rejected generic Transition activation fusion
+
+Status: rejected and reverted
+
+Hypothesis:
+- The generic `Transition` module still performs separate SiLU and multiply
+  launches in inference. Reusing the existing Triton `silu(x) * y` helper behind
+  `PROTENIX_TRITON_FUSED_TRANSITION=1` might remove a small amount of launch and
+  memory traffic outside the diffusion conditioned-transition block.
+
+Experiment:
+- Baseline: latest promoted Round 11 path, `N_sample=160`, `N_step=200`,
+  `PROTENIX_TRITON_FUSED_TRANSITION=0`.
+- Candidate: same flags plus `PROTENIX_TRITON_FUSED_TRANSITION=1`.
+- Hardware: one Sandpit Tokyo H100.
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round12_transition_fusion_gate_n160_20260630_212917`.
+
+Results:
+| run | aggregate samples/sec | forward samples/sec | forward sec | diffusion transformer | peak allocated MiB | delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| N160, generic transition fusion off | 5.709 | 5.762 | 27.77 | 11.17 s | 9425 | baseline |
+| N160, generic transition fusion on | 5.575 | 5.627 | 28.43 | 11.17 s | 9425 | -2.3% aggregate |
+
+Interpretation:
+- The candidate did not move the diffusion-transformer timer and slightly
+  worsened full forward throughput. The slowdown is likely overhead/noise in
+  non-dominant transition uses rather than movement of the real bottleneck.
+
+Decision:
+- Reject and revert the generic `Transition` feature flag and code. Do not carry
+  a default-off path without a representative workload win.
+
+Next:
+- Re-profile the current promoted Round 11 baseline before writing another
+  fusion. The next candidate should target a launch family that remains material
+  after TF32 local attention, not a generic helper that only looks plausible from
+  code structure.
