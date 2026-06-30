@@ -35,6 +35,31 @@ outputs:
   trace reducer: scripts/perf/trace_aggregate.py
 ```
 
+## Current promoted one-H100 throughput stack
+
+Use the following for the current best high-throughput 7r6r-style inference
+path:
+
+```bash
+export N_SAMPLE=320
+export SAMPLE_DIFFUSION_CHUNK_SIZE=none
+export CHUNK_SIZE=none
+export PROTENIX_GPU_RANDOM_AUGMENT=1
+export PROTENIX_BF16_DIFFUSION_CORE=1
+export PROTENIX_ATTENTION_FORCE_FP32=0
+export PROTENIX_TRITON_LOCAL_ATTN=1
+export PROTENIX_TRITON_LOCAL_ATTN_NUM_WARPS=4
+export PROTENIX_TRITON_FUSED_ELEMENTWISE=1
+export PROTENIX_BF16_ATOM_ATTENTION=1
+```
+
+Best measured one-H100 throughput so far is `6.642` aggregate samples/sec at
+`N_sample=320`, `N_step=200`, true unchunked diffusion on the 7r6r benchmark
+input. This is `12.58x` over the original per-GPU default aggregate baseline
+of `0.528` samples/sec. The goal remains open because the remaining profile
+still contains material tensor-core GEMM, cuDNN SDPA, local-attention,
+LayerNorm, and elementwise/copy work.
+
 ## Running report
 
 ### Round 00 - harness and cluster baseline
@@ -653,3 +678,60 @@ Next:
   GEMMs, cuDNN SDPA, the already-custom atom local attention, fast LayerNorm,
   and residual elementwise/copy traffic. Future candidates need to move one of
   those measured families directly.
+
+### Round 16 - BF16 atom encoder/decoder with Triton local attention
+
+Status: promoted as an opt-in throughput flag
+
+Hypothesis:
+- Earlier broad BF16 atom attention was slower before the custom local-attention
+  path existed. After promoting the Triton atom local-attention kernel, running
+  the atom encoder/decoder under BF16 autocast should reduce adjacent linear,
+  normalization, and elementwise traffic while preserving the already-guarded
+  local-attention kernel behavior.
+
+Change:
+- Added `PROTENIX_BF16_ATOM_ATTENTION=1` to wrap the diffusion atom
+  encoder/decoder calls in CUDA BF16 autocast. The flag is off by default and
+  is only promoted as part of the explicit throughput stack above.
+
+Experiment:
+- Paired one-H100 gates on `gpu-8`, commit `28e65fd`, true unchunked diffusion,
+  one warmup 7r6r item and one timed 7r6r item per variant.
+- Shared flags: `PROTENIX_GPU_RANDOM_AUGMENT=1`,
+  `PROTENIX_BF16_DIFFUSION_CORE=1`, `PROTENIX_ATTENTION_FORCE_FP32=0`,
+  `PROTENIX_TRITON_LOCAL_ATTN=1`,
+  `PROTENIX_TRITON_LOCAL_ATTN_NUM_WARPS=4`,
+  `PROTENIX_TRITON_FUSED_ELEMENTWISE=1`, `PROTENIX_TIMING_DIFFUSION=1`.
+- N160 run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round15_bf16_atom_attention_gate_20260630_224053`.
+- N320 run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round15_bf16_atom_attention_n320_gate_20260630_224507`.
+
+Results:
+| shape | BF16 atom flag | aggregate samples/sec | forward samples/sec | forward sec | atom encoder | atom decoder | transformer | peak allocated MiB | finite coords |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| N160 | 0 | 5.821 | 5.881 | 27.208 | 4.538 s | 4.078 s | 11.105 s | 9425 | yes |
+| N160 | 1 | 6.123 | 6.186 | 25.867 | 4.237 s | 3.048 s | 11.100 s | 9429 | yes |
+| N320 | 0 | 6.266 | 6.299 | 50.803 | 8.860 s | 8.022 s | 21.444 s | 16545 | yes |
+| N320 | 1 | 6.642 | 6.679 | 47.914 | 8.258 s | 5.965 s | 21.436 s | 16549 | yes |
+
+Interpretation:
+- The win is real and localized. The diffusion transformer time is unchanged,
+  while atom decoder time falls substantially and atom encoder time improves
+  modestly.
+- Peak memory is effectively unchanged. The candidate remains finite on both
+  gate shapes.
+- New best per-GPU throughput is `6.642` aggregate samples/sec, `12.58x` over
+  the original default per-GPU aggregate baseline.
+
+Decision:
+- Promote `PROTENIX_BF16_ATOM_ATTENTION=1` into the explicit high-throughput
+  stack.
+
+Next:
+- Re-profile the new best stack. The likely next legitimate candidates are
+  narrower than whole-model mega-kernels: improve the owned local-attention
+  kernel and its projection/bias boundary, remove residual FP32 LayerNorm and
+  elementwise traffic where numerically safe, or find GEMM epilogue fusions that
+  preserve vendor tensor-core kernels.
