@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import os
 import random
 import time
 from typing import Any, Optional
@@ -559,6 +560,20 @@ class Protenix(nn.Module):
         else:
             cache["pair_z"] = None
             cache["p_lm/c_l"] = [None, None]
+        cache["transformer_z"] = None
+        if (
+            cache["pair_z"] is not None
+            and self.enable_efficient_fusion
+            and not torch.is_grad_enabled()
+            and os.getenv("PROTENIX_CACHE_DIFFUSION_TRANSFORMER_Z", "0").lower()
+            not in {"0", "false", "off", "no"}
+        ):
+            transformer_dtype = self.diffusion_module._diffusion_core_dtype(
+                cache["pair_z"].dtype
+            )
+            cache["transformer_z"] = self.diffusion_module.prepare_transformer_pair_z(
+                cache["pair_z"], transformer_dtype
+            )
         if hasattr(self.diffusion_module, "reset_perf_stats"):
             self.diffusion_module.reset_perf_stats()
         pred_dict["coordinate"] = self.sample_diffusion(
@@ -572,6 +587,7 @@ class Protenix(nn.Module):
             c_l=cache["p_lm/c_l"][1],
             N_sample=N_sample,
             noise_schedule=noise_schedule,
+            z_pair_transformer=cache["transformer_z"],
             inplace_safe=inplace_safe,
             enable_efficient_fusion=self.enable_efficient_fusion,
         )
