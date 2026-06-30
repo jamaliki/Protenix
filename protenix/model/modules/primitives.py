@@ -32,6 +32,32 @@ from protenix.model.utils import (
 )
 
 
+def _try_triton_local_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    trunked_attn_bias: Optional[torch.Tensor],
+    n_queries: int,
+    n_keys: int,
+) -> Optional[torch.Tensor]:
+    if trunked_attn_bias is None:
+        return None
+    try:
+        from protenix.model.modules.local_attention_triton import (
+            triton_local_attention,
+        )
+    except Exception:
+        return None
+    return triton_local_attention(
+        q=q,
+        k=k,
+        v=v,
+        trunked_attn_bias=trunked_attn_bias,
+        n_queries=n_queries,
+        n_keys=n_keys,
+    )
+
+
 def attention_force_fp32() -> bool:
     return os.getenv("PROTENIX_ATTENTION_FORCE_FP32", "1").lower() not in {
         "0",
@@ -627,6 +653,18 @@ def _local_attention(
             [..., Q, d]
     """
     assert q.shape == k.shape == v.shape  # local attention doesn't make sense if Q != K
+
+    if attn_bias is None and chunk_size is None and use_efficient_implementation:
+        triton_out = _try_triton_local_attention(
+            q=q,
+            k=k,
+            v=v,
+            trunked_attn_bias=trunked_attn_bias,
+            n_queries=n_queries,
+            n_keys=n_keys,
+        )
+        if triton_out is not None:
+            return triton_out
 
     # Prepare for attention qkv, q: [..., n_trunks, n_queries, d], kv: [..., n_trunks, n_keys, d]
 

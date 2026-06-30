@@ -381,8 +381,7 @@ def main() -> None:
     load_sec = time.perf_counter() - load_start
     runner.configs.input_json_path = args.input_json
     runner.configs.num_workers = args.num_workers
-    if args.chunk_size is not None:
-        runner.configs.infer_setting.chunk_size = args.chunk_size
+    runner.configs.infer_setting.chunk_size = args.chunk_size
     runner.configs.infer_setting.sample_diffusion_chunk_size = (
         args.sample_diffusion_chunk_size
     )

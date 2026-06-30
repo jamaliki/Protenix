@@ -227,3 +227,79 @@ Next:
   `n_keys=128`, `n_heads=4`, `c_atom=128` atom transformer path, including pair
   bias. A whole-block mega-kernel is too broad; the right fusion boundary is
   local q/k/v projection + bias application + SDPA for the 32x128 windows.
+
+### Round 09 - Triton atom local attention and true unchunked attention
+
+Status: promoted as an opt-in throughput path
+
+Hypothesis:
+- The local atom attention path spends material time in dense trunk
+  rearrangement, FP32 upcasts, pair-bias addition, and SDPA dispatch for fixed
+  `32x128` windows. A narrow Triton kernel can compute the pair-biased local
+  attention directly over the original `[... , H, N_atom, D]` q/k/v layout and
+  broadcasted pair bias.
+
+Change:
+- Added `PROTENIX_TRITON_LOCAL_ATTN=1`, a guarded H100-oriented Triton forward
+  kernel for local atom attention with `n_queries=32`, `n_keys=128`,
+  `head_dim=32`, FP32/BF16 inputs, FP32 output, and broadcasted pair bias.
+- Added an isolated hotspot benchmark:
+  `scripts/perf/local_attention_hotspot.py`.
+- Fixed the benchmark harness so `--chunk-size none` actually sets
+  `runner.configs.infer_setting.chunk_size = None`. Previously the harness left
+  the default `chunk_size=256` in place, which meant diffusion atom attention
+  was still chunked even in "unchunked" runs.
+
+Hotspot screen:
+| shape | reference | Triton | speedup | parity |
+| --- | ---: | ---: | ---: | --- |
+| BF16 q/k/v, `N_sample=80`, 7r6r atom count | 4.48 ms | 0.89 ms | 5.0x | max abs error `5.3e-6`, no NaNs |
+| BF16 q/k/v, `N_sample=160`, 7r6r atom count | 8.80 ms | 1.75 ms | 5.0x | max abs error `7.2e-6`, no NaNs |
+
+Diagnostics:
+- Initial model gates showed no atom-time movement because the real diffusion
+  path was still using `attn_chunk_size=256`; the Triton fast path is correctly
+  disabled for chunked local attention.
+- After fixing `chunk_size=None`, the next blocker was broadcasted diffusion
+  pair bias (`[1, H, n_trunks, 32, 128]` bias for `[N_sample, H, N_atom, D]`
+  q/k/v). The kernel now supports this by using the expanded bias view without
+  materializing a copy.
+
+Results:
+| run | aggregate samples/sec | forward samples/sec | forward sec | peak allocated MiB | speedup vs default |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| default `N_sample=5`, chunk 5 | 0.528 | 0.544 | 9.198 for 5 samples | 2414 | 1.00x |
+| previous robust split policy, `N_sample=160` | 3.397 | 3.417 | 46.83 | 9425 | 6.43x |
+| true `chunk_size=None`, no Triton, `N_sample=160` | 4.501 | 4.535 | 35.28 | 9425 | 8.52x |
+| true `chunk_size=None` + Triton local attention, `N_sample=160` | 4.996 | 5.038 | 31.76 | 9425 | 9.46x |
+| true `chunk_size=None` + Triton local attention, `N_sample=320` | 5.347 | 5.371 | 59.58 | 16545 | 10.13x |
+
+Representative component movement at `N_step=200`, `N_sample=160`:
+| component | no Triton | Triton local attention | delta |
+| --- | ---: | ---: | ---: |
+| diffusion total | 28.12 s | 24.44 s | -13.1% |
+| atom encoder | 7.68 s | 5.84 s | -24.0% |
+| atom decoder | 7.17 s | 5.34 s | -25.6% |
+| diffusion transformer | 12.88 s | 12.86 s | unchanged |
+| pairformer | 2.61 s | 2.67 s | unchanged/noise |
+| confidence | 2.77 s | 2.81 s | unchanged/noise |
+
+Decision:
+- Promote the harness chunk-size fix and the guarded Triton atom-local
+  attention path. The branch now has a measured `10.13x` per-GPU throughput
+  improvement over the original default on the 7r6r benchmark.
+- Do not stop here. After atom attention, the remaining large measured
+  component is `diffusion_transformer_sec`, which is dominated by full
+  token/trunk attention and transition work. The next credible fusion boundary
+  is pair-biased full-token attention, especially fusing pair-bias projection
+  from `z` into score computation rather than materializing a separate
+  `[H, N_token, N_token]` bias tensor.
+
+Next:
+- Build an isolated benchmark for `AttentionPairBias.standard_multihead_attention`
+  at the real 7r6r token count and sample counts.
+- Compare the current `layernorm_z -> linear_z -> SDPA -> gate -> output`
+  path with a full-token Triton attention prototype that reads/project pair
+  bias on the fly.
+- Promote only if it moves real `diffusion_transformer`, pairformer, or
+  confidence timings in the full inference gate.
