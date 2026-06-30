@@ -40,6 +40,24 @@ def triton_local_attention_enabled() -> bool:
 def triton_local_attention_available() -> bool:
     return triton is not None and tl is not None
 
+
+def triton_local_attention_input_precision() -> str:
+    precision = os.getenv(
+        "PROTENIX_TRITON_LOCAL_ATTN_INPUT_PRECISION", "tf32x3"
+    ).lower()
+    if precision in {"tf32x3", "tf32", "ieee"}:
+        return precision
+    return "tf32x3"
+
+
+def triton_local_attention_num_warps() -> int:
+    try:
+        num_warps = int(os.getenv("PROTENIX_TRITON_LOCAL_ATTN_NUM_WARPS", "4"))
+    except ValueError:
+        return 4
+    return num_warps if num_warps in {1, 2, 4, 8} else 4
+
+
 _SUPPORTED_INPUT_DTYPES = {torch.float32, torch.bfloat16}
 
 
@@ -80,6 +98,7 @@ if triton_local_attention_available():
         block_m: tl.constexpr,
         block_n: tl.constexpr,
         block_d: tl.constexpr,
+        dot_input_precision: tl.constexpr,
     ):
         pid = tl.program_id(0)
         trunk = pid % n_trunks
@@ -119,7 +138,7 @@ if triton_local_attention_available():
             mask=q_mask[:, None] & k_mask[None, :],
             other=-float("inf"),
         )
-        score = tl.dot(q, tl.trans(k), input_precision="tf32x3") + bias
+        score = tl.dot(q, tl.trans(k), input_precision=dot_input_precision) + bias
         score = tl.where(q_mask[:, None] & k_mask[None, :], score, -float("inf"))
         # The final trunk may contain padded query rows. Keep those rows finite
         # through the reduction even though they are masked out on store.
@@ -135,7 +154,7 @@ if triton_local_attention_available():
             other=0.0,
         )
         v = v.to(tl.float32)
-        out = tl.dot(prob, v, input_precision="tf32x3")
+        out = tl.dot(prob, v, input_precision=dot_input_precision)
         out_base = out_ptr + sample * o_stride_s + head * o_stride_h
         tl.store(
             out_base + q_idx[:, None] * o_stride_n + offs_d[None, :] * o_stride_d,
@@ -262,7 +281,8 @@ def triton_local_attention(
         block_m=n_queries,
         block_n=n_keys,
         block_d=head_dim,
-        num_warps=4,
+        dot_input_precision=triton_local_attention_input_precision(),
+        num_warps=triton_local_attention_num_warps(),
     )
     if not batch_shape:
         return out[0]

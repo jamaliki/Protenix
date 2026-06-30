@@ -146,6 +146,10 @@ def main() -> None:
         "q_stride": list(q.stride()),
         "bias_shape": list(bias.shape),
         "bias_stride": list(bias.stride()),
+        "triton_precision": os.environ.get(
+            "PROTENIX_TRITON_LOCAL_ATTN_INPUT_PRECISION", "tf32x3"
+        ),
+        "triton_num_warps": os.environ.get("PROTENIX_TRITON_LOCAL_ATTN_NUM_WARPS", "4"),
         "ref_ms": ref_ms,
         "candidate_ms": cand_ms,
         "speedup": ref_ms / cand_ms,
