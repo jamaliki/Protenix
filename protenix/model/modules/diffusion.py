@@ -343,13 +343,9 @@ class DiffusionModule(nn.Module):
         )
         self.normalize = LayerNorm(c_z, create_offset=False, create_scale=False)
         self._perf_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
-        self._transformer_pair_bias_cache: Optional[
-            tuple[tuple[object, ...], tuple[torch.Tensor, ...]]
-        ] = None
 
     def reset_perf_stats(self) -> None:
         self._perf_events = {}
-        self._transformer_pair_bias_cache = None
 
     def _profile_block(self, name: str):
         if (
@@ -400,44 +396,6 @@ class DiffusionModule(nn.Module):
         ):
             return nullcontext()
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-
-    def _cache_transformer_pair_bias_enabled(self) -> bool:
-        return (
-            os.getenv("PROTENIX_CACHE_DIFFUSION_TRANSFORMER_PAIR_BIAS", "0").lower()
-            not in {"0", "false", "off", "no"}
-            and not torch.is_grad_enabled()
-        )
-
-    def _cached_transformer_pair_biases(
-        self, z_pair: torch.Tensor, dtype: torch.dtype
-    ) -> tuple[torch.Tensor, ...]:
-        key = (
-            z_pair.data_ptr(),
-            tuple(z_pair.shape),
-            z_pair.stride(),
-            z_pair.dtype,
-            z_pair.device.type,
-            z_pair.device.index,
-            dtype,
-            z_pair._version,
-        )
-        if (
-            self._transformer_pair_bias_cache is not None
-            and self._transformer_pair_bias_cache[0] == key
-        ):
-            return self._transformer_pair_bias_cache[1]
-
-        z = self.normalize(z_pair.to(dtype=dtype))
-        z = permute_final_dims(z, [2, 0, 1]).contiguous()
-        autocast_ctx = (
-            torch.autocast(device_type="cuda", dtype=dtype)
-            if z.is_cuda and dtype != torch.float32
-            else nullcontext()
-        )
-        with autocast_ctx:
-            biases = self.diffusion_transformer.prepare_pair_biases_efficient(z)
-        self._transformer_pair_bias_cache = (key, biases)
-        return biases
 
     def f_forward(
         self,
@@ -586,13 +544,7 @@ class DiffusionModule(nn.Module):
             a_token = a_token + self.linear_no_bias_s(
                 self.layernorm_s(s_single)
             )  # [..., N_sample, N_token, c_token]
-        precomputed_z_biases = None
-        if enable_efficient_fusion and self._cache_transformer_pair_bias_enabled():
-            precomputed_z_biases = self._cached_transformer_pair_biases(
-                z_pair, transformer_dtype
-            )
-            z = z_pair
-        elif enable_efficient_fusion:
+        if enable_efficient_fusion:
             z = self.normalize(z_pair.to(dtype=transformer_dtype))
             z = permute_final_dims(z, [2, 0, 1]).contiguous()
         else:
@@ -608,7 +560,6 @@ class DiffusionModule(nn.Module):
                     inplace_safe=inplace_safe,
                     chunk_size=chunk_size,
                     enable_efficient_fusion=enable_efficient_fusion,
-                    precomputed_z_biases=precomputed_z_biases,
                 )
         if a_token.dtype != torch.float32:
             a_token = a_token.to(dtype=torch.float32)
