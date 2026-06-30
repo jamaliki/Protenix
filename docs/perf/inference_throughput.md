@@ -404,3 +404,68 @@ Next:
   that combines GEMM outputs with SiLU/mul/output gating without replacing the
   GEMMs themselves, or a true GEMM-epilogue integration rather than another
   standalone elementwise launch.
+
+### Round 11 - local attention TF32 precision tuning
+
+Status: promoted as the default precision for the guarded Triton local-attention path
+
+Hypothesis:
+- After Round 10, the largest owned kernel in the current profile is the
+  Triton atom local-attention kernel. It was using `input_precision="tf32x3"`
+  for FP32 dot products, which is more accurate but slower than standard TF32.
+  Since the inference path already enables TF32 globally, using standard TF32
+  inside the opt-in Triton local-attention fast path should improve throughput
+  with acceptable inference-level numerical movement.
+
+Current profile:
+- Warmed N20/N80 profile with accepted flags showed `_local_attention_kernel`
+  as a top owned kernel family: 123 launches, 211 ms total, about 1.72 ms per
+  call.
+- Other large families are mostly outside this branch's easy control:
+  cuequivariance pairformer kernels, cuDNN SDPA, cublas GEMMs, fast LayerNorm,
+  and copy/cast traffic.
+
+Change:
+- Added `PROTENIX_TRITON_LOCAL_ATTN_INPUT_PRECISION={tf32,tf32x3,ieee}`.
+- Added `PROTENIX_TRITON_LOCAL_ATTN_NUM_WARPS={1,2,4,8}` for screening.
+- Changed the guarded Triton local-attention default from `tf32x3` to `tf32`.
+  Users can still set `PROTENIX_TRITON_LOCAL_ATTN_INPUT_PRECISION=tf32x3` for
+  the previous conservative precision.
+
+Hotspot screen (`N_sample=80`, outer batch 1, 7r6r atom count):
+| dtype | precision | warps | candidate ms | max abs error vs PyTorch ref | notes |
+| --- | --- | ---: | ---: | ---: | --- |
+| FP32 | tf32x3 | 4 | 1.784 | `1.2e-5` | previous default |
+| FP32 | tf32x3 | 8 | 2.579 | `1.2e-5` | rejected |
+| FP32 | tf32 | 4 | 0.942 | `1.39e-2` | promoted |
+| FP32 | tf32 | 8 | 1.501 | `1.39e-2` | rejected |
+| BF16 | tf32x3 | 4 | 0.887 | `5.3e-6` | previous BF16 behavior |
+| BF16 | tf32 | 4 | 0.645 | `2.27e-3` | faster, same promoted default |
+
+Representative full inference gates:
+| run | aggregate samples/sec | forward samples/sec | forward sec | atom encoder | atom decoder | peak allocated MiB | delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| N160, local precision tf32x3 | 5.361 | 5.408 | 29.58 | 5.56 s | 5.12 s | 9425 | baseline |
+| N160, local precision tf32 | 5.779 | 5.833 | 27.43 | 4.55 s | 4.10 s | 9425 | +7.8% aggregate |
+| N320, local precision tf32x3 | 5.757 | 5.784 | 55.33 | 10.88 s | 10.18 s | 16545 | baseline |
+| N320, local precision tf32 | 6.227 | 6.258 | 51.13 | 8.86 s | 8.08 s | 16545 | +8.2% aggregate |
+
+Guardrails:
+- Full inference coordinates were finite in both N160 and N320 gates.
+- Peak allocated memory was unchanged.
+- The hotspot numerical movement is larger than `tf32x3` but is consistent
+  with standard TF32 inference and remains behind the Triton local-attention
+  opt-in path.
+
+Decision:
+- Promote standard TF32 as the default dot precision for
+  `PROTENIX_TRITON_LOCAL_ATTN=1`.
+- The best measured one-H100 7r6r throughput is now `6.227` aggregate
+  samples/sec at `N_sample=320`, `N_step=200`, or `11.79x` over the original
+  default aggregate baseline (`6.227 / 0.528`).
+
+Next:
+- Re-profile the new best path if continuing. The atom local-attention kernel
+  is much smaller now; remaining material costs are likely tensor-core GEMMs,
+  cuequivariance pairformer/confidence kernels, trunk SDPA, and host-visible
+  copy/cast traffic.

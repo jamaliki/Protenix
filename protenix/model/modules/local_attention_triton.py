@@ -43,7 +43,7 @@ def triton_local_attention_available() -> bool:
 
 def triton_local_attention_input_precision() -> str:
     precision = os.getenv(
-        "PROTENIX_TRITON_LOCAL_ATTN_INPUT_PRECISION", "tf32x3"
+        "PROTENIX_TRITON_LOCAL_ATTN_INPUT_PRECISION", "tf32"
     ).lower()
     if precision in {"tf32x3", "tf32", "ieee"}:
         return precision
