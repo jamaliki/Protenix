@@ -1010,11 +1010,13 @@ class TemplateEmbedder(nn.Module):
             # Compatible with the Protenix 0.5.0 model series
             return 0
         asym_id = input_feature_dict["asym_id"]
-        multichain_mask = (asym_id[:, None] == asym_id[None, :]).to(z.dtype)
+        multichain_mask = (asym_id[..., :, None] == asym_id[..., None, :]).to(z.dtype)
 
-        num_residues = z.shape[0]
-        # determine whether the number of templates is the configured maximum value, otherwise error out
-        num_templates = input_feature_dict["template_aatype"].shape[0]
+        num_residues = z.shape[-3]
+        # Template features are shaped [..., N_template, N_token, ...].  Use
+        # negative axes so a leading batch of independent proteins can share the
+        # same template loop without accidentally indexing the batch dimension.
+        num_templates = input_feature_dict["template_aatype"].shape[-2]
         query_num_channels = z.shape[-1]
 
         if pair_mask is None:
@@ -1036,7 +1038,7 @@ class TemplateEmbedder(nn.Module):
             )
         u = u / (1e-7 + num_templates)
         u = self.linear_no_bias_u(self.relu(u))
-        assert u.shape == (num_residues, num_residues, query_num_channels)
+        assert u.shape[-3:] == (num_residues, num_residues, query_num_channels)
         return u
 
     def single_template_forward(
@@ -1052,12 +1054,13 @@ class TemplateEmbedder(nn.Module):
         chunk_size: Optional[int] = None,
     ) -> torch.Tensor:
         to_concat = []
+        num_residues = z.shape[-3]
 
         dgram = input_feature_dict["template_distogram"][
-            template_id
-        ]  # [N_token, N_token, 39]
+            ..., template_id, :, :, :
+        ]  # [..., N_token, N_token, 39]
         pseudo_beta_mask_2d = input_feature_dict["template_pseudo_beta_mask"][
-            template_id
+            ..., template_id, :, :
         ]
         dgram = dgram * multichain_mask[..., None] * pair_mask[..., None]
         pseudo_beta_mask_2d = (
@@ -1066,19 +1069,23 @@ class TemplateEmbedder(nn.Module):
         to_concat.append(dgram)
         to_concat.append(pseudo_beta_mask_2d.unsqueeze(-1))
 
-        aatype = input_feature_dict["template_aatype"][template_id]  # [N_token]
+        aatype = input_feature_dict["template_aatype"][
+            ..., template_id, :
+        ]  # [..., N_token]
         aatype = F.one_hot(aatype, num_classes=len(STD_RESIDUES_WITH_GAP))
-        to_concat.append(expand_at_dim(aatype, dim=-3, n=z.shape[0]))
-        to_concat.append(expand_at_dim(aatype, dim=-2, n=z.shape[0]))
+        to_concat.append(expand_at_dim(aatype, dim=-3, n=num_residues))
+        to_concat.append(expand_at_dim(aatype, dim=-2, n=num_residues))
 
-        unit_vector = input_feature_dict["template_unit_vector"][template_id]
+        unit_vector = input_feature_dict["template_unit_vector"][
+            ..., template_id, :, :, :
+        ]
         unit_vector = (
             unit_vector * multichain_mask[..., None] * pair_mask[..., None]
         )  # [N_token, N_token, 3]
         to_concat.append(unit_vector)
 
         backbone_mask_2d = input_feature_dict["template_backbone_frame_mask"][
-            template_id
+            ..., template_id, :, :
         ]
         backbone_mask_2d = backbone_mask_2d * multichain_mask * pair_mask
         to_concat.append(backbone_mask_2d.unsqueeze(-1))
