@@ -217,6 +217,23 @@ Decision: keep the implementation guarded by
 `PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION=1` for follow-up memory/batch-size
 screens, but do not count it as a promoted throughput optimization yet.
 
+Third, fusing the two AdaLN conditioning projections was rejected.  The idea was
+reasonable: every block computes both a gate and an offset from the same
+normalized `s`, and the high-throughput diffusion path broadcasts `s` over all
+samples.  The prototype used one wider `s -> [gate, offset]` GEMM plus a
+split-aware Triton consumer.  It had exact parity in a nonzero-weight BF16
+screen, but it did not move the representative trunk block:
+
+| screen | baseline | candidate | delta |
+| --- | ---: | ---: | ---: |
+| AdaLN micro, ms | 0.749 | 0.747 | +0.26% |
+| trunk block, paired average ms | 14.047 | 14.041 | +0.046% |
+| peak allocated MiB | 7000 | 7007 | worse |
+
+The mechanism is now clear: this boundary is real but too small after
+sample-broadcast conditioning.  The code path was removed so future work does
+not carry another default-off branch with no throughput signal.
+
 ### 4. Use lower precision only where profiling supports it
 
 `PROTENIX_BF16_DIFFUSION_CORE=1` and `PROTENIX_BF16_ATOM_ATTENTION=1` reduce
