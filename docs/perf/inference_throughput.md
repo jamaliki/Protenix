@@ -73,6 +73,42 @@ headroom matters. Larger unchunked batches are not currently safe:
 `N_sample=3840` and `N_sample=5120` both fail during the atom encoder warmup in
 a BF16 cuBLAS GEMM followed by an illegal-memory-access report.
 
+## Optional coordinate-only design-throughput mode
+
+For protein-design workflows that only need generated coordinates and will
+score/rank structures elsewhere, the current branch also has an explicit
+semantic tradeoff:
+
+```bash
+export PROTENIX_COORDINATE_ONLY=1
+```
+
+Use this together with the promoted throughput stack above. It skips
+distogram/contact probabilities, the confidence head, confidence summary,
+ranking-by-confidence, confidence JSONs, and pLDDT B-factors. CIF structures
+are still dumped, in sample order.
+
+Clean one-H100 7r6r-only gate at commit `e5081f2`, `N_sample=2560`,
+`N_step=200`:
+
+| mode | e2e samples/sec | forward samples/sec | forward sec | diffusion | confidence | peak reserved MiB | notes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| same-output promoted stack | 9.178 | 9.187 | 278.640 | 229.201 s | 41.736 s | 37120 | includes contact/confidence/summary |
+| coordinate-only | 10.922 | 10.935 | 234.105 | 230.845 s | 0.0 s | 37120 | coordinates finite, confidence/contact skipped |
+
+This is `20.69x` over the original `0.528` samples/sec default baseline and
+`1.19x` over the current same-output N2560 stack for this 7r6r-style input.
+It is not a same-output speedup. It exposes the largest remaining product-level
+lever after the same-output kernel work: confidence is real per-sample work,
+not just a cheap logit epilogue.
+
+Guardrail: `N_sample=2560` is not automatically safe for every example input.
+An all-example coordinate-only run completed the 7r6r timed row at `10.948`
+e2e samples/sec, then OOMed on the next larger example in the atom path with
+about `73.8 GiB` already in use before a `5.58 GiB` linear allocation. Use a
+lower `N_sample` or sample chunking for larger atom/token counts until they are
+separately gated.
+
 ## Running report
 
 ### Round 00 - harness and cluster baseline
@@ -3226,3 +3262,130 @@ Decision:
 - Next same-output kernel work should either move to a real pairformer-kernel
   campaign or stop and expose an explicit coordinate-only/deferred-confidence
   throughput mode as a semantic tradeoff.
+
+### Round 59 - coordinate-only design-throughput mode
+
+Status: promoted as an explicit semantic mode
+
+Hypothesis:
+- For protein-design throughput, confidence and contact outputs are often not
+  required on every generated structure. Skipping contact probabilities,
+  confidence head, and summary should remove the remaining large per-sample
+  confidence cost while preserving coordinate generation.
+
+Change:
+- Commit `e5081f2` added `PROTENIX_COORDINATE_ONLY=1`.
+- The mode is guarded to inference with no labels or symmetric permutation.
+  It returns `coordinate` only, sets timing fields for contact/confidence to
+  zero, and leaves the default same-output path unchanged.
+- `runner/dumper.py` now tolerates missing `summary_confidence`: structures
+  are dumped in sample order and confidence JSON emission is skipped.
+
+Experiments:
+- Initial all-example N2560 gate:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round119_coordinate_only_n2560_20260701_123834`.
+- Clean 7r6r-only N2560 gate:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round122_coordinate_only_n2560_7r6r_20260701_124915`.
+- Dump smoke:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round121_coordinate_only_dump_smoke_20260701_124639`.
+
+Results:
+
+| gate | status | e2e samples/sec | forward samples/sec | forward sec | diffusion | confidence | peak reserved MiB | notes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| clean 7r6r N2560 | completed | 10.922 | 10.935 | 234.105 | 230.845 s | 0.0 s | 37120 | finite coordinates |
+| all-example N2560 | failed after 7r6r | 10.948 on 7r6r row | 10.961 on 7r6r row | 233.554 | 230.501 s | 0.0 s | 37120 before next input | next larger example OOMed in atom path |
+| dump smoke N8/Nstep5 | completed | 0.402 | 0.603 | 13.273 | 3.100 s | 0.0 s | 2816 | 8 CIFs, 0 confidence JSONs |
+
+Interpretation:
+- For the 7r6r-style benchmark input, coordinate-only is the fastest measured
+  one-H100 mode so far: `10.922` end-to-end samples/sec, `20.69x` over the
+  original default and `1.19x` over the current same-output N2560 stack.
+- Diffusion time is essentially unchanged. The gain is from removing
+  confidence/contact/summary, exactly as expected from the bottleneck map.
+- This mode does not solve memory scaling for larger inputs. The all-example
+  N2560 run failed on the next input in an atom-path linear allocation after
+  the first timed 7r6r row. The right policy for larger proteins is a lower
+  sample batch or explicit sample chunking, not claiming N2560 is universal.
+
+Decision:
+- Keep coordinate-only as an explicit opt-in semantic mode.
+- Do not mix coordinate-only numbers with same-output speedups; report them as
+  design-throughput coordinates-only throughput.
+- Continue same-output kernel work on the confidence pairformer / atom and
+  trunk memory traffic, because coordinate-only is a product tradeoff rather
+  than a kernel solution.
+
+### Round 60 - confidence pairformer NCU roofline
+
+Status: diagnostic
+
+Question:
+- The torch-profiler attribution in Round 58 showed the confidence pairformer
+  dominates confidence time. At kernel level, is this path compute-saturated,
+  memory-saturated, launch-bound, or dominated by a few fixable copy/layout
+  launches?
+
+Experiment:
+- Corrected NCU run:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round123_confidence_pairformer_ncu_profile_from_start_off_20260701_130205`.
+- Command used `--profile-from-start off` with `--section SpeedOfLight` and
+  `--section SpeedOfLight_RooflineChart`, targeting one
+  `confidence_head_hotspot.py --ncu-target pairformer --ncu-iters 1` call.
+- The earlier run in
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round120_confidence_pairformer_ncu_20260701_124530`
+  is not used for decisions because it lacked `--profile-from-start off` and
+  captured setup/warmup launches.
+- Data rows below are from
+  `confidence_pairformer_corrected_raw.csv`: one units row plus 412 kernel
+  rows, total profiled kernel time `16.192 ms`, matching the CUDA-event
+  pairformer hotspot timing.
+
+Launch-family and time-weighted roofline summary:
+
+| family | launches | kernel time | time share | SM %peak | memory %peak | DRAM %peak | L2 %peak | L1 %peak | tensor %peak | FMA %peak |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| cuBLAS/CUTLASS SGEMM | 136 | 6.563 ms | 40.5% | 62.8 | 57.8 | 26.2 | 32.9 | 63.7 | 0.0 | 48.2 |
+| elementwise/copy/cast | 184 | 3.206 ms | 19.8% | 30.0 | 63.9 | 62.8 | 68.1 | 18.9 | 1.7 | 10.0 |
+| FMHA/SDPA | 8 | 3.095 ms | 19.1% | 51.5 | 87.8 | 9.2 | 22.0 | 90.8 | 0.2 | 35.0 |
+| cuequivariance fused gated dual GEMM | 16 | 1.807 ms | 11.2% | 37.3 | 54.7 | 41.6 | 45.8 | 57.4 | 32.5 | 12.0 |
+| LayerNorm | 40 | 1.040 ms | 6.4% | 44.2 | 59.6 | 44.3 | 71.9 | 56.9 | 0.6 | 15.7 |
+| cuequivariance triangle kernel2 | 4 | 0.384 ms | 2.4% | 77.7 | 34.4 | 24.9 | 31.9 | 36.5 | 0.0 | 67.4 |
+| cat/copy | 16 | 0.053 ms | 0.3% | 0.6 | 10.4 | 1.2 | 13.3 | 4.8 | 0.0 | 0.1 |
+| softmax | 4 | 0.022 ms | 0.1% | 22.7 | 33.1 | 20.7 | 48.9 | 28.2 | 0.1 | 8.7 |
+| reduce | 4 | 0.022 ms | 0.1% | 22.5 | 9.4 | 5.6 | 12.9 | 6.1 | 0.2 | 2.2 |
+
+Representative hottest launches:
+- 8x `native_sm80_fprop_fmha_fp32_ffma_64x32x32`, about
+  `0.385-0.389 ms` each, `~51%` SM, `~88%` memory, `~91%` L1, but only
+  `~9%` DRAM. These are on-chip/L1-pressure limited, not global-bandwidth
+  saturated.
+- 8x FP32 SGEMMs around `0.230-0.232 ms`, `~80%` SM and `~87%` memory with
+  `128` registers/thread.
+- 4+ FP32 SGEMMs around `0.188-0.190 ms`, `~73%` SM and `~57%` memory with
+  `255` registers/thread.
+
+Interpretation:
+- The confidence pairformer is not hitting maximum H100 tensor compute.
+  The largest family is FP32 FFMA SGEMM, not tensor-core BF16/TF32. These
+  launches are moderately SM/FMA busy and moderately memory busy, but neither
+  globally compute-peak nor DRAM-peak.
+- FMHA is also not DRAM-bound: it is mostly L1/on-chip throughput pressure.
+  A bigger "mega-kernel" that only combines neighboring Python ops is unlikely
+  to fix this unless it changes the data movement pattern feeding attention.
+- The 20% elementwise/copy/cast share is real material traffic. It is large
+  enough to justify a focused screen for avoidable confidence clones/layout
+  writes before designing a whole pairformer CUDA/Triton rewrite.
+- A monolithic whole-block mega-kernel is not yet the best next edit. The
+  credible kernel campaign is narrower: remove clone/layout traffic first,
+  then consider pairformer-specific precision/tiling/fusion only where NCU
+  shows a material kernel family with a plausible roofline movement.
+
+Decision:
+- Use this corrected NCU profile as the confidence-pairformer roofline map.
+- Next isolated screen: compare the real confidence `inplace_safe=True`
+  clone+inplace path against a non-inplace path that avoids cloning
+  `s_trunk`/`z_trunk` before each confidence sample.
+- If that screen wins, add an opt-in production flag and gate it in the full
+  same-output inference workload before promotion. If it loses, document and
+  move on to a true pairformer-kernel design.

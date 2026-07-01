@@ -108,6 +108,13 @@ def parse_args() -> argparse.Namespace:
         default="none",
     )
     parser.add_argument("--ncu-iters", type=int, default=1)
+    parser.add_argument(
+        "--inplace-safe",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Use the real confidence clone+inplace path before pairformer/full targets.",
+    )
     parser.add_argument("--seed", type=int, default=123)
     return parser.parse_args()
 
@@ -187,12 +194,12 @@ def main() -> None:
 
     def run_pairformer() -> tuple[torch.Tensor, torch.Tensor]:
         return head.pairformer_stack(
-            s_norm,
-            z_pair_input,
+            s_norm.clone() if args.inplace_safe else s_norm,
+            z_pair_input.clone() if args.inplace_safe else z_pair_input,
             pair_mask=None,
             triangle_multiplicative=args.triangle_multiplicative,
             triangle_attention=args.triangle_attention,
-            inplace_safe=False,
+            inplace_safe=bool(args.inplace_safe),
             chunk_size=None,
         )
 
@@ -223,13 +230,13 @@ def main() -> None:
     def run_full() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return head.memory_efficient_forward(
             input_feature_dict=feature_dict,
-            s_trunk=s_norm,
-            z_pair=z_base,
+            s_trunk=s_norm.clone() if args.inplace_safe else s_norm,
+            z_pair=z_base.clone() if args.inplace_safe else z_base,
             pair_mask=None,
             x_pred_rep_coords=rep_coords[0],
             triangle_multiplicative=args.triangle_multiplicative,
             triangle_attention=args.triangle_attention,
-            inplace_safe=False,
+            inplace_safe=bool(args.inplace_safe),
             chunk_size=None,
         )
 
