@@ -190,8 +190,9 @@ Representative full-path timing at the promoted point:
 | confidence head | about 42 s |
 | feature/input work | subsecond |
 
-The confidence pairformer hotspot was profiled with Nsight Compute.  One
-representative confidence sample had about 16.2 ms of pairformer kernel time:
+An early confidence pairformer hotspot was profiled in a deliberately FP32
+standalone screen.  That was useful for understanding the worst case, but it
+was not the production inference precision path:
 
 | family | launch share | interpretation |
 | --- | ---: | --- |
@@ -205,6 +206,33 @@ This is why a single "mega-kernel" is not an obvious next win.  Some hot
 launches are already efficient vendor/library kernels, while the memory-bound
 pieces are spread across the pairformer.
 
+A follow-up precision screen loaded the real
+`protenix_base_default_v1.0.0.pt` confidence-head weights and ran the
+production-like BF16 autocast path.  In that path, the confidence pairformer
+matmuls already produce BF16 outputs.  The remaining FP32 matmuls are the final
+confidence logits:
+
+| module/op | shape | status |
+| --- | --- | --- |
+| `linear_no_bias_pae` | `[245, 245, 128] -> [245, 245, 64]` | FP32 |
+| `linear_no_bias_pde` | `[245, 245, 128] -> [245, 245, 64]` | FP32 |
+| pLDDT `einsum` | `[2529, 384] x [2529, 384, 50] -> [2529, 50]` | FP32 |
+| resolved `einsum` | `[2529, 384] x [2529, 384, 2] -> [2529, 2]` | FP32, tiny |
+
+On one H100 confidence sample, Nsight Compute reported 9.21 ms total profiled
+kernel time for the current production-like path.  FP32 GEMM/GEMV launches were
+only 0.16 ms (1.7%).  Allowing the final logit matmuls to use BF16 reduced that
+FP32 family to 0.07 ms, but added cast traffic and raised total profiled time to
+9.32 ms.  The multi-sample screen showed similarly small deltas: 73.72 ms for
+`prod`, 73.15 ms for BF16 logits, and 72.77 ms for `torch.set_float32_matmul_precision("high")`.
+Those are below the noise floor for a full inference gate, and BF16 logits also
+raised peak allocated memory in the screen (about 705 MiB versus 652 MiB) due to
+upcast traffic.
+
+Decision: do not promote BF16 confidence logits or global TF32 precision as a
+throughput optimization.  The safe lower-precision candidates exist, but the
+matmuls are too small in the real path to be the next bottleneck.
+
 ## Negative results worth remembering
 
 These failed because the real workload, not the isolated kernel, is the gate:
@@ -215,7 +243,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Fusing activation into a custom Triton matmul | slower despite less memory | do not replace cuBLAS with a mediocre matmul |
 | Query-splitting the local-attention CTA | slower and more memory | reducing register pressure can duplicate other work |
 | Forcing confidence pairformer non-inplace | +0.08% e2e, below noise | wrapper clone cleanup is too small |
-| BF16 confidence head | rejected in full workload | confidence precision needs its own validation campaign |
+| BF16 final confidence logits | reduced FP32 logit matmuls but no NCU/timing win | the remaining FP32 matmuls are too small and cast traffic dominates |
 | Generic full-token Triton attention | slower than cuDNN/SDPA | vendor kernels win unless the shape mismatch is severe |
 | CUDA graph capture of the denoiser | slower in this setup | graph overhead/constraints can outweigh launch savings |
 
@@ -254,6 +282,8 @@ Profiling and reproducibility helpers:
 - `scripts/perf/local_attention_bias_hotspot.py`: bias-projection screen.
 - `scripts/perf/trunk_attention_hotspot.py`: trunk attention block screen.
 - `scripts/perf/confidence_head_hotspot.py`: confidence pairformer screen.
+- `scripts/perf/confidence_precision_screen.py`: confidence precision/parity
+  screen with real checkpoint weights and matmul dtype tracing.
 - `scripts/perf/trace_aggregate.py`: compact profiler trace summarizer.
 
 ## If continuing from here
