@@ -76,6 +76,28 @@ For a complete list of supported models, please refer to [Supported Models](docs
 
 For detailed instructions on installation, data preprocessing, inference, and training, please refer to the [Training and Inference Instructions](docs/training_inference_instructions.md). We recommend users refer to [inference_demo.sh](inference_demo.sh) for detailed inference methods and input explanations.
 
+### ⚡ H100 Inference Throughput Optimisation
+
+This repository includes an opt-in H100 inference-throughput path for workloads
+that generate many samples per input while keeping the normal confidence outputs
+enabled. The optimisation stack combines larger unchunked sample batches,
+BF16/autocast choices in the profiled diffusion paths, guarded Triton kernels
+for atom local attention and memory-bound elementwise gates, GPU-side random
+augmentation, and streamed confidence-summary computation to avoid keeping all
+pairwise confidence logits live at once.
+
+On a representative one-H100 `7r6r` benchmark with `N_sample=2560`,
+`N_step=200`, and confidence enabled, the optimized configuration measured about
+`9.18-9.21` samples/sec per GPU, compared with `0.528` samples/sec for the
+default `N_sample=5` setting. The exact gain depends on GPU, input shape, driver
+stack, and memory headroom; the fast path is therefore exposed through explicit
+environment flags rather than enabled silently for every user.
+
+For the recommended flags, reproduction commands, profiling scripts, and the
+negative results that shaped the implementation, see
+[docs/perf/inference_throughput.md](docs/perf/inference_throughput.md). The
+benchmark and hotspot tools live under [scripts/perf](scripts/perf/).
+
 
 ### 📊 Benchmark
 
