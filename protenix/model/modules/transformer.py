@@ -279,7 +279,7 @@ class AttentionPairBias(nn.Module):
             if inplace_safe:
                 a *= torch.sigmoid(self.linear_a_last(s))
             else:
-                a = torch.sigmoid(self.linear_a_last(s)) * a
+                a = fused_sigmoid_mul(self.linear_a_last(s), a)
 
         return a
 

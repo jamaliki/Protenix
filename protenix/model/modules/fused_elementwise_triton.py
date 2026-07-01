@@ -70,6 +70,47 @@ def _can_use_triton(*tensors: torch.Tensor) -> bool:
     return tensors[0].numel() > 0
 
 
+def _can_use_first_dim_broadcast_triton(
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> bool:
+    if not triton_fused_elementwise_enabled():
+        return False
+    if not triton_fused_elementwise_available():
+        return False
+    if torch.is_grad_enabled():
+        return False
+    if x.dtype not in _SUPPORTED_DTYPES:
+        return False
+    if not x.is_cuda or not y.is_cuda:
+        return False
+    if x.dtype != y.dtype:
+        return False
+    if not x.is_contiguous() or not y.is_contiguous():
+        return False
+    if x.dim() != 3 or y.dim() != 3:
+        return False
+    if x.shape[0] != 1 or y.shape[0] <= 1:
+        return False
+    return x.shape[1:] == y.shape[1:] and x.numel() > 0
+
+
+def _broadcast_z_mode(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    z: torch.Tensor,
+) -> Optional[bool]:
+    if not _can_use_first_dim_broadcast_triton(x, y):
+        return None
+    if not z.is_cuda or z.dtype != y.dtype or not z.is_contiguous():
+        return None
+    if z.shape == x.shape:
+        return True
+    if z.shape == y.shape:
+        return False
+    return None
+
+
 if triton_fused_elementwise_available():
 
     @triton.jit
@@ -107,6 +148,49 @@ if triton_fused_elementwise_available():
         tl.store(out_ptr + offsets, out, mask=mask)
 
     @triton.jit
+    def _sigmoid_mul_broadcast_x_kernel(
+        x_ptr,
+        y_ptr,
+        out_ptr,
+        n_elements: tl.constexpr,
+        n_x_elements: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = pid * block_size + tl.arange(0, block_size)
+        mask = offsets < n_elements
+        x_offsets = offsets % n_x_elements
+        x = tl.load(x_ptr + x_offsets, mask=mask, other=0.0).to(tl.float32)
+        y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        out = (1.0 / (1.0 + tl.exp(-x))) * y
+        tl.store(out_ptr + offsets, out, mask=mask)
+
+    @triton.jit
+    def _sigmoid_mul_add_broadcast_x_kernel(
+        x_ptr,
+        y_ptr,
+        z_ptr,
+        out_ptr,
+        n_elements: tl.constexpr,
+        n_x_elements: tl.constexpr,
+        z_broadcast: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = pid * block_size + tl.arange(0, block_size)
+        mask = offsets < n_elements
+        x_offsets = offsets % n_x_elements
+        if z_broadcast:
+            z_offsets = x_offsets
+        else:
+            z_offsets = offsets
+        x = tl.load(x_ptr + x_offsets, mask=mask, other=0.0).to(tl.float32)
+        y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        z = tl.load(z_ptr + z_offsets, mask=mask, other=0.0).to(tl.float32)
+        out = (1.0 / (1.0 + tl.exp(-x))) * y + z
+        tl.store(out_ptr + offsets, out, mask=mask)
+
+    @triton.jit
     def _silu_mul_kernel(
         x_ptr,
         y_ptr,
@@ -128,13 +212,25 @@ def _grid(n_elements: int) -> tuple[int]:
 
 
 def triton_sigmoid_mul(x: torch.Tensor, y: torch.Tensor) -> Optional[torch.Tensor]:
-    if not _can_use_triton(x, y):
-        return None
-    out = torch.empty_like(y)
-    _sigmoid_mul_kernel[_grid(y.numel())](
-        x, y, out, y.numel(), block_size=_BLOCK_SIZE, num_warps=4
-    )
-    return out
+    if _can_use_triton(x, y):
+        out = torch.empty_like(y)
+        _sigmoid_mul_kernel[_grid(y.numel())](
+            x, y, out, y.numel(), block_size=_BLOCK_SIZE, num_warps=4
+        )
+        return out
+    if _can_use_first_dim_broadcast_triton(x, y):
+        out = torch.empty_like(y)
+        _sigmoid_mul_broadcast_x_kernel[_grid(y.numel())](
+            x,
+            y,
+            out,
+            y.numel(),
+            x.numel(),
+            block_size=_BLOCK_SIZE,
+            num_warps=4,
+        )
+        return out
+    return None
 
 
 def triton_sigmoid_mul_add(
@@ -142,13 +238,28 @@ def triton_sigmoid_mul_add(
     y: torch.Tensor,
     z: torch.Tensor,
 ) -> Optional[torch.Tensor]:
-    if not _can_use_triton(x, y, z):
-        return None
-    out = torch.empty_like(y)
-    _sigmoid_mul_add_kernel[_grid(y.numel())](
-        x, y, z, out, y.numel(), block_size=_BLOCK_SIZE, num_warps=4
-    )
-    return out
+    if _can_use_triton(x, y, z):
+        out = torch.empty_like(y)
+        _sigmoid_mul_add_kernel[_grid(y.numel())](
+            x, y, z, out, y.numel(), block_size=_BLOCK_SIZE, num_warps=4
+        )
+        return out
+    z_broadcast = _broadcast_z_mode(x, y, z)
+    if z_broadcast is not None:
+        out = torch.empty_like(y)
+        _sigmoid_mul_add_broadcast_x_kernel[_grid(y.numel())](
+            x,
+            y,
+            z,
+            out,
+            y.numel(),
+            x.numel(),
+            z_broadcast=z_broadcast,
+            block_size=_BLOCK_SIZE,
+            num_warps=4,
+        )
+        return out
+    return None
 
 
 def triton_silu_mul(x: torch.Tensor, y: torch.Tensor) -> Optional[torch.Tensor]:
