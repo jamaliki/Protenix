@@ -19,7 +19,7 @@ def cuda_time(
     warmup: int,
     iters: int,
 ) -> tuple[torch.Tensor | tuple[torch.Tensor, ...], float]:
-    with torch.inference_mode():
+    with torch.no_grad():
         for _ in range(warmup):
             out = fn()
         torch.cuda.synchronize()
@@ -39,7 +39,7 @@ def cuda_profile_capture(
     warmup: int,
     iters: int,
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-    with torch.inference_mode():
+    with torch.no_grad():
         for _ in range(warmup):
             out = fn()
         torch.cuda.synchronize()
@@ -125,7 +125,7 @@ def main() -> None:
     x_pred_coords = torch.randn(args.samples, args.atoms, 3, device=device, dtype=dtype)
     rep_coords = x_pred_coords[:, feature_dict["distogram_rep_atom_mask"], :]
 
-    with torch.inference_mode():
+    with torch.no_grad():
         s_norm = head.input_strunk_ln(torch.clamp(s_trunk, min=-512, max=512))
         z_init = (
             head.linear_no_bias_s1(s_inputs)[..., None, :, :]
@@ -135,7 +135,7 @@ def main() -> None:
         del z_init
 
     def run_distance() -> torch.Tensor:
-        with torch.amp.autocast("cuda", enabled=False), torch.inference_mode():
+        with torch.amp.autocast("cuda", enabled=False), torch.no_grad():
             coords = rep_coords[0].to(torch.float32)
             distance = torch.cdist(coords, coords)
             z_dist = head.linear_no_bias_d(
@@ -166,7 +166,7 @@ def main() -> None:
     s_single = s_single.to(torch.float32)
 
     def run_logits() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        with torch.amp.autocast("cuda", enabled=False), torch.inference_mode():
+        with torch.amp.autocast("cuda", enabled=False), torch.no_grad():
             pae = head.linear_no_bias_pae(head.pae_ln(z_pair))
             pde = head.linear_no_bias_pde(head.pde_ln(z_pair + z_pair.transpose(-2, -3)))
             a = broadcast_token_to_atom(
