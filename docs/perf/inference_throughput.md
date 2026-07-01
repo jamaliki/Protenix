@@ -52,6 +52,7 @@ export PROTENIX_BF16_DIFFUSION_CORE=1
 export PROTENIX_ATTENTION_FORCE_FP32=0
 export PROTENIX_TRITON_LOCAL_ATTN=1
 export PROTENIX_TRITON_LOCAL_ATTN_NUM_WARPS=1
+export PROTENIX_TRITON_LOCAL_ATTN_OUTPUT_BF16=1
 export PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS=1
 export PROTENIX_TRITON_FUSED_ELEMENTWISE=1
 export PROTENIX_BF16_ATOM_ATTENTION=1
@@ -60,17 +61,17 @@ export PROTENIX_STREAM_CONFIDENCE_SUMMARY=1
 export PROTENIX_CONFIDENCE_LOGIT_CHUNK_SIZE=32
 ```
 
-Measured one-H100 throughput with streamed confidence summary is `7.723`
-end-to-end samples/sec and `7.736` forward samples/sec at `N_sample=1280`,
-`N_step=200`, true unchunked diffusion on the 7r6r benchmark input. The current
-max-throughput point is `N_sample=2560` with `7.769` end-to-end samples/sec and
-`7.775` forward samples/sec, reserving `36.4 GiB`; this is `14.71x` over the
-original per-GPU default aggregate baseline of `0.528` samples/sec. Larger
-batches now work because confidence PAE/PDE logits are streamed into
-summary/full-data chunks instead of materializing the full FP32 logit stack.
-The marginal batch-size gain is now nearly exhausted; the remaining profile is
-dominated by diffusion and confidence kernels that scale almost linearly in
-`N_sample`.
+Measured one-H100 throughput with streamed confidence summary and BF16 atom
+local-attention output is `7.824` end-to-end samples/sec and `7.837` forward
+samples/sec at `N_sample=1280`, `N_step=200`, true unchunked diffusion on the
+7r6r benchmark input, reserving `18.4 GiB`. The current max-throughput point is
+`N_sample=2560` with `7.868` end-to-end samples/sec and `7.875` forward
+samples/sec, reserving `34.8 GiB`; this is `14.90x` over the original per-GPU
+default aggregate baseline of `0.528` samples/sec. Larger batches now work
+because confidence PAE/PDE logits are streamed into summary/full-data chunks
+instead of materializing the full FP32 logit stack. The marginal batch-size gain
+is now nearly exhausted; the remaining profile is dominated by diffusion and
+confidence kernels that scale almost linearly in `N_sample`.
 
 ## Running report
 
@@ -1933,3 +1934,78 @@ Decision:
 - Further batch-only sweeps are not a legitimate path to a large win. The next
   work should be kernel redesign around atom local-attention/transition memory
   traffic and elementwise/copy fusion.
+
+### Round 38 - BF16 local-attention output store
+
+Status: promoted behind an explicit inference flag
+
+Hypothesis:
+- In the BF16 atom-attention path, the Triton local-attention kernel still
+  accumulates in FP32 but stores a FP32 output tensor. `Attention.forward`
+  already allocates that tensor with transposed Q strides, so the following
+  `transpose(-2, -3)` is contiguous and is not the main copy bottleneck. The
+  avoidable traffic is the FP32 attention output feeding the BF16 gate/output
+  projection path.
+
+Change:
+- Added `PROTENIX_TRITON_LOCAL_ATTN_OUTPUT_BF16=1` in commit `c9f9584`.
+- The flag only affects the Triton local-attention path when inputs are BF16.
+  Scores and attention-value accumulation remain FP32 inside the kernel; only
+  the output store dtype changes from FP32 to BF16. The default remains FP32 to
+  preserve upstream semantics unless the throughput stack opts in.
+
+Local correctness and layout diagnostics:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round67_bf16_local_attention_output_20260701_054331`.
+- Direct local attention, `N_sample=1280`, BF16 inputs:
+  - default output dtype: `torch.float32`
+  - candidate output dtype: `torch.bfloat16`
+  - both use output stride `[323712, 32, 128, 1]`; after the existing
+    transpose, the post-transpose view is contiguous with stride
+    `[323712, 128, 32, 1]`
+  - candidate-vs-default local-attention error: max `0.0156`, mean `0.00081`
+- Full `attention_pair_bias` same-block/same-input check at `N_sample=640`:
+  output dtype stayed BF16 and candidate-vs-default output was bit-identical
+  (`max_abs_error=0.0`, all finite). Peak allocated memory in that direct check
+  dropped from `22694 MiB` to `21903 MiB`.
+
+Hotspot screen, one atom transformer block:
+
+| samples | output store | attention ms | transition ms | full block ms | peak allocated MiB |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 320 | FP32 | 8.923 | 2.462 | 11.733 | 7591 |
+| 320 | BF16 | 8.345 | 2.461 | 11.181 | 6998 |
+| 640 | FP32 | 17.629 | 4.855 | 23.202 | 15147 |
+| 640 | BF16 | 16.431 | 4.850 | 21.946 | 13962 |
+| 1280 | FP32 | 35.078 | 9.638 | 46.040 | 30260 |
+| 1280 | BF16 | 32.627 | 9.616 | 43.600 | 27889 |
+
+Full 7r6r gate, `N_step=200`, one H100, normal async throughput timing:
+
+| variant | forward sec | forward samples/sec | end-to-end samples/sec | diffusion | confidence head | summary confidence | peak allocated MiB | peak reserved MiB | finite coords |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| N1280, FP32 local-attn output | 167.077 | 7.661 | 7.649 | 140.656 s | 21.571 s | 2.147 s | 18076 | 21598 | yes |
+| N1280, BF16 local-attn output | 163.327 | 7.837 | 7.824 | 137.897 s | 20.733 s | 2.080 s | 15705 | 18438 | yes |
+| N2560, BF16 local-attn output | 325.095 | 7.875 | 7.868 | 275.907 s | 42.099 s | 4.451 s | 29104 | 34818 | yes |
+
+Interpretation:
+- The paired N1280 gate shows a real but bounded win: `+2.3%` end-to-end
+  throughput, `-13.1%` peak allocated memory, and `-14.6%` peak reserved
+  memory.
+- The N2560 candidate is the best measured per-GPU point so far:
+  `7.868` end-to-end samples/sec, `14.90x` over the original default per-GPU
+  baseline. The marginal gain of N2560 over N1280 remains only `+0.56%`, so
+  N1280 remains the conservative stack default.
+- This is the kind of fusion/detail work that the roofline supported: reduce
+  memory traffic on the repeated atom-attention path without re-reading pair
+  features per head or making a giant kernel with worse locality.
+
+Decision:
+- Promote `PROTENIX_TRITON_LOCAL_ATTN_OUTPUT_BF16=1` in the high-throughput
+  stack.
+- Keep the implementation opt-in until more input sizes are gated; the current
+  validation is strong for the 7r6r-style benchmark but not yet a broad
+  upstream default policy.
+- Continue with current-candidate NCU and then target atom transition and
+  elementwise/copy traffic, where the previous roofline still showed high DRAM
+  pressure.
