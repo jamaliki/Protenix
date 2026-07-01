@@ -479,14 +479,17 @@ class MSAStack(nn.Module):
             msa_pair_weighted = self.chunk_forward(
                 self.msa_pair_weighted_averaging, m_new, z, chunk_size
             )
-            m = dropout_add_rowwise(m, msa_pair_weighted[: m.shape[-3], :, :], self.p_drop, self.training)
+            msa_pair_weighted = msa_pair_weighted.narrow(-3, 0, m.shape[-3])
+            m = dropout_add_rowwise(
+                m, msa_pair_weighted, self.p_drop, self.training
+            )
             m_new = pad_at_dim(
                 m, dim=-3, pad_length=(0, self.msa_max_size - m.shape[-3]), value=0
             )
             m_transition = self.chunk_forward(
                 self.transition_m, m_new, None, chunk_size
             )
-            m = m + m_transition[: m.shape[-3], :, :]
+            m = m + m_transition.narrow(-3, 0, m.shape[-3])
             if (not self.training) and (z.shape[-2] > 2000 or m.shape[-3] > 5120):
                 del msa_pair_weighted, m_transition
         else:
@@ -513,7 +516,7 @@ class MSAStack(nn.Module):
                 [..., n_msa_sampled, n_token, c_m]
         """
 
-        def fixed_length_chunk(m, chunk_length, dim=0):
+        def fixed_length_chunk(m, chunk_length, dim=-3):
             dim_size = m.size(dim)
             chunk_num = (dim_size + chunk_length - 1) // chunk_length
             chunks = []
@@ -527,9 +530,9 @@ class MSAStack(nn.Module):
             return chunks
 
         checkpoint_fn = get_checkpoint_fn()
-        # Split the tensor `m` into chunks along the first dimension
-        # m_chunks = torch.chunk(m, chunk_size, dim=0)
-        m_chunks = fixed_length_chunk(m, chunk_size, dim=0)
+        # Split along the MSA axis, not the leading axis.  The leading axes may
+        # be a batch of independent proteins.
+        m_chunks = fixed_length_chunk(m, chunk_size, dim=-3)
 
         # Process each chunk with gradient checkpointing
         if z is not None:
@@ -539,7 +542,7 @@ class MSAStack(nn.Module):
         if (not self.training) and m.shape[-3] > 5120:
             del m_chunks
         # Concatenate the processed chunks back together
-        m = torch.cat(processed_chunks, dim=0)
+        m = torch.cat(processed_chunks, dim=-3)
         if (not self.training) and m.shape[-3] > 5120:
             del processed_chunks
         return m
@@ -564,11 +567,10 @@ class MSAStack(nn.Module):
         for i in range(no_chunks):
             start = i * chunk_size
             end = min((i + 1) * chunk_size, num_msa)
+            m_chunk = m.narrow(-3, start, end - start)
             # Use inplace to save memory
-            m[start:end, :, :] += self.msa_pair_weighted_averaging(
-                m[start:end, :, :], z
-            )
-            m[start:end, :, :] += self.transition_m(m[start:end, :, :])
+            m_chunk += self.msa_pair_weighted_averaging(m_chunk, z)
+            m_chunk += self.transition_m(m_chunk)
         return m
 
 
@@ -896,8 +898,9 @@ class MSAModule(nn.Module):
         # Line2
         msa_sample = self.linear_no_bias_m(msa_sample)
 
-        # Auto broadcast [...,n_msa_sampled, n_token, c_m]
-        msa_sample = msa_sample + self.linear_no_bias_s(s_inputs)
+        # Broadcast the per-token embedding over the MSA rows.  The explicit
+        # ``-3`` insert keeps any leading sequence batch axes intact.
+        msa_sample = msa_sample + self.linear_no_bias_s(s_inputs).unsqueeze(-3)
         blocks = self._prep_blocks(
             pair_mask=pair_mask,
             triangle_multiplicative=triangle_multiplicative,
