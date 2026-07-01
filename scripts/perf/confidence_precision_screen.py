@@ -131,7 +131,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-blocks", type=int, default=4)
     parser.add_argument("--max-atoms-per-token", type=int, default=20)
     parser.add_argument("--hidden-scale-up", type=str_bool, default=True)
-    parser.add_argument("--input-dtype", choices=["float32", "bfloat16"], default="bfloat16")
+    parser.add_argument(
+        "--input-dtype",
+        choices=["float32", "bfloat16"],
+        default="float32",
+        help=(
+            "Synthetic trunk/input embedding dtype. Keep the default FP32: "
+            "AMP then chooses BF16 kernels where production inference allows it."
+        ),
+    )
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--load-checkpoint-dir", type=Path, default=Path("checkpoint"))
     parser.add_argument("--model-name", default="protenix-v2")
