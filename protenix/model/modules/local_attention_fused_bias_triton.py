@@ -93,14 +93,14 @@ if triton_fused_local_attention_bias_attention_available():
         block_d: tl.constexpr,
         dot_input_precision: tl.constexpr,
     ):
-        pid = tl.program_id(0).to(tl.int64)
+        pid = tl.program_id(0)
         trunk = pid % n_trunks
         head = (pid // n_trunks) % n_heads
         sample = pid // (n_trunks * n_heads)
 
-        offs_m = tl.arange(0, block_m).to(tl.int64)
-        offs_n = tl.arange(0, block_n).to(tl.int64)
-        offs_d = tl.arange(0, block_d).to(tl.int64)
+        offs_m = tl.arange(0, block_m)
+        offs_n = tl.arange(0, block_n)
+        offs_d = tl.arange(0, block_d)
         q_idx = trunk * block_m + offs_m
         k_idx = trunk * block_m - pad_left + offs_n
         q_mask = q_idx < n_atoms
