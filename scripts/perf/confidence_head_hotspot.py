@@ -53,6 +53,35 @@ def cuda_profile_capture(
     return out
 
 
+def profile_cuda_ops(
+    fn: Callable[[], torch.Tensor | tuple[torch.Tensor, ...]],
+    warmup: int,
+    row_limit: int,
+) -> list[dict[str, float | int | str]]:
+    with torch.no_grad():
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        ) as profiler:
+            fn()
+        torch.cuda.synchronize()
+    rows = []
+    for event in profiler.key_averages():
+        cuda_us = float(getattr(event, "cuda_time_total", 0.0) or 0.0)
+        if cuda_us > 0:
+            rows.append({"key": event.key, "count": event.count, "cuda_time_us": cuda_us})
+    rows.sort(key=lambda row: row["cuda_time_us"], reverse=True)
+    return rows[:row_limit]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples", type=int, default=32)
@@ -67,6 +96,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--triangle-attention", default="cuequivariance")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument(
+        "--profile-target",
+        choices=["none", "distance", "pairformer", "logits", "full"],
+        default="none",
+    )
+    parser.add_argument("--profile-row-limit", type=int, default=30)
     parser.add_argument(
         "--ncu-target",
         choices=["none", "distance", "pairformer", "logits", "full"],
@@ -238,12 +273,20 @@ def main() -> None:
             "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
             "peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
         }
+    profile = (
+        profile_cuda_ops(
+            targets[args.profile_target], args.warmup, args.profile_row_limit
+        )
+        if args.profile_target != "none"
+        else []
+    )
 
     print(
         json.dumps(
             {
                 "args": vars(args),
                 "device": torch.cuda.get_device_name(),
+                "profile": profile,
                 "rows": rows,
                 "timestamp": time.time(),
             },
