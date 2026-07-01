@@ -2959,3 +2959,49 @@ Decision:
   head/trunk/sample ordering can reduce excessive sectors without increasing
   math. Otherwise shift to the atom/trunk transition MLP, where the largest
   remaining kernels are explicitly memory-bound (`SiLU/mul` and gate traffic).
+
+### Round 54 - rejected contiguous Q/K/V local-attention layout
+
+Status: rejected and reverted
+
+Hypothesis:
+- Round 52's source-counter rule reported `66.34%` excessive global sectors.
+  The current Q/K/V projection layout is `[sample, atom, head, dim]` followed by
+  a transpose to `[sample, head, atom, dim]`, so a single head sees atom stride
+  `128` and dim stride `1`. Materializing Q/K/V as head-contiguous before the
+  Triton local-attention kernel should improve coalescing inside the kernel.
+
+Change:
+- Commit `7de4c82` added an opt-in
+  `PROTENIX_TRITON_LOCAL_ATTN_CONTIG_QKV=1` path that calls
+  `q.contiguous()`, `k.contiguous()`, and `v.contiguous()` immediately before
+  flattening into the Triton local-attention kernel.
+- Commit `0cf79f6` reverted it after the hotspot screen below.
+
+Hotspot screen:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round111_contig_qkv_local_attention_hotspot_20260701_121011`.
+- Workload: same cached atom-transformer hotspot as Rounds 52-53,
+  `N_sample=1280`, `p_samples=1`, BF16, current promoted flags,
+  `--warmup 8 --iters 30 --transition-residual 1`.
+
+| variant | attention path | full atom block | transition | finite | peak reserved |
+| --- | ---: | ---: | ---: | --- | ---: |
+| base | 16.699 ms | 27.341 ms | 9.875 ms | yes | 12704 MiB |
+| contiguous Q/K/V | 21.055 ms | 31.704 ms | 9.861 ms | yes | 12704 MiB |
+| base repeat | 16.689 ms | 27.336 ms | 9.858 ms | yes | 12704 MiB |
+
+Interpretation:
+- The coalescing diagnosis is useful, but a standalone `.contiguous()` is the
+  wrong way to fix it. The extra materialization/copy cost is far larger than
+  any local-attention memory-sector improvement.
+- This also confirms a broader constraint for future "mega" work: changing the
+  Q/K/V layout must be fused into the projection/output path. A separate layout
+  conversion in front of the attention kernel is not viable.
+
+Decision:
+- Reject and revert `7de4c82`.
+- Do not add explicit contiguous Q/K/V before atom local attention.
+- A legitimate follow-up would need a projection kernel that writes the desired
+  head-contiguous layout directly and an output path that avoids a compensating
+  copy before `linear_o`; otherwise shift effort to transition MLP fusion.
