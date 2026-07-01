@@ -1499,3 +1499,118 @@ Decision:
   The next ambitious candidate should target launch/orchestration overhead in
   the diffusion trunk loop, with CUDA graphs or `torch.compile`/Inductor as the
   smallest decisive screen before considering custom mega-kernels.
+
+### Round 30 - trunk capture and roofline diagnostics
+
+Status: diagnostic; capture rejected
+
+Question:
+- Is the remaining trunk/atom transformer time launch/orchestration limited,
+  or are the important launches already near a relevant H100 roofline?
+
+Experiments:
+- `torch.compile` screen:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round47_trunk_compile_screen_20260701_023557`.
+- CUDA Graph screen with fast LayerNorm:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round48_trunk_cudagraph_screen_20260701_023940`.
+- CUDA Graph screen with `LAYERNORM_TYPE=torch` fallback and NCU roofline
+  reports from Nsight Compute `2026.1.1`:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round49_graph_ln_fallback_roofline_20260701_024352`.
+
+Capture results at `N_sample=640`, BF16, one H100:
+
+| target | eager ms | candidate ms | speedup | parity / status |
+| --- | ---: | ---: | ---: | --- |
+| `torch.compile` attention | 4.741 | 5.070 | 0.935x | finite; slower |
+| `torch.compile` transition | 3.355 | 3.771 | 0.890x | finite; slower |
+| `torch.compile` block | 9.121 | 10.048 | 0.908x | finite; slower |
+| `torch.compile` stack4 | 36.614 | 39.669 | 0.923x | finite; slower |
+| CUDA Graph, fast LN, attention | 4.717 | 4.352 | 1.084x | invalid; graph output all NaN |
+| CUDA Graph, fast LN, transition | 3.336 | 2.922 | 1.142x | invalid; graph output contains NaNs |
+| CUDA Graph, torch LN, attention | 4.952 | 4.965 | 0.997x | exact parity; finite |
+| CUDA Graph, torch LN, transition | 3.592 | 3.580 | 1.003x | exact parity; finite |
+| CUDA Graph, torch LN, block | 9.589 | 9.579 | 1.001x | exact parity; finite |
+| CUDA Graph, torch LN, stack4 | 38.496 | 38.277 | 1.006x | exact parity; finite |
+
+Interpretation:
+- `torch.compile(mode="reduce-overhead")` is rejected in this environment. It
+  graph-breaks on the custom fast LayerNorm extension and is slower on every
+  static-shape trunk target.
+- CUDA Graph replay with the default fast LayerNorm is not numerically valid.
+  The PyTorch/OpenFold LayerNorm fallback makes graph replay finite, but then
+  the speedup is effectively zero. Capture is therefore not a legitimate
+  throughput path unless the fast LayerNorm extension itself is made graph-safe
+  and the full model gate proves a real win.
+
+NCU SpeedOfLight/roofline launch-family summary, `N_sample=640`:
+
+| target | launch family | time | share | roofline indication |
+| --- | --- | ---: | ---: | --- |
+| atom attention | local bias projection Triton | 7.720 ms | 43.9% | memory-pipeline saturated: memory 96.9%, L1/TEX 97.0%, DRAM 32.4%, SM 35.2% |
+| atom attention | tensor-core GEMMs | 3.225 ms | 18.3% | memory-limited small GEMMs: memory/DRAM 73.4%, SM 16.9% |
+| atom attention | local attention Triton | 1.750 ms | 9.9% | mixed memory/softmax/value path: memory 66.1%, DRAM 63.2%, SM 44.8% |
+| atom attention | LN/gates/elementwise/copies | 4.908 ms | 27.9% | mostly memory-bound, many already fused pointwise kernels |
+| atom transition | tensor-core GEMMs | 2.351 ms | 49.3% | memory-heavy GEMMs: memory/DRAM 76.2%, SM 21.0% |
+| atom transition | SiLU/sigmoid/gates/LN | 2.397 ms | 50.2% | memory-bound epilogues/LN, 74-93% memory throughput |
+| trunk attention | cuDNN/CUTLASS FMHA | 2.040 ms | 54.0% | mixed compute/cache path: memory 77.0%, DRAM 14.1%, SM 54.7% |
+| trunk attention | tensor-core GEMMs | 1.322 ms | 35.0% | reasonably hot tensor path: memory 72.3%, SM 78.8% |
+| trunk attention | gates/multiply/copies | 0.417 ms | 11.0% | memory-bound but small |
+| trunk transition | tensor-core GEMMs | 1.998 ms | 59.6% | reasonably hot tensor path: memory 72.9%, SM 78.0% |
+| trunk transition | SiLU/sigmoid/gates/LN | 1.324 ms | 39.5% | memory-bound, 65-93% memory throughput |
+
+Decision:
+- Higher `N_sample` does not help much beyond the promoted point because the
+  important kernels scale linearly and are already memory-pipeline, DRAM, or
+  tensor-pipe limited. There is little fixed launch overhead left to amortize
+  in the finite/correct path.
+- The next kernel work should not be a broad trunk SDPA replacement. The
+  highest isolated atom launch is the pair-bias producer, but any fusion must
+  reuse the 16-channel `z` vector across all four heads; a per-head fusion is
+  expected to reread too much memory.
+
+### Round 31 - rejected true fused atom bias-attention kernel
+
+Status: rejected and reverted
+
+Hypothesis:
+- A more ambitious "mega-kernel" could remove the 7.7 ms atom local pair-bias
+  producer and the 1.75 ms local-attention consumer boundary by computing
+  `LayerNorm(z) @ W_head` inside the local-attention score kernel.
+
+Change:
+- Added an opt-in `PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS_ATTN=1` prototype in
+  commits `9e34672`, `2513d5c`, and `92bfc9f`.
+- The first version worked at `N_sample=64` but hit illegal memory access at
+  `N_sample=640`; the cause was 32-bit pointer offset overflow for the large
+  `z` tensor. Commit `92bfc9f` fixed this by using int64 Triton offsets.
+
+Experiments:
+- Initial warp sweep:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round50_fused_bias_attention_screen_20260701_025320`.
+- Int64 confirmation:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round51_fused_bias_attention_int64_20260701_025515`.
+
+Results:
+
+| shape | split fused-bias + local attention | true fused bias+attention | speed vs split | parity |
+| --- | ---: | ---: | ---: | --- |
+| N64, best 8-warps | 1.509 ms | 6.774 ms | 0.223x | max diff `0.00390625`, finite |
+| N640, 8-warps | 14.073 ms | 64.743 ms | 0.217x | max diff `0.0078125`, finite |
+
+Interpretation:
+- The candidate failed for the predicted reason: the current producer computes
+  all four heads in one pass over the 16-channel pair vector, while the
+  per-head fused attention prototype rereads `z` once per head and keeps a
+  large 32x128 bias/score tile live. Removing a launch and a materialized bias
+  tensor did not compensate for the extra memory traffic and register pressure.
+- This is an example where "mega-kernel" fusion is the wrong boundary. A
+  credible all-head fused atom kernel would need a different design that reuses
+  pair-vector statistics across heads without holding four full score matrices
+  live in registers.
+
+Decision:
+- Rejected. Reverted the prototype and hotspot extension in `d1467e0`,
+  `a1be288`, and `845d304`.
+- Do not retry per-head fused atom bias-attention. If revisiting atom local
+  attention, write a design note for an all-head/staged producer-consumer
+  approach before coding.
