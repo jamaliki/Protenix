@@ -1614,3 +1614,57 @@ Decision:
 - Do not retry per-head fused atom bias-attention. If revisiting atom local
   attention, write a design note for an all-head/staged producer-consumer
   approach before coding.
+
+### Round 32 - rejected confidence sample chunking
+
+Status: rejected and reverted
+
+Hypothesis:
+- The confidence head loops over `N_sample` one structure at a time. Processing
+  small sample chunks together might amortize kernel launches and raise
+  occupancy in the confidence pairformer path without changing confidence
+  semantics.
+
+Change:
+- Added opt-in `PROTENIX_CONFIDENCE_SAMPLE_CHUNK_SIZE` in commit `73c4e9c`.
+  The default path still used the original one-sample loop.
+
+Experiment:
+- Failed first attempt without `PROTENIX_ROOT_DIR`, cancelled:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round52_confidence_chunk_screen_20260701_025909`.
+- Corrected paired screen, job `92743`:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round53_confidence_chunk_screen_20260701_030333`.
+- Workload: one H100, `N_sample=640`, `N_step=20`, `N_cycle=10`, unchunked
+  diffusion, promoted kernel flags, `PROTENIX_ROOT_DIR=/mnt/lustre/users/kiarash-eitgbi/protenix_data`.
+
+Results:
+
+| confidence sample chunk | forward sec | forward samples/sec | pairformer | diffusion | confidence | peak allocated MiB |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 44.116 | 14.507 | 11.850 s | 12.281 s | 12.399 s | 30410 |
+| 4 | 41.838 | 15.297 | 9.847 s | 12.171 s | 12.543 s | 30410 |
+| 8 | 41.722 | 15.340 | 9.830 s | 12.178 s | 12.513 s | 30410 |
+| 16 | 41.990 | 15.242 | 9.895 s | 12.176 s | 12.617 s | 30410 |
+| 32 | 41.341 | 15.481 | 9.682 s | 12.120 s | 12.327 s | 30410 |
+| 64 | 41.585 | 15.390 | 9.831 s | 12.166 s | 12.424 s | 30410 |
+
+Interpretation:
+- The intended metric did not move: `model_log.time.confidence` stayed
+  `12.3-12.6 s` for all chunk sizes, and peak memory was unchanged. The
+  apparent small forward-time improvement came from pairformer/diffusion
+  variation, not from a confidence-kernel speedup.
+- This suggests the existing confidence/pairformer kernels do not gain useful
+  occupancy or launch amortization from adding a leading sample batch in this
+  path, or the dominant confidence cost is elsewhere in the output/summary
+  pipeline.
+
+Decision:
+- Rejected. Reverted the opt-in chunking path in `d5a6146`.
+- Do not promote `PROTENIX_CONFIDENCE_SAMPLE_CHUNK_SIZE`.
+
+Next:
+- Profile the post-confidence summary/output work explicitly. The remaining
+  full forward wall time still contains several seconds outside the recorded
+  `model_forward` component, so the next useful measurement is whether
+  confidence summary/logit processing is a GPU, CPU, or synchronization
+  bottleneck before writing another kernel.
