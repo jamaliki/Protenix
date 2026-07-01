@@ -298,6 +298,41 @@ before custom-matmul overheads.  That is a real target, but not a 2x target:
 the implementation has to be vendor-quality, or the lost GEMM efficiency will
 erase the saved HBM traffic.
 
+#### Round 142-147: first custom-kernel boundary attempts
+
+The transition-output epilogue was the first CUTLASS target because it looked
+like a standard GEMM plus one auxiliary gate/residual load.  The correct tensor
+mapping is a strided-batched GEMM over tokens: each token batch multiplies
+`b[:, token, :] @ W.T`, shares the projection weight, and broadcasts
+`gate[0, token, :]` over samples.  The legacy CUTLASS
+`GemmUniversalWithBroadcast` wrapper did not become a viable implementation
+path on the Tokyo CUDA 13 stack: SM90 BF16 has no default configuration in that
+wrapper, the SM80 fallback needed extra output-op overloads, and compilation
+then hit a CUDA launch-stub failure around CUTLASS `Kernel2`.  This is a
+tooling rejection of that wrapper, not of the epilogue boundary itself.  A real
+attempt should use native CuTe/SM90 collectives rather than this CUTLASS-2
+broadcast path.
+
+The larger dual-input boundary was then prototyped directly in Triton: one
+kernel computed both `a @ W1.T` and `a @ W2.T`, then stored
+`silu(a1) * a2`.  A synthetic random-weight screen was initially encouraging:
+best tile `M128/N128/K64` measured 3.28 ms versus 3.67 ms for two cuBLAS GEMMs
+plus the Triton SiLU/multiply.  The representative model gate rejected it:
+
+| screen | baseline | candidate | decision |
+| --- | ---: | ---: | --- |
+| synthetic random weights | 3.67 ms | 3.28 ms | useful hypothesis only |
+| real transition input projection, autocast/module weights | 3.09 ms | 3.54 ms | reject |
+| full `ConditionedTransitionBlock` | 5.49 ms | 5.64 ms | reject |
+| trunk block | 25.89 ms | 26.21 ms | reject |
+
+The mechanism is clear: the true baseline is not the synthetic cuBLAS timing,
+but PyTorch/cuBLAS on the real module weights under autocast.  That path already
+runs the input projections in about 3.08 ms including the fused SiLU/multiply,
+so a custom kernel must preserve cuBLAS-class GEMM efficiency while deleting
+the HBM epilogue.  The Triton prototype did not.  It was reverted rather than
+kept as a default-off branch.
+
 ### 4. Use lower precision only where profiling supports it
 
 `PROTENIX_BF16_DIFFUSION_CORE=1` and `PROTENIX_BF16_ATOM_ATTENTION=1` reduce
@@ -476,6 +511,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Generic full-token Triton attention | slower than cuDNN/SDPA | vendor kernels win unless the shape mismatch is severe |
 | Fused self-attention `q/k/v/g` projection | exact parity but trunk block slowed from about 14.1 ms to 14.9 ms | fewer launches are not enough if the wider GEMM/cache/layout is worse |
 | Fused transition `a1/a2` projection without split-aware consumer | transition slowed from about 5.3 ms to 7.0 ms | fusing the producer can break the consumer by creating non-contiguous halves |
+| Custom Triton transition input GEMM+SiLU | synthetic +12%, but real transition input path slowed from 3.09 ms to 3.54 ms | custom GEMM screens must use real module weights/autocast; cuBLAS efficiency is the bottleneck to match |
 | CUDA graph capture of the denoiser | slower in this setup | graph overhead/constraints can outweigh launch savings |
 
 The main learning point: isolated wins are hypotheses, not promotions.  A
