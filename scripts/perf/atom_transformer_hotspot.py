@@ -96,6 +96,13 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of target calls inside the CUDA profiler capture range.",
     )
+    parser.add_argument(
+        "--transition-residual",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Pass the residual into ConditionedTransitionBlock, matching the promoted fused residual path.",
+    )
     return parser.parse_args()
 
 
@@ -149,7 +156,11 @@ def main() -> None:
 
     def run_transition() -> torch.Tensor:
         with amp:
-            return block.conditioned_transition_block(a=residual, s=c)
+            return block.conditioned_transition_block(
+                a=residual,
+                s=c,
+                residual=residual if args.transition_residual else None,
+            )
 
     def run_block() -> torch.Tensor:
         with amp:
@@ -196,6 +207,7 @@ def main() -> None:
         "device": torch.cuda.get_device_name(),
         "q_shape": list(q.shape),
         "p_shape": list(p.shape),
+        "transition_residual": bool(args.transition_residual),
         "attention_out_shape": list(attn_out.shape),
         "transition_out_shape": list(transition_out.shape),
         "block_out_shape": list(block_out.shape),
