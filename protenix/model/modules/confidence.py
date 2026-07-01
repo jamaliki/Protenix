@@ -35,6 +35,17 @@ def _env_float(name: str) -> Optional[float]:
     return float(value)
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return max(1, parsed)
+
+
 class ConfidenceHead(nn.Module):
     """
     Implements Algorithm 31 in AF3
@@ -245,22 +256,77 @@ class ConfidenceHead(nn.Module):
             [],
             [],
         )
-        for i in range(N_sample):
-            (
-                plddt_pred,
-                pae_pred,
-                pde_pred,
-                resolved_pred,
-            ) = self.memory_efficient_forward(
-                input_feature_dict=input_feature_dict,
-                s_trunk=s_trunk.clone() if inplace_safe else s_trunk,
-                z_pair=z_trunk.clone() if inplace_safe else z_trunk,
-                pair_mask=pair_mask,
-                x_pred_rep_coords=x_pred_rep_coords[..., i, :, :],
-                triangle_multiplicative=triangle_multiplicative,
-                triangle_attention=triangle_attention,
-                inplace_safe=inplace_safe,
-                chunk_size=chunk_size,
+        sample_chunk_size = _env_int("PROTENIX_CONFIDENCE_SAMPLE_CHUNK_SIZE", 1)
+        if inplace_safe:
+            sample_chunk_size = 1
+        if sample_chunk_size == 1:
+            for i in range(N_sample):
+                (
+                    plddt_pred,
+                    pae_pred,
+                    pde_pred,
+                    resolved_pred,
+                ) = self.memory_efficient_forward(
+                    input_feature_dict=input_feature_dict,
+                    s_trunk=s_trunk.clone() if inplace_safe else s_trunk,
+                    z_pair=z_trunk.clone() if inplace_safe else z_trunk,
+                    pair_mask=pair_mask,
+                    x_pred_rep_coords=x_pred_rep_coords[..., i, :, :],
+                    triangle_multiplicative=triangle_multiplicative,
+                    triangle_attention=triangle_attention,
+                    inplace_safe=inplace_safe,
+                    chunk_size=chunk_size,
+                )
+                if offload_pair_logits:
+                    # cpu offload pae_preds/pde_preds
+                    pae_pred = pae_pred.cpu()
+                    pde_pred = pde_pred.cpu()
+                    if empty_cache_after_offload:
+                        torch.cuda.empty_cache()
+                plddt_preds.append(plddt_pred)
+                pae_preds.append(pae_pred)
+                pde_preds.append(pde_pred)
+                resolved_preds.append(resolved_pred)
+            plddt_preds = torch.stack(
+                plddt_preds, dim=-3
+            )  # [..., N_sample, N_atom, plddt_bins]
+            pae_preds = torch.stack(
+                pae_preds, dim=-4
+            )  # [..., N_sample, N_token, N_token, pae_bins]
+            pde_preds = torch.stack(
+                pde_preds, dim=-4
+            )  # [..., N_sample, N_token, N_token, pde_bins]
+            resolved_preds = torch.stack(
+                resolved_preds, dim=-3
+            )  # [..., N_sample, N_atom, 2]
+            return (
+                plddt_preds,
+                pae_preds,
+                pde_preds,
+                resolved_preds,
+            )
+
+        for start in range(0, N_sample, sample_chunk_size):
+            end = min(start + sample_chunk_size, N_sample)
+            chunk_n = end - start
+            s_chunk = s_trunk.unsqueeze(-2).expand(
+                *s_trunk.shape[:-2], chunk_n, *s_trunk.shape[-2:]
+            )
+            z_chunk = z_trunk.unsqueeze(-3).expand(
+                *z_trunk.shape[:-3], chunk_n, *z_trunk.shape[-3:]
+            )
+            plddt_pred, pae_pred, pde_pred, resolved_pred = (
+                self.memory_efficient_forward(
+                    input_feature_dict=input_feature_dict,
+                    s_trunk=s_chunk,
+                    z_pair=z_chunk,
+                    pair_mask=pair_mask,
+                    x_pred_rep_coords=x_pred_rep_coords[..., start:end, :, :],
+                    triangle_multiplicative=triangle_multiplicative,
+                    triangle_attention=triangle_attention,
+                    inplace_safe=False,
+                    chunk_size=chunk_size,
+                )
             )
             if offload_pair_logits:
                 # cpu offload pae_preds/pde_preds
@@ -272,17 +338,17 @@ class ConfidenceHead(nn.Module):
             pae_preds.append(pae_pred)
             pde_preds.append(pde_pred)
             resolved_preds.append(resolved_pred)
-        plddt_preds = torch.stack(
+        plddt_preds = torch.cat(
             plddt_preds, dim=-3
         )  # [..., N_sample, N_atom, plddt_bins]
         # Pae_preds/pde_preds single tensor will occupy 11.6G[BF16]/23.2G[FP32]
-        pae_preds = torch.stack(
+        pae_preds = torch.cat(
             pae_preds, dim=-4
         )  # [..., N_sample, N_token, N_token, pae_bins]
-        pde_preds = torch.stack(
+        pde_preds = torch.cat(
             pde_preds, dim=-4
         )  # [..., N_sample, N_token, N_token, pde_bins]
-        resolved_preds = torch.stack(
+        resolved_preds = torch.cat(
             resolved_preds, dim=-3
         )  # [..., N_sample, N_atom, 2]
         return (
