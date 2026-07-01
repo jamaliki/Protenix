@@ -2842,3 +2842,120 @@ Decision:
 - Do not promote attention-residual fusion. Future atom work should target
   `_local_attention_kernel` or the transition MLP activation/output materialized
   traffic directly, with a same-run full gate required before promotion.
+
+### Round 52 - detailed NCU for cached atom local attention
+
+Status: diagnostic
+
+Question:
+- Is `_local_attention_kernel` actually compute-saturated, or is it limited by
+  register pressure, occupancy, and memory movement? Round 50 identified it as
+  the largest single atom launch, but only with basic roofline counters.
+
+Experiment:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round107_local_attention_detailed_ncu_20260701_120116`.
+- Commit: `de78445`.
+- Workload: one H100, cached atom attention shape
+  `q/c=[1280,2529,128]`, `p=[1,80,32,128,16]`, BF16 atom attention,
+  BF16 local-attention output, fused local pair-bias projection, current
+  promoted stack.
+- NCU command: `--set detailed`, one profiled
+  `regex:.*local_attention_kernel.*` launch inside
+  `scripts/perf/atom_transformer_hotspot.py --profile-target attention`.
+
+Key NCU counters for `_local_attention_kernel`:
+
+| metric | value |
+| --- | ---: |
+| duration | 3.20 ms |
+| grid size | 409600 CTAs |
+| block size | 32 threads |
+| registers/thread | 253 |
+| dynamic shared memory/block | 8.19 KiB |
+| theoretical occupancy | 12.50% |
+| achieved occupancy | 12.25% |
+| active warps/SM | 7.84 |
+| block limit from registers | 8 blocks/SM |
+| memory throughput | 69.46% |
+| compute/SM throughput | 47.73% |
+| DRAM throughput | 30.91% |
+| L1/TEX throughput | 69.60% |
+| L2 throughput | 48.50% |
+| achieved DRAM bandwidth | 1.04 TB/s |
+
+Profiler rules/stalls:
+- NCU marked memory as more heavily utilized than compute.
+- NCU marked theoretical occupancy as register-limited.
+- Source counters reported excessive global sectors: `66.34%` of theoretical
+  global sectors were excessive.
+- Largest not-issued stall buckets were `wait`, `long_scoreboard`,
+  `no_instructions`, `short_scoreboard`, and `mio_throttle`.
+
+Interpretation:
+- This kernel is not at H100 peak compute. It is a low-occupancy, register-heavy
+  softmax/value kernel with substantial on-chip/L1 pressure and inefficient
+  global sector use.
+- The obvious "more batch" answer cannot fix this launch: the grid is already
+  enormous (`409600` CTAs) and occupancy is limited by the per-CTA kernel shape,
+  not by insufficient work.
+- This profile justifies kernel-level work, but it also says a successful change
+  must reduce register pressure or memory-sector waste without adding extra
+  softmax/value work. A whole-model mega-kernel remains poorly motivated unless
+  it can preserve the strong vendor GEMMs/SDPA and directly remove this kind of
+  memory/register bottleneck.
+
+Decision:
+- Screen an online-softmax streaming local-attention variant that reduces the
+  live score tile from `32x128` to smaller key chunks.
+
+### Round 53 - rejected streaming atom local attention
+
+Status: rejected and reverted
+
+Hypothesis:
+- Round 52 showed `_local_attention_kernel` is register-limited at
+  `253 registers/thread` with only `12.5%` theoretical occupancy. A streaming
+  online-softmax kernel that processes the fixed 128-key local window in
+  smaller chunks should keep a smaller score/prob tile live and improve
+  occupancy enough to beat the extra loop/update work.
+
+Change:
+- Commit `f5cb2b0` added an opt-in
+  `PROTENIX_TRITON_LOCAL_ATTN_STREAMING=1` path with
+  `PROTENIX_TRITON_LOCAL_ATTN_STREAM_BLOCK_N={64,32}`.
+- Commit `885b50e` reverted it after the hotspot screen below.
+
+Hotspot screen:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round110_streaming_local_attention_hotspot_20260701_120623`.
+- Workload: same cached atom-transformer hotspot as Round 52,
+  `N_sample=1280`, `p_samples=1`, BF16, current promoted flags,
+  `--warmup 8 --iters 30 --transition-residual 1`.
+
+| variant | attention path | full atom block | transition | finite | peak reserved |
+| --- | ---: | ---: | ---: | --- | ---: |
+| base | 16.733 ms | 27.319 ms | 9.870 ms | yes | 12704 MiB |
+| streaming, 64-key chunks | 17.230 ms | 27.855 ms | 9.857 ms | yes | 12704 MiB |
+| streaming, 32-key chunks | 17.621 ms | 28.253 ms | 9.853 ms | no | 12704 MiB |
+| base repeat | 16.682 ms | 27.322 ms | 9.854 ms | yes | 12704 MiB |
+
+Interpretation:
+- The profile diagnosis was right, but this particular fix was wrong. Smaller
+  score tiles did not compensate for the extra online-softmax bookkeeping and
+  extra dot/exp phases.
+- The 32-key variant is invalid for promotion regardless of speed because it
+  produced non-finite attention/block outputs.
+- The stable base repeat makes the regression clear: 64-key streaming is about
+  `+3.0%` slower on the attention path and `+2.0%` slower on the full atom
+  block.
+
+Decision:
+- Reject and revert `f5cb2b0`.
+- Do not carry a default-off streaming path. The next atom-local-attention
+  attempt should attack memory coalescing/sector waste or the Q/K/V/bias layout,
+  not just split the softmax tile.
+- If staying in atom work, inspect whether the local-attention q/k/v layout or
+  head/trunk/sample ordering can reduce excessive sectors without increasing
+  math. Otherwise shift to the atom/trunk transition MLP, where the largest
+  remaining kernels are explicitly memory-bound (`SiLU/mul` and gate traffic).
