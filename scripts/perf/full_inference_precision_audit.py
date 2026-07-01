@@ -549,8 +549,14 @@ def main() -> None:
     if not dataset.inputs:
         raise ValueError("no inputs selected")
 
-    sample_name = f"{dataset.inputs[0]['name']}_precision_audit_seed{args.seed}"
-    data, _atom_array, feature_times = prepare_data(dataset, 0, sample_name)
+    raw_name = dataset.inputs[0]["name"]
+
+    def build_data(suffix: str) -> tuple[dict[str, Any], dict[str, float]]:
+        sample_name = f"{raw_name}_precision_audit_seed{args.seed}_{suffix}"
+        run_data, _atom_array, run_feature_times = prepare_data(dataset, 0, sample_name)
+        return run_data, run_feature_times
+
+    data, feature_times = build_data("shape")
     n_token = int(data["N_token"].item())
     n_atom = int(data["N_atom"].item())
     n_msa = int(data["N_msa"].item())
@@ -558,11 +564,16 @@ def main() -> None:
 
     for warmup_idx in range(args.warmup_runs):
         seed_everything(seed=args.seed + 90000001 + warmup_idx, deterministic=args.deterministic)
+        warmup_data, _ = build_data(f"warmup{warmup_idx}")
+        # Protenix deletes large input features during inference once caches are
+        # built.  Re-featurizing each pass keeps warmup from changing the traced
+        # input and avoids auditing an impossible post-mutation state.
         with torch.inference_mode():
-            _ = runner.predict(data)
+            _ = runner.predict(warmup_data)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
+    data, feature_times = build_data("trace")
     seed_everything(seed=args.seed, deterministic=args.deterministic)
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
