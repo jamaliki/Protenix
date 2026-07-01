@@ -1435,3 +1435,67 @@ Next:
   workload changes to one where atom transformer blocks dominate. The next
   full-workload bottlenecks are the diffusion trunk transformer, confidence
   summary/pairformer work, and broad memory-bound LN/gating paths.
+
+### Round 29 - trunk attention NCU launch attribution
+
+Status: diagnostic
+
+Question:
+- The trunk block hotspot showed `attention_qkv_sdpa_gate_out` at `9.759 ms`
+  for `N_sample=640`, but fused self-QKV regressed. Which launches inside that
+  subrange actually cost GPU time?
+
+Change:
+- Added an NCU capture mode to `scripts/perf/trunk_attention_hotspot.py` in
+  commit `a0d1c9e`.
+
+Experiment:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round46_trunk_ncu_20260701_022956`.
+- Workload: `N_sample=640`, 245 tokens, 16 heads, head dim 48, BF16, efficient
+  pair-bias projection enabled, one H100.
+
+NCU launch attribution for one warmed trunk attention call:
+
+| launch family | GPU kernel time | share of profiled GPU kernels | NCU indication |
+| --- | ---: | ---: | --- |
+| `fmha_cutlassF_bf16_aligned_64x64_rf_sm80` | 2.040 ms | 54.2% | fused attention kernel, 54.7% SM, 76.9% tensor pipe |
+| q/k/v/out tensor-core GEMMs, grouped | 1.305 ms | 34.7% | 75-80% tensor pipe; not an obvious hand-GEMM target |
+| `_sigmoid_mul_kernel` gate | 0.232 ms | 6.2% | memory-bound gate, 90.9% compute-memory throughput |
+| final multiply | 0.157 ms | 4.2% | memory-bound elementwise |
+| small elementwise/copies | 0.030 ms | 0.8% | not material individually |
+
+NCU launch attribution for one warmed trunk conditioned-transition call:
+
+| launch family | GPU kernel time | share of profiled GPU kernels | NCU indication |
+| --- | ---: | ---: | --- |
+| transition tensor-core GEMMs, grouped | 1.965 ms | 59.3% | 59-88% tensor pipe depending GEMM |
+| `_silu_mul_kernel` | 0.468 ms | 14.1% | memory-bound |
+| `_sigmoid_mul_add_kernel` | 0.307 ms | 9.3% | memory-bound |
+| `_sigmoid_mul_kernel` | 0.231 ms | 7.0% | memory-bound |
+| two `LayerNormForwardV2` launches | 0.309 ms | 9.3% | memory-bound |
+
+Interpretation:
+- This is the strongest evidence so far that the trunk attention wall time is
+  not explained by one bad GPU kernel. NCU sees only `3.764 ms` of GPU kernels
+  inside the same attention target that the CUDA-event hotspot measured near
+  `9.76 ms`. The missing time is consistent with CPU/framework/launch gaps or
+  library orchestration around many small launches and SDPA setup.
+- A "mega-kernel" for trunk attention would need to replace an already-good
+  cuDNN/CUTLASS FMHA kernel plus efficient GEMMs. That is a high-complexity
+  path with limited roofline upside unless it also removes orchestration and
+  adjacent pointwise/LN traffic.
+- The more credible high-leverage mechanisms are:
+  1. CUDA graph capture/replay or compile-style capture for the static-shape
+     diffusion trunk loop to remove launch/orchestration gaps.
+  2. Fusing the cheap memory-bound gate/multiply epilogue around existing GEMMs
+     only if the fusion does not pessimize cuBLAS/cuDNN kernels.
+  3. Algorithmic confidence-output work, because confidence still takes about
+     10-11 s in the full gate and may compute more pair logits than design
+     ranking actually needs.
+
+Decision:
+- Do not attempt a hand-written replacement for cuDNN SDPA as the next step.
+  The next ambitious candidate should target launch/orchestration overhead in
+  the diffusion trunk loop, with CUDA graphs or `torch.compile`/Inductor as the
+  smallest decisive screen before considering custom mega-kernels.
