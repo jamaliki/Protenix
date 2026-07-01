@@ -33,6 +33,7 @@ from protenix.model.utils import (
 from protenix.model.modules.fused_elementwise_triton import (
     fused_sigmoid_mul,
     fused_sigmoid_mul_add,
+    fused_sigmoid_split_mul_add,
 )
 
 
@@ -66,6 +67,15 @@ def _try_triton_local_attention(
 
 def _local_attention_gate_fusion_requested() -> bool:
     return os.getenv("PROTENIX_TRITON_LOCAL_ATTN_FUSE_GATE", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
+def _adaln_projection_fusion_requested() -> bool:
+    return os.getenv("PROTENIX_FUSED_ADALN_PROJECTION", "0").lower() not in {
         "0",
         "false",
         "off",
@@ -242,6 +252,59 @@ class AdaptiveLayerNorm(nn.Module):
         self.linear_nobias_s = LinearNoBias(
             in_features=c_s, out_features=c_a, initializer="zeros"
         )
+        self._projection_cache_key = None
+        self._projection_weight = None
+        self._projection_bias = None
+
+    def _can_fuse_projection(self, a: torch.Tensor, s: torch.Tensor) -> bool:
+        if not _adaln_projection_fusion_requested():
+            return False
+        if torch.is_grad_enabled():
+            return False
+        if not a.is_cuda or not s.is_cuda:
+            return False
+        if a.dtype != s.dtype:
+            return False
+        if (
+            self.linear_s.precision is not None
+            or self.linear_nobias_s.precision is not None
+        ):
+            return False
+        if self.linear_s.bias is None:
+            return False
+        if a.shape[-1] != self.linear_s.out_features:
+            return False
+        if s.shape[-1] != self.linear_s.in_features:
+            return False
+        if s.shape[:-1] == a.shape[:-1]:
+            return True
+        # The high-throughput diffusion path keeps s sample-independent with
+        # shape [1, N_token, c_s] while a has [N_sample, N_token, c_a].
+        # Keep that broadcast implicit; expanding s would erase the win.
+        return (
+            s.dim() == a.dim()
+            and s.shape[0] == 1
+            and a.shape[0] > 1
+            and s.shape[1:-1] == a.shape[1:-1]
+        )
+
+    def _projection_params(self) -> tuple[torch.Tensor, torch.Tensor]:
+        weights = (self.linear_s.weight, self.linear_nobias_s.weight)
+        bias = self.linear_s.bias
+        cache_key = tuple((w.data_ptr(), w._version) for w in weights) + (
+            (bias.data_ptr(), bias._version),
+        )
+        if cache_key != self._projection_cache_key:
+            # AdaLN needs two projections of the same normalized conditioning:
+            # one gate and one additive offset.  A single wider GEMM preserves
+            # the fast cuBLAS path while removing one launch and one read of s.
+            self._projection_weight = torch.cat(weights, dim=0).contiguous()
+            self._projection_bias = torch.cat(
+                (bias, torch.zeros_like(bias)),
+                dim=0,
+            ).contiguous()
+            self._projection_cache_key = cache_key
+        return self._projection_weight, self._projection_bias
 
     def forward(self, a: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         """
@@ -257,7 +320,12 @@ class AdaptiveLayerNorm(nn.Module):
         """
         a = self.layernorm_a(a)
         s = self.layernorm_s(s)
-        a = fused_sigmoid_mul_add(self.linear_s(s), a, self.linear_nobias_s(s))
+        if self._can_fuse_projection(a, s):
+            weight, bias = self._projection_params()
+            projected = F.linear(s, weight, bias)
+            a = fused_sigmoid_split_mul_add(projected, a, self.linear_s.out_features)
+        else:
+            a = fused_sigmoid_mul_add(self.linear_s(s), a, self.linear_nobias_s(s))
         return a
 
 

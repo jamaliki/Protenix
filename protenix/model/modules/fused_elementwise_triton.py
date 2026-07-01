@@ -21,6 +21,13 @@ each intermediate tensor is written to and reread from HBM.  A one-pass Triton
 kernel is useful here because it removes intermediate memory traffic without
 trying to replace cuBLAS/cuDNN kernels that are already highly optimized.
 
+Some helpers consume a wider projection whose final dimension is split in two.
+That pattern matters for GPU optimization: a single GEMM can produce
+``[gate, offset]`` in one contiguous tensor, and the following Triton kernel can
+read the two halves directly.  Splitting into PyTorch views is mathematically
+cheap, but many downstream kernels require contiguous inputs and would silently
+fall back to slower paths or add copies.
+
 Every public helper falls back to the original PyTorch expression when the
 shape, dtype, device, or autograd mode is outside the profiled inference path.
 """
@@ -110,6 +117,45 @@ def _can_use_first_dim_broadcast_triton(
     if x.shape[0] != 1 or y.shape[0] <= 1:
         return False
     return x.shape[1:] == y.shape[1:] and x.numel() > 0
+
+
+def _can_use_split_x_mul_add_triton(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    split_size: int,
+) -> bool:
+    if not triton_fused_elementwise_enabled():
+        return False
+    if not triton_fused_elementwise_available():
+        return False
+    if torch.is_grad_enabled():
+        return False
+    if split_size <= 0:
+        return False
+    if x.dtype not in _SUPPORTED_DTYPES:
+        return False
+    if not x.is_cuda or not y.is_cuda:
+        return False
+    if x.dtype != y.dtype:
+        return False
+    if not x.is_contiguous() or not y.is_contiguous():
+        return False
+    if x.dim() != y.dim():
+        return False
+    if x.shape[-1] != 2 * split_size or y.shape[-1] != split_size:
+        return False
+    if x.numel() == 0 or y.numel() == 0:
+        return False
+    if x.shape[:-1] == y.shape[:-1]:
+        return True
+    # Diffusion uses sample-independent conditioning with leading dimension 1.
+    # The kernel maps each sample row back to the matching singleton-row gate
+    # and offset instead of materializing those tensors N_sample times.
+    return (
+        x.shape[0] == 1
+        and y.shape[0] > 1
+        and x.shape[1:-1] == y.shape[1:-1]
+    )
 
 
 def _broadcast_z_mode(
@@ -246,6 +292,33 @@ if triton_fused_elementwise_available():
         out = a * (1.0 / (1.0 + tl.exp(-a))) * b
         tl.store(out_ptr + offsets, out, mask=mask)
 
+    @triton.jit
+    def _sigmoid_split_mul_add_kernel(
+        x_ptr,
+        y_ptr,
+        out_ptr,
+        n_elements: tl.constexpr,
+        split_size: tl.constexpr,
+        x_row_count: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = pid * block_size + tl.arange(0, block_size)
+        mask = offsets < n_elements
+        cols = offsets % split_size
+        y_rows = offsets // split_size
+        x_rows = y_rows % x_row_count
+        x_base = x_rows * (2 * split_size)
+        gate = tl.load(x_ptr + x_base + cols, mask=mask, other=0.0).to(tl.float32)
+        offset = tl.load(
+            x_ptr + x_base + split_size + cols,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        out = (1.0 / (1.0 + tl.exp(-gate))) * y + offset
+        tl.store(out_ptr + offsets, out, mask=mask)
+
 
 def _grid(n_elements: int) -> tuple[int]:
     return (triton.cdiv(n_elements, _BLOCK_SIZE),)
@@ -338,6 +411,28 @@ def triton_silu_mul_split(
     return out
 
 
+def triton_sigmoid_split_mul_add(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    split_size: int,
+) -> Optional[torch.Tensor]:
+    if not _can_use_split_x_mul_add_triton(x, y, split_size):
+        return None
+    out = torch.empty_like(y)
+    x_row_count = x.numel() // (2 * split_size)
+    _sigmoid_split_mul_add_kernel[_grid(y.numel())](
+        x,
+        y,
+        out,
+        y.numel(),
+        split_size,
+        x_row_count,
+        block_size=_BLOCK_SIZE,
+        num_warps=4,
+    )
+    return out
+
+
 def fused_sigmoid_mul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = triton_sigmoid_mul(x, y)
     if out is not None:
@@ -369,3 +464,15 @@ def fused_silu_mul_split(x: torch.Tensor, split_size: int) -> torch.Tensor:
         return out
     a, b = x.split(split_size, dim=-1)
     return F.silu(a) * b
+
+
+def fused_sigmoid_split_mul_add(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    split_size: int,
+) -> torch.Tensor:
+    out = triton_sigmoid_split_mul_add(x, y, split_size)
+    if out is not None:
+        return out
+    gate, offset = x.split(split_size, dim=-1)
+    return torch.sigmoid(gate) * y + offset
