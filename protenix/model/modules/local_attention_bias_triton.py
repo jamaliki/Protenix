@@ -33,7 +33,10 @@ _BLOCK_SIZE = 256
 
 
 def triton_fused_local_attention_bias_enabled() -> bool:
-    return os.getenv("PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS", "0").lower() not in {
+    value = os.getenv("PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS")
+    if value is None:
+        value = os.getenv("PROTENIX_TRITON_LOCAL_ATTN", "0")
+    return value.lower() not in {
         "0",
         "false",
         "off",

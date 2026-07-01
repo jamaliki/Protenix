@@ -51,19 +51,21 @@ export PROTENIX_BF16_DIFFUSION_CORE=1
 export PROTENIX_ATTENTION_FORCE_FP32=0
 export PROTENIX_TRITON_LOCAL_ATTN=1
 export PROTENIX_TRITON_LOCAL_ATTN_NUM_WARPS=1
+export PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS=1
 export PROTENIX_TRITON_FUSED_ELEMENTWISE=1
 export PROTENIX_BF16_ATOM_ATTENTION=1
 ```
 
-Best measured one-H100 throughput so far is `6.890` aggregate samples/sec at
+Best measured one-H100 throughput so far is `7.162` aggregate samples/sec at
 `N_sample=640`, `N_step=200`, true unchunked diffusion on the 7r6r benchmark
-input after the BF16 local-attention one-warp retune. This is `13.05x` over the
-original per-GPU default aggregate baseline of `0.528` samples/sec. The
-previous `N_sample=960` run measured `6.863` samples/sec before the warp
-retune, while reserving `73.8 GiB` instead of `50.0 GiB`; repeat N960 before
-claiming the retune changes the high-memory best point. The goal remains open
-because the remaining profile still contains material tensor-core GEMM, cuDNN
-SDPA, local-attention, LayerNorm, and elementwise/copy work.
+input after the fused local-attention pair-bias projection. This is `13.56x`
+over the original per-GPU default aggregate baseline of `0.528` samples/sec.
+The previous `N_sample=960` run measured `6.863` samples/sec before the
+one-warp and fused-bias retunes, while reserving `73.8 GiB` instead of
+`50.0 GiB`; repeat N960 before claiming the retunes change the high-memory best
+point. The goal remains open because the remaining profile still contains
+material tensor-core GEMM, cuDNN SDPA, local-attention, LayerNorm, and
+elementwise/copy work.
 
 ## Running report
 
@@ -1155,3 +1157,85 @@ Next:
   bias/value traffic rather than more batching. The next kernel-level work
   should attack the actual local-attention data movement, or fuse adjacent
   memory-bound LayerNorm/elementwise paths, not just adjust launch parameters.
+
+### Round 25 - fused local-attention pair-bias projection
+
+Status: promoted
+
+Hypothesis:
+- In atom local attention, `AttentionPairBias.local_multihead_attention`
+  materializes the pair-bias producer as
+  `LayerNorm(c_atompair=16) -> Linear(16 -> 4 heads) -> permute`, then the
+  Triton local-attention kernel immediately rereads the bias. At `N_sample=640`
+  this is a large linear-scaling memory path in every atom-transformer block.
+- A fused producer can write the final
+  `[..., n_heads, n_trunks, 32, 128]` bias layout directly and remove the
+  normalized-pair intermediate while preserving the existing local-attention
+  consumer kernel.
+
+Change:
+- Added `protenix/model/modules/local_attention_bias_triton.py`.
+- Added `PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS`. If unset, it now follows
+  `PROTENIX_TRITON_LOCAL_ATTN`, so the fused bias producer is part of the
+  guarded Triton local-attention fast path and can still be explicitly disabled.
+- Wired the fused producer into `AttentionPairBias.local_multihead_attention`
+  with exact-shape guards and fallback to the existing PyTorch path.
+- Added `scripts/perf/local_attention_bias_hotspot.py` to compare the bias
+  producer alone and the full local-attention block.
+
+Implementation note:
+- The first naive Triton producer read each 16-channel pair vector once for
+  LayerNorm statistics and then again once per head. It was rejected by the
+  hotspot screen (`15.56 ms` reference full block vs `19.70 ms` candidate at
+  N320) and exposed an int32 address overflow at N640.
+- The promoted kernel reads `z` once and accumulates all four head projections
+  during that pass:
+  `projected_h = (sum(z * ln_weight * linear_weight_h) - mean * sum(ln_weight * linear_weight_h)) * rstd`.
+  Address arithmetic was widened to int64 for the multi-GiB N640 `z` tensor.
+
+Hotspot screen:
+- Rejected naive run:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round30c_fused_local_bias_hotspot_20260701_010439`.
+- Promoted optimized run:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round31_fused_local_bias_hotspot_opt_20260701_010622`.
+
+| shape | metric | reference | optimized fused producer | speedup | parity |
+| --- | --- | ---: | ---: | ---: | --- |
+| N320 BF16 | bias projection | 11.727 ms | 3.862 ms | 3.04x | max bias diff `0.03125` |
+| N320 BF16 | full local-attention block | 15.626 ms | 6.473 ms | 2.41x | max output diff `0.0078125` |
+| N640 BF16 | bias projection | 23.193 ms | 7.716 ms | 3.01x | max bias diff `0.03125` |
+| N640 BF16 | full local-attention block | 30.811 ms | 12.865 ms | 2.39x | max output diff `0.009765625` |
+
+Representative full inference gate:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round32_fused_local_bias_full_gate_20260701_010815`.
+- Commit: `aa0131e`.
+- Workload: `N_sample=640`, BF16 diffusion core, BF16 atom attention, true
+  unchunked diffusion, one warmup 7r6r item and one timed 7r6r item per
+  variant, dump disabled, one H100 on `gpu-canary-0`.
+
+| variant | aggregate samples/sec | forward samples/sec | forward sec | diffusion | atom encoder | atom decoder | transformer | confidence | peak allocated MiB | finite coords |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| fused bias off | 6.923 | 6.943 | 92.185 | 71.728 s | 15.865 s | 11.475 s | 43.066 s | 10.808 s | 30788 | yes |
+| fused bias on | 7.162 | 7.183 | 89.103 | 68.742 s | 14.263 s | 9.877 s | 43.277 s | 10.774 s | 30788 | yes |
+
+Interpretation:
+- The full workload improved `+3.45%` aggregate throughput with unchanged peak
+  allocation/reservation and finite coordinates.
+- The movement is in the intended component: atom encoder plus decoder time
+  falls from `27.34 s` to `24.14 s`, while trunk transformer and confidence are
+  effectively unchanged.
+- This is a real fusion win rather than config tuning: it removes a
+  memory-heavy local-attention bias producer intermediate and preserves the
+  existing attention kernel.
+
+Decision:
+- Promote fused local-attention pair-bias projection as part of the current
+  Triton local-attention throughput stack.
+
+Next:
+- Profile the fused-bias stack to see whether atom local attention is now
+  dominated by the softmax/value kernel, q/k/v projections, or adjacent
+  adaptive LayerNorm/gating. The next candidate should be another producer/
+  consumer fusion in the atom transformer or a trunk transition epilogue fusion
+  that preserves cuDNN SDPA and tensor-core GEMMs.
