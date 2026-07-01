@@ -3156,3 +3156,73 @@ Decision:
   layout-producing projection or an all-head fused bias/attention design that
   reuses the 16-channel pair feature across heads; both are larger rewrites and
   should be designed before coding.
+
+### Round 58 - confidence-head hotspot attribution
+
+Status: diagnostic
+
+Question:
+- At the current `N_sample=2560` max-throughput point, confidence still costs
+  about `42 s` of the full forward. Is that dominated by cheap output logits
+  and summary reductions, or by the confidence pairformer itself?
+
+Change:
+- Added `scripts/perf/confidence_head_hotspot.py` in commits `5956638`,
+  `10feac0`, `aca475f`, and `cd3de6e`.
+- The harness uses representative 7r6r-style dimensions
+  (`245` tokens, `2529` atoms, confidence `c_s=384`, `c_z=128`) and separates
+  one confidence sample into distance embedding, confidence pairformer, and
+  output-logit heads.
+
+Experiments:
+- First working CUDA-event component split:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round116_confidence_hotspot_nograd_20260701_123223`.
+- Pairformer launch-family profile:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round118_confidence_pairformer_profile2_20260701_123522`.
+- Hardware: one H100. Synthetic weights/data, but exact module shapes and
+  default `cuequivariance` triangle kernels.
+
+Component timing, one confidence sample:
+
+| component | time |
+| --- | ---: |
+| full `memory_efficient_forward` | 16.87-21.84 ms |
+| confidence pairformer stack | 16.43-22.04 ms |
+| distance embedding (`cdist` + bins) | 0.17-0.28 ms |
+| PAE/PDE/pLDDT/resolved logits | 0.35-0.42 ms |
+
+Top CUDA launch families inside one confidence pairformer call:
+
+| launch family / op | count | CUDA time |
+| --- | ---: | ---: |
+| `aten::matmul` / `aten::linear` / `aten::mm` aggregate | ~92-100 | ~5.6 ms |
+| `cuequivariance::triangle_attention` | 8 | 3.78 ms |
+| cuBLAS SGEMM `128x128x8` family | 48 | 3.57 ms |
+| `native_sm80_fprop_fmha_fp32_ffma_64x32x32` | 8 | 3.06 ms |
+| cuBLAS SGEMM `64x64x8` family | 20 | 1.96 ms |
+| `cuequivariance::fused_gated_dual_gemm` | 16 | 1.81 ms |
+| clones/copies/contiguous | 40-56 | 1.1-1.2 ms |
+| LayerNorm | 24 | 0.57 ms |
+
+Interpretation:
+- The remaining same-output confidence cost is not the PAE/PDE/pLDDT logits or
+  the post-confidence summary path. Those are already sub-millisecond per
+  sample after the earlier streaming/summary work.
+- The cost is almost entirely the confidence pairformer, repeated once per
+  generated structure. That explains why increasing `N_sample` does not improve
+  throughput: this is real per-sample pairformer work, not fixed overhead.
+- A small "confidence logit kernel" would be irrelevant. Meaningful
+  same-output confidence acceleration would have to target the pairformer
+  block itself: cuequivariance triangle attention/multiplication, many
+  small/medium FP32 GEMMs, and layout/copy traffic. That is a separate
+  pairformer-kernel campaign, not a one-off epilogue fusion.
+- For protein-design throughput, a coordinate-only or deferred-confidence mode
+  is now clearly the largest remaining product-level lever, but it changes
+  output semantics and should be reported separately from same-output speedups.
+
+Decision:
+- Use this as the confidence bottleneck map.
+- Do not spend time fusing PAE/PDE/pLDDT logit heads.
+- Next same-output kernel work should either move to a real pairformer-kernel
+  campaign or stop and expose an explicit coordinate-only/deferred-confidence
+  throughput mode as a semantic tradeoff.
