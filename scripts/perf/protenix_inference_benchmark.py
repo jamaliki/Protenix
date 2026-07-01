@@ -42,6 +42,15 @@ def optional_int(value: str | int | None) -> int | None:
     return int(value)
 
 
+def optional_bool(value: str | bool | None) -> bool | None:
+    if value is None or isinstance(value, bool):
+        return value
+    normalized = value.strip().lower()
+    if normalized in {"auto", "none", "null", "-1"}:
+        return None
+    return str_bool(value)
+
+
 def parse_seeds(seed_arg: str, count: int | None) -> list[int]:
     if count is not None:
         base = int(seed_arg.split(",")[0]) if seed_arg else 101
@@ -186,6 +195,15 @@ def run_one(
     row["n_msa"] = int(data["N_msa"].item())
 
     runner.update_model_configs(update_inference_configs(runner.configs, row["n_token"]))
+    if args.skip_amp_confidence_head is not None:
+        # update_inference_configs() conservatively disables AMP for the base
+        # confidence head at <=2560 tokens.  This override is for controlled
+        # precision screening only; the default path above is unchanged.
+        runner.configs.skip_amp.confidence_head = args.skip_amp_confidence_head
+        runner.model.configs.skip_amp.confidence_head = args.skip_amp_confidence_head
+    row["skip_amp_confidence_head"] = bool(
+        runner.model.configs.skip_amp.confidence_head
+    )
     seed_everything(seed=seed, deterministic=args.deterministic)
 
     if torch.cuda.is_available():
@@ -329,6 +347,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-cache", type=str_bool, default=True)
     parser.add_argument("--enable-fusion", type=str_bool, default=True)
     parser.add_argument("--enable-tf32", type=str_bool, default=True)
+    parser.add_argument(
+        "--skip-amp-confidence-head",
+        type=optional_bool,
+        default=None,
+        help=(
+            "Override confidence-head autocast policy after update_inference_configs. "
+            "auto/none keeps the production default; false runs the confidence head under AMP."
+        ),
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--chunk-size", type=optional_int, default=None)
     parser.add_argument("--sample-diffusion-chunk-size", type=optional_int, default=5)

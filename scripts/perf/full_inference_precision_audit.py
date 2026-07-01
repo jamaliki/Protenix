@@ -30,6 +30,7 @@ from runner.batch_inference import get_default_runner
 from runner.inference import update_inference_configs
 from scripts.perf.protenix_inference_benchmark import (
     default_model_params,
+    optional_bool,
     optional_int,
     parse_input_indices,
     prediction_sample_count,
@@ -488,6 +489,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-cache", type=str_bool, default=True)
     parser.add_argument("--enable-fusion", type=str_bool, default=True)
     parser.add_argument("--enable-tf32", type=str_bool, default=True)
+    parser.add_argument(
+        "--skip-amp-confidence-head",
+        type=optional_bool,
+        default=None,
+        help="auto/none keeps runner default; false lets confidence head run under AMP.",
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--chunk-size", type=optional_int, default=None)
     parser.add_argument("--sample-diffusion-chunk-size", type=optional_int, default=None)
@@ -561,6 +568,9 @@ def main() -> None:
     n_atom = int(data["N_atom"].item())
     n_msa = int(data["N_msa"].item())
     runner.update_model_configs(update_inference_configs(runner.configs, n_token))
+    if args.skip_amp_confidence_head is not None:
+        runner.configs.skip_amp.confidence_head = args.skip_amp_confidence_head
+        runner.model.configs.skip_amp.confidence_head = args.skip_amp_confidence_head
 
     for warmup_idx in range(args.warmup_runs):
         seed_everything(seed=args.seed + 90000001 + warmup_idx, deterministic=args.deterministic)
@@ -606,6 +616,9 @@ def main() -> None:
             "n_token": n_token,
             "n_atom": n_atom,
             "n_msa": n_msa,
+            "skip_amp_confidence_head": bool(
+                runner.model.configs.skip_amp.confidence_head
+            ),
             "prediction_samples": prediction_sample_count(prediction, args.n_sample),
             "coordinate_all_finite": finite_coordinate,
             "cuda_memory": cuda_memory(),
