@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 from contextlib import nullcontext
 from typing import Optional, Union
@@ -41,6 +42,47 @@ def _env_int(name: str) -> Optional[int]:
     if value is None or not value.strip():
         return None
     return int(value)
+
+
+def _select_representative_atom_coords(
+    x_pred_coords: torch.Tensor, x_rep_atom_mask: torch.Tensor
+) -> torch.Tensor:
+    """Select representative atoms without mixing leading protein batches.
+
+    A plain ``x[..., mask, :]`` is correct for one protein, but a batched mask
+    ``[B, N_atom]`` would be interpreted as advanced indexing over the sample
+    axis of ``[B, N_sample, N_atom, 3]``.  Flatten the protein batch and apply
+    each protein's mask only to that protein.
+    """
+    x_rep_atom_mask = x_rep_atom_mask.bool()
+    if x_rep_atom_mask.dim() == 1:
+        return x_pred_coords[..., x_rep_atom_mask, :]
+
+    mask_prefix_shape = x_rep_atom_mask.shape[:-1]
+    coord_prefix_shape = x_pred_coords.shape[:-2]
+    assert coord_prefix_shape[: len(mask_prefix_shape)] == mask_prefix_shape
+
+    flat_batch = math.prod(mask_prefix_shape)
+    extra_shape = coord_prefix_shape[len(mask_prefix_shape) :]
+    coords_flat = x_pred_coords.reshape(
+        flat_batch, *extra_shape, *x_pred_coords.shape[-2:]
+    )
+    mask_flat = x_rep_atom_mask.reshape(flat_batch, x_rep_atom_mask.shape[-1])
+    selected_items = [
+        coords_flat[batch_idx][..., mask_flat[batch_idx], :]
+        for batch_idx in range(flat_batch)
+    ]
+    selected = torch.stack(selected_items, dim=0)
+    return selected.reshape(*mask_prefix_shape, *extra_shape, *selected.shape[1:])
+
+
+def _atom_weight_einsum(
+    atom_features: torch.Tensor, atom_weights: torch.Tensor
+) -> torch.Tensor:
+    """Apply atom-specific confidence weights for unbatched or batched atoms."""
+    if atom_weights.dim() == 3:
+        return torch.einsum("...nc,ncb->...nb", atom_features, atom_weights)
+    return torch.einsum("...nc,...ncb->...nb", atom_features, atom_weights)
 
 
 def _confidence_logit_context():
@@ -227,7 +269,9 @@ class ConfidenceHead(nn.Module):
         x_rep_atom_mask = input_feature_dict[
             "distogram_rep_atom_mask"
         ].bool()  # [N_atom]
-        x_pred_rep_coords = x_pred_coords[..., x_rep_atom_mask, :]
+        x_pred_rep_coords = _select_representative_atom_coords(
+            x_pred_coords, x_rep_atom_mask
+        )
         N_sample = x_pred_rep_coords.size(-3)
 
         z_init = (
@@ -355,7 +399,9 @@ class ConfidenceHead(nn.Module):
                 z_trunk = 0 * z_trunk
 
         x_rep_atom_mask = input_feature_dict["distogram_rep_atom_mask"].bool()
-        x_pred_rep_coords = x_pred_coords[..., x_rep_atom_mask, :]
+        x_pred_rep_coords = _select_representative_atom_coords(
+            x_pred_coords, x_rep_atom_mask
+        )
         N_sample = x_pred_rep_coords.size(-3)
 
         z_init = (
@@ -489,13 +535,11 @@ class ConfidenceHead(nn.Module):
             a = broadcast_token_to_atom(
                 x_token=s_single, atom_to_token_idx=atom_to_token_idx
             )
-            plddt_pred = torch.einsum(
-                "...nc,ncb->...nb",
+            plddt_pred = _atom_weight_einsum(
                 self.plddt_ln(a),
                 self.plddt_weight[atom_to_tokatom_idx],
             )
-            resolved_pred = torch.einsum(
-                "...nc,ncb->...nb",
+            resolved_pred = _atom_weight_einsum(
                 self.resolved_ln(a),
                 self.resolved_weight[atom_to_tokatom_idx],
             )
