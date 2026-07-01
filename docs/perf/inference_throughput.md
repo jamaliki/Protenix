@@ -206,11 +206,69 @@ This is why a single "mega-kernel" is not an obvious next win.  Some hot
 launches are already efficient vendor/library kernels, while the memory-bound
 pieces are spread across the pairformer.
 
-A follow-up precision screen loaded the real
-`protenix_base_default_v1.0.0.pt` confidence-head weights and ran the
-production-like BF16 autocast path.  In that path, the confidence pairformer
-matmuls already produce BF16 outputs.  The remaining FP32 matmuls are the final
-confidence logits:
+### Full-path precision audit
+
+Use `scripts/perf/full_inference_precision_audit.py` to rank matmul-like work
+by inferred compute dtype across a real `runner.predict()` call.  The script
+records the explicit `module.precision` on Protenix/OpenFold `Linear` modules,
+because those modules can force FP32 internally and then cast the output back.
+Output dtype alone is not a reliable precision audit.
+
+On one H100, commit `2396ab2`, input `7r6r`, `N_sample=32`, `N_step=20`, and
+the optimized inference flags above, the audit reported:
+
+| family | estimated matmul FLOPs | dtype / reason |
+| --- | ---: | --- |
+| diffusion module | 53.2 TF | BF16, promoted optimized path |
+| trunk pairformer stack | 21.5 TF | BF16 |
+| non-module attention/einsum ops | 6.5 TF | BF16 |
+| confidence head | 5.8 TF | FP32 because `update_inference_configs()` sets `skip_amp.confidence_head=True` for base models under 2560 tokens |
+| cuequivariance triangle-multiplicative einsums | 1.0 TF | FP32, associated with the FP32 confidence path |
+| explicitly forced FP32 Protenix linears | 0.013 TF | too small to matter end-to-end |
+
+The largest explicitly forced FP32 linears were in diffusion conditioning and
+coordinate projection:
+
+| module/op | shape/count in audit | estimated work |
+| --- | --- | ---: |
+| `diffusion_conditioning.linear_no_bias_z` | `[245,245,256] -> [245,245,128]`, once | 3.93 GF |
+| `diffusion_conditioning.linear_no_bias_s` | `[245,833] -> [245,384]`, 20 calls | 3.13 GF |
+| `diffusion_module.linear_no_bias_s` | `[1,245,384] -> [1,245,768]`, 20 calls | 2.89 GF |
+| atom encoder/decoder coordinate linears | 20 calls each | 2.49 GF combined |
+
+These are numerically plausible lower-precision candidates, but they are not
+legitimate throughput targets: together they are less than 0.02% of the
+estimated matmul work in the audit.
+
+The material FP32 candidate was therefore the whole confidence head, not the
+small forced-FP32 coordinate linears.  `scripts/perf/protenix_inference_benchmark.py`
+now has a default-neutral screening override:
+
+```bash
+--skip-amp-confidence-head false
+```
+
+That override keeps the production default unless explicitly passed, then lets
+the confidence head run under the outer BF16 autocast context after
+`update_inference_configs()`.
+
+A paired screen at `N_sample=128`, `N_step=20` rejected this idea:
+
+| run | baseline forward samples/s | confidence AMP samples/s | delta | confidence-head time |
+| --- | ---: | ---: | ---: | --- |
+| baseline then candidate | 20.79 | 19.64 | -5.6% | 2.11s -> 2.38s |
+| candidate then baseline | 20.96 | 20.35 | -2.9% | 2.10s -> 2.28s |
+
+Decision: do not promote whole-confidence BF16/AMP.  With
+`enable_tf32=True`, the current FP32 confidence GEMMs can still use TF32 tensor
+cores where cuBLAS/cuDNN allow it.  The BF16 autocast path adds casts and sends
+some library/einsum work down a slower route for this shape.
+
+A narrower precision screen loaded the real
+`protenix_base_default_v1.0.0.pt` confidence-head weights and tested only the
+final confidence logits under BF16.  In that isolated direct-module path, the
+pairformer matmuls can produce BF16 outputs; the remaining FP32 matmuls are the
+final confidence logits:
 
 | module/op | shape | status |
 | --- | --- | --- |
@@ -230,8 +288,9 @@ raised peak allocated memory in the screen (about 705 MiB versus 652 MiB) due to
 upcast traffic.
 
 Decision: do not promote BF16 confidence logits or global TF32 precision as a
-throughput optimization.  The safe lower-precision candidates exist, but the
-matmuls are too small in the real path to be the next bottleneck.
+throughput optimization.  The safe lower-precision candidates exist, but either
+they are too small in the real path or the full lower-precision route is slower
+than the current FP32+TF32 policy.
 
 ## Negative results worth remembering
 
@@ -244,6 +303,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Query-splitting the local-attention CTA | slower and more memory | reducing register pressure can duplicate other work |
 | Forcing confidence pairformer non-inplace | +0.08% e2e, below noise | wrapper clone cleanup is too small |
 | BF16 final confidence logits | reduced FP32 logit matmuls but no NCU/timing win | the remaining FP32 matmuls are too small and cast traffic dominates |
+| Whole confidence head under AMP | 2.9-5.6% slower at `N_sample=128`, `N_step=20` | lower dtype is not automatically faster when FP32 uses TF32 tensor cores and casts/library paths change |
 | Generic full-token Triton attention | slower than cuDNN/SDPA | vendor kernels win unless the shape mismatch is severe |
 | CUDA graph capture of the denoiser | slower in this setup | graph overhead/constraints can outweigh launch savings |
 
@@ -277,6 +337,8 @@ Production code touched by the throughput stack:
 Profiling and reproducibility helpers:
 
 - `scripts/perf/protenix_inference_benchmark.py`: full-model throughput gate.
+- `scripts/perf/full_inference_precision_audit.py`: full-run matmul precision
+  audit; records forced-FP32 modules and non-module einsums/matmuls.
 - `scripts/perf/atom_transformer_hotspot.py`: atom block hotspot screen.
 - `scripts/perf/local_attention_hotspot.py`: local-attention kernel screen.
 - `scripts/perf/local_attention_bias_hotspot.py`: bias-projection screen.
