@@ -2256,3 +2256,53 @@ Next:
 - Target the real full-path costs: diffusion token transformer attention/GEMMs,
   confidence-head/sample-summary cost, and atom-transformer work that is still
   sample-scaled rather than cached with sample dimension `1`.
+
+### Round 42 - promoted-stack detailed full-path timing
+
+Status: diagnostic
+
+Question:
+- After rejecting the synthetic 2D local-bias win, where is the real
+  high-throughput full-model time spent under the current promoted stack?
+
+Experiment:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round80_promoted_detailed_timing_20260701_081505`.
+- Commit: `ee55ece`.
+- Workload: one H100, 7r6r input, `N_sample=1280`, `N_step=200`,
+  unchunked diffusion, current promoted stack, `PROTENIX_TIMING_DIFFUSION=1`.
+
+Result:
+
+| component | time |
+| --- | ---: |
+| forward total | 164.639 s |
+| end-to-end throughput | 7.761 samples/sec |
+| pairformer | 2.731 s |
+| diffusion total | 137.899 s |
+| diffusion token transformer | 90.478 s |
+| diffusion atom encoder | 26.755 s |
+| diffusion atom decoder | 18.072 s |
+| diffusion conditioning | 1.976 s |
+| confidence head | 21.475 s |
+| summary confidence | 2.145 s |
+| peak reserved | 18.0 GiB |
+
+Interpretation:
+- The current dominant same-output bottleneck is the diffusion token
+  transformer, not local pair-bias production. It is about `55%` of full
+  forward time and `66%` of diffusion time.
+- Atom encoder/decoder remain material (`44.8 s` combined), but the rejected
+  2D-bias experiment showed that the cached pair-bias producer is not the
+  sample-scaled part of that cost.
+- Confidence head is still a large linear-in-sample cost (`21.5 s`), but
+  earlier BF16 and sample-chunking attempts regressed or failed to move it.
+  Skipping or deferring confidence would be an output/semantics tradeoff, not a
+  same-output kernel optimization.
+
+Decision:
+- Use this as the current bottleneck map for the next round.
+- Same-output kernel work should target the diffusion token transformer first:
+  24 blocks per denoising step, 200 denoising steps, `N_sample x 245 tokens x
+  16 heads x head_dim 48`, with already efficient cuDNN/SDPA and conv2d
+  pair-bias projection.
