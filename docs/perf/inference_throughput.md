@@ -41,9 +41,10 @@ Use the following for the current best high-throughput 7r6r-style inference
 path:
 
 ```bash
-# Safe high-throughput default. Use N_SAMPLE=960 only for max-throughput
-# runs that can tolerate running close to the 80 GB memory cliff.
-export N_SAMPLE=640
+# Conservative high-throughput default for the 7r6r-style benchmark.
+# N_SAMPLE=2560 is the current max-throughput point, but the marginal gain
+# over N_SAMPLE=1280 is only about 0.6% and memory rises to 36.4 GiB reserved.
+export N_SAMPLE=1280
 export SAMPLE_DIFFUSION_CHUNK_SIZE=none
 export CHUNK_SIZE=none
 export PROTENIX_GPU_RANDOM_AUGMENT=1
@@ -55,18 +56,21 @@ export PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS=1
 export PROTENIX_TRITON_FUSED_ELEMENTWISE=1
 export PROTENIX_BF16_ATOM_ATTENTION=1
 export PROTENIX_SUMMARY_SAMPLE_CHUNK_SIZE=32
+export PROTENIX_STREAM_CONFIDENCE_SUMMARY=1
+export PROTENIX_CONFIDENCE_LOGIT_CHUNK_SIZE=32
 ```
 
-Safe measured one-H100 throughput so far is `7.484` end-to-end samples/sec and
-`7.507` forward samples/sec at `N_sample=640`, `N_step=200`, true unchunked
-diffusion on the 7r6r benchmark input after the fused local-attention pair-bias
-projection and chunked confidence-summary processing. The max-throughput
-high-memory point is `N_sample=960` with `7.565` end-to-end samples/sec and
-`7.581` forward samples/sec, while reserving `73.6 GiB`; this is `14.33x` over
-the original per-GPU default aggregate baseline of `0.528` samples/sec. The
-goal remains open because the remaining profile still contains material
-tensor-core GEMM, cuDNN SDPA, local-attention, LayerNorm, and elementwise/copy
-work.
+Measured one-H100 throughput with streamed confidence summary is `7.723`
+end-to-end samples/sec and `7.736` forward samples/sec at `N_sample=1280`,
+`N_step=200`, true unchunked diffusion on the 7r6r benchmark input. The current
+max-throughput point is `N_sample=2560` with `7.769` end-to-end samples/sec and
+`7.775` forward samples/sec, reserving `36.4 GiB`; this is `14.71x` over the
+original per-GPU default aggregate baseline of `0.528` samples/sec. Larger
+batches now work because confidence PAE/PDE logits are streamed into
+summary/full-data chunks instead of materializing the full FP32 logit stack.
+The marginal batch-size gain is now nearly exhausted; the remaining profile is
+dominated by diffusion and confidence kernels that scale almost linearly in
+`N_sample`.
 
 ## Running report
 
@@ -1780,3 +1784,152 @@ Next:
 - Do not retry normal N1280 without first changing confidence-logit
   materialization; the known failure mode is the full FP32 PAE/PDE stack, not
   the now-fixed summary wrapper.
+
+### Round 35 - streamed confidence logits unlock higher batches
+
+Status: promoted behind an explicit inference flag
+
+Hypothesis:
+- The remaining memory cliff is not diffusion; it is the full FP32
+  `pae`/`pde` logit stack materialized by `ConfidenceHead.forward` before
+  summary/full-data processing. If logits are generated in sample chunks and
+  immediately consumed by `compute_full_data_and_summary`, N1280 should run and
+  the confidence-summary path should retain exact output parity for dumped
+  inference fields.
+
+Change:
+- Added `ConfidenceHead.iter_logit_chunks(...)` and
+  `Protenix.run_confidence_summary_stream(...)` in commit `075d860`.
+- Enabled by `PROTENIX_STREAM_CONFIDENCE_SUMMARY=1` for inference-only calls
+  with no labels or symmetric permutation. The raw `plddt`/`pae`/`pde`/`resolved`
+  logits are intentionally omitted in this mode; inference dumping uses
+  `coordinate`, `contact_probs`, `summary_confidence`, and `full_data`.
+- `PROTENIX_CONFIDENCE_LOGIT_CHUNK_SIZE` controls the logit chunk; the promoted
+  stack uses `32`, matching the existing summary chunk size.
+
+Correctness:
+- Direct same-tensor parity passed in
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round62_stream_confidence_direct_parity3_20260701_042929`.
+  The test compared normal confidence logits plus summary against streamed
+  confidence summary/full-data for the same `s_inputs`, `s`, `z`, coordinates,
+  and contact probabilities across all summary and full-data keys.
+- On the direct N32 screen, the streamed confidence-summary block reduced time
+  from `0.774 s` to `0.609 s` and peak allocated memory from `3344 MiB` to
+  `2739 MiB`.
+
+Full 7r6r gate, `N_step=200`, one H100, normal async throughput timing:
+
+| variant | forward sec | forward samples/sec | end-to-end samples/sec | confidence head | summary confidence | peak allocated MiB | peak reserved MiB | finite coords |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| N640, no stream | 84.924 | 7.536 | 7.513 | 10.792 s | 1.025 s | 30788 | 49858 | yes |
+| N640, stream | 84.482 | 7.576 | 7.552 | 10.316 s | 1.045 s | 10190 | 10700 | yes |
+| N960, stream | 125.859 | 7.628 | 7.611 | 16.117 s | 1.611 s | 14133 | 15620 | yes |
+| N1280, stream | 165.455 | 7.736 | 7.723 | 20.758 s | 2.102 s | 18076 | 21598 | yes |
+
+Interpretation:
+- Streaming is only a small throughput win at N640 (`+0.5%`) because the
+  normal path already uses chunked summary and most time is diffusion. It is a
+  large memory win: peak reserved drops from `49.9 GiB` to `10.7 GiB`.
+- The previous N960 memory cliff (`73.6 GiB` reserved) was confidence-logit
+  materialization, not true model activation pressure. With streaming, N960
+  reserves only `15.6 GiB`, and N1280 runs at `21.6 GiB` reserved.
+- Increasing batch size now helps, but only modestly, because the per-sample
+  diffusion and confidence costs are already close to linear.
+
+Decision:
+- Promote `PROTENIX_STREAM_CONFIDENCE_SUMMARY=1` and
+  `PROTENIX_CONFIDENCE_LOGIT_CHUNK_SIZE=32` in the high-throughput stack.
+- Update the conservative high-throughput point to N1280 and keep testing
+  higher batches until the marginal gain disappears.
+
+### Round 36 - current N1280 Nsight Compute roofline
+
+Status: diagnostic
+
+Question:
+- Are the remaining hot kernels actually hitting H100 peak compute, or are
+  higher batches limited by memory traffic, layout/copy traffic, and occupancy?
+
+Experiment:
+- NCU `2026.1.1` was run from a Slurm compute-node job, not the login node:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round65_current_ncu_roofline_n1280_20260701_050930`.
+- Command shape: isolated hotspot scripts at `samples=1280`, current commit
+  `075d860`, promoted streaming and Triton flags, with `--section SpeedOfLight`,
+  `--section SpeedOfLight_RooflineChart`, and
+  `--section SpeedOfLight_HierarchicalTensorRooflineChart`.
+
+Aggregated roofline counters:
+
+| hotspot | main family | report time | SM % | memory % | DRAM % | L2 % | L1 % | interpretation |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| atom attention | local bias projection | 15.420 ms | 35.2 | 97.0 | 32.5 | 34.4 | 97.0 | L1/shared-memory or on-chip memory pipe bound, not tensor compute bound |
+| atom attention | local attention kernel | 3.482 ms | 45.1 | 66.4 | 63.7 | 75.8 | 66.4 | mixed memory/occupancy bound; high registers (`244/thread`) |
+| atom attention | GEMMs | 6.447 ms | 16.9 | 73.9 | 73.9 | 70.1 | 21.5 | memory dominated despite tensor ops |
+| atom transition | GEMMs | 4.703 ms | 20.9 | 76.5 | 76.5 | 71.0 | 25.1 | memory dominated, low tensor utilization |
+| trunk attention | SDPA | 4.035 ms | 54.8 | 77.1 | 14.2 | 34.1 | 77.2 | not peak compute; mostly on-chip traffic/attention pipeline |
+| trunk attention | GEMMs | 2.593 ms | 80.4 | 74.0 | 54.6 | 67.3 | 75.0 | the closest to compute-saturated, but still memory-active |
+| trunk transition | GEMMs | 3.961 ms | 79.4 | 74.9 | 48.5 | 65.3 | 73.9 | near tensor-pipe saturation, not enough alone to dominate full runtime |
+| trunk transition | elementwise/copy | 2.053 ms | 28.7 | 90.8 | 90.7 | 81.1 | 14.9 | DRAM bandwidth dominated |
+
+Interpretation:
+- The model is not globally hitting maximum H100 compute. Some trunk GEMMs are
+  healthy (`~79-80%` SM/tensor utilization), but atom attention/transition and
+  elementwise/copy paths are memory-pipe limited.
+- The worst atom-attention launch remains the fused pair-bias projection
+  (`_project_local_attention_bias_kernel`): it removed Python/PyTorch overhead,
+  but now sits at `~97%` memory throughput and only `~35%` SM throughput. A
+  naive mega-kernel that rereads pair features per head is expected to lose,
+  matching the rejected true fused bias-attention prototype.
+- Higher batches do not buy much more once fixed pairformer/launch overhead is
+  amortized because the dominant diffusion kernels scale linearly and are
+  already memory-pipeline or tensor-pipe limited.
+
+Decision:
+- Do not keep increasing batch size expecting large gains. It is useful only
+  until fixed overhead is amortized.
+- The next legitimate kernel work must reduce memory traffic or improve
+  arithmetic intensity in atom local attention/transition and elementwise
+  paths; broad whole-block "mega kernels" are too likely to increase traffic
+  unless they are designed around all-head reuse of pair features.
+
+### Round 37 - high-batch saturation after streaming
+
+Status: diagnostic; max-throughput point updated
+
+Question:
+- After removing confidence-logit materialization, does 4x larger batch improve
+  throughput materially, or are we at the linear-scaling asymptote?
+
+Experiment:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round66_stream_confidence_high_batch_20260701_051340`.
+- Workload: one H100, 7r6r input only, `N_step=200`, `N_cycle=10`, unchunked
+  diffusion, promoted kernel flags, streamed confidence summary.
+
+Results:
+
+| N_sample | forward sec | forward samples/sec | end-to-end samples/sec | diffusion | confidence head | summary confidence | peak allocated MiB | peak reserved MiB | finite coords |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1280 | 165.455 | 7.736 | 7.723 | 140.007 s | 20.758 s | 2.102 s | 18076 | 21598 | yes |
+| 1920 | 247.380 | 7.761 | 7.753 | 210.518 s | 30.940 s | 3.340 s | 25961 | 29658 | yes |
+| 2560 | 329.254 | 7.775 | 7.769 | 281.547 s | 40.797 s | 4.344 s | 33846 | 36398 | yes |
+
+Interpretation:
+- N2560 is the best measured per-GPU throughput so far: `7.769` end-to-end
+  samples/sec, `14.71x` over the original default per-GPU baseline.
+- The marginal return is now tiny: N1920 is only `+0.38%` over N1280, and N2560
+  is only `+0.21%` over N1920 (`+0.59%` over N1280). This matches the roofline
+  picture: fixed pairformer overhead is already amortized, and diffusion plus
+  confidence scale nearly linearly with `N_sample`.
+- Memory is no longer the limiter at these sizes for the 245-token 7r6r input:
+  N2560 reserves `36.4 GiB`. For larger token/atom counts, keep N1280 as the
+  conservative high-throughput default until separately gated.
+
+Decision:
+- Record N2560 as the current max-throughput point for this input.
+- Keep N1280 in the promoted run block as the conservative default because it
+  gives `99.4%` of max throughput with much lower memory and shorter individual
+  job runtime.
+- Further batch-only sweeps are not a legitimate path to a large win. The next
+  work should be kernel redesign around atom local-attention/transition memory
+  traffic and elementwise/copy fusion.
