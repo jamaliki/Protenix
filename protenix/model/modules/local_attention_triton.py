@@ -50,12 +50,20 @@ def triton_local_attention_input_precision() -> str:
     return "tf32x3"
 
 
-def triton_local_attention_num_warps() -> int:
+def triton_local_attention_num_warps(dtype: torch.dtype) -> int:
+    default_num_warps = 2 if dtype == torch.float32 else 1
+    explicit_value = os.getenv("PROTENIX_TRITON_LOCAL_ATTN_NUM_WARPS")
+    if explicit_value is None:
+        # The 32x128 local window is too small for the previous 4-warp default.
+        # H100 screens showed BF16 is fastest with one warp, while the FP32 path
+        # is fastest with two. Keep this as a launch-time choice so callers can
+        # still override the value with the environment variable.
+        return default_num_warps
     try:
-        num_warps = int(os.getenv("PROTENIX_TRITON_LOCAL_ATTN_NUM_WARPS", "4"))
+        num_warps = int(explicit_value)
     except ValueError:
-        return 4
-    return num_warps if num_warps in {1, 2, 4, 8} else 4
+        return default_num_warps
+    return num_warps if num_warps in {1, 2, 4, 8} else default_num_warps
 
 
 _SUPPORTED_INPUT_DTYPES = {torch.float32, torch.bfloat16}
@@ -282,7 +290,7 @@ def triton_local_attention(
         block_n=n_keys,
         block_d=head_dim,
         dot_input_precision=triton_local_attention_input_precision(),
-        num_warps=triton_local_attention_num_warps(),
+        num_warps=triton_local_attention_num_warps(q.dtype),
     )
     if not batch_shape:
         return out[0]
