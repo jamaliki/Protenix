@@ -946,16 +946,23 @@ class AtomAttentionEncoder(nn.Module):
 
         # If provided, add trunk embeddings and noisy positions
         if r_l is not None:
-            p_lm = (
-                p_lm.unsqueeze(dim=-5)
-                + broadcast_token_to_local_atom_pair(
-                    z_token=self.linear_no_bias_z(self.layernorm_z(z)),
-                    atom_to_token_idx=atom_to_token_idx,
-                    n_queries=self.n_queries,
-                    n_keys=self.n_keys,
-                    compute_mask=False,
-                )[0]
-            )  # [..., N_sample, n_blocks, n_queries, n_keys, c_atompair]
+            p_lm = p_lm.unsqueeze(dim=-5)
+            z_lm = broadcast_token_to_local_atom_pair(
+                z_token=self.linear_no_bias_z(self.layernorm_z(z)),
+                atom_to_token_idx=atom_to_token_idx,
+                n_queries=self.n_queries,
+                n_keys=self.n_keys,
+                compute_mask=False,
+            )
+            z_lm = z_lm[0]
+            while z_lm.dim() < p_lm.dim():
+                # If z has no N_sample axis, the local gather returns
+                # [..., n_blocks, ...].  Insert the singleton sample axis
+                # explicitly; otherwise a leading protein batch would align
+                # with N_sample and broadcast to a false [B, B, ...] tensor.
+                z_lm = z_lm.unsqueeze(dim=-5)
+            # [..., N_sample, n_blocks, n_queries, n_keys, c_atompair]
+            p_lm = p_lm + z_lm
         return p_lm, c_l
 
     def forward(
