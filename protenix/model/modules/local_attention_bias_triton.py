@@ -29,8 +29,7 @@ except ImportError:  # pragma: no cover - optional runtime dependency.
 
 
 _SUPPORTED_DTYPES = {torch.float32, torch.bfloat16}
-_DEFAULT_BLOCK_SIZE = 256
-_DEFAULT_NUM_WARPS = 4
+_BLOCK_SIZE = 256
 _PREWEIGHT_CACHE: dict[
     tuple[int, int, int, int, torch.dtype, torch.device],
     tuple[torch.Tensor, torch.Tensor],
@@ -61,30 +60,6 @@ def triton_preweighted_local_attention_bias_enabled() -> bool:
         "off",
         "no",
     }
-
-
-def _env_int(name: str, default: int, allowed: set[int]) -> int:
-    try:
-        value = int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-    return value if value in allowed else default
-
-
-def _projection_block_size() -> int:
-    return _env_int(
-        "PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS_BLOCK_SIZE",
-        _DEFAULT_BLOCK_SIZE,
-        {64, 128, 256, 512, 1024},
-    )
-
-
-def _projection_num_warps() -> int:
-    return _env_int(
-        "PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS_NUM_WARPS",
-        _DEFAULT_NUM_WARPS,
-        {1, 2, 4, 8},
-    )
 
 
 def _get_preweighted_bias_projection(
@@ -382,9 +357,7 @@ def triton_project_local_attention_bias(
         device=z.device,
     )
     total_pairs = n_sample * n_trunks * n_queries * n_keys
-    block_size = _projection_block_size()
-    num_warps = _projection_num_warps()
-    grid = (triton.cdiv(total_pairs, block_size),)
+    grid = (triton.cdiv(total_pairs, _BLOCK_SIZE),)
     if triton_preweighted_local_attention_bias_enabled():
         fused_weight, weight_sum = _get_preweighted_bias_projection(
             layernorm_weight,
@@ -412,8 +385,8 @@ def triton_project_local_attention_bias(
             out.stride(3),
             out.stride(4),
             eps,
-            block_size=block_size,
-            num_warps=num_warps,
+            block_size=_BLOCK_SIZE,
+            num_warps=4,
         )
     else:
         _project_local_attention_bias_kernel[grid](
@@ -438,8 +411,8 @@ def triton_project_local_attention_bias(
             out.stride(3),
             out.stride(4),
             eps,
-            block_size=block_size,
-            num_warps=num_warps,
+            block_size=_BLOCK_SIZE,
+            num_warps=4,
         )
     if not batch_shape:
         return out[0]
