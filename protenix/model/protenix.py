@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import os
 import random
 import time
 from typing import Any, Optional
@@ -50,6 +51,15 @@ from protenix.utils.permutation.permutation import SymmetricPermutation
 from protenix.utils.torch_utils import autocasting_disable_decorator
 
 logger = get_logger(__name__)
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _sync_cuda_for_timing(enabled: bool) -> None:
+    if enabled and torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 def update_input_feature_dict(input_feature_dict: dict[str, Any]) -> dict[str, Any]:
@@ -485,6 +495,8 @@ class Protenix(nn.Module):
         Returns:
             tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]: Prediction, log, and time dictionaries.
         """
+        sync_timings = _env_flag_enabled("PROTENIX_SYNC_TIMINGS")
+        _sync_cuda_for_timing(sync_timings)
         step_st = time.time()
         N_token = input_feature_dict["residue_index"].shape[-1]
 
@@ -522,6 +534,7 @@ class Protenix(nn.Module):
 
         for key in keys_to_delete:
             del input_feature_dict[key]
+        _sync_cuda_for_timing(sync_timings)
         step_trunk = time.time()
         time_tracker.update({"pairformer": step_trunk - step_st})
         # Sample diffusion
@@ -576,6 +589,7 @@ class Protenix(nn.Module):
             enable_efficient_fusion=self.enable_efficient_fusion,
         )
 
+        _sync_cuda_for_timing(sync_timings)
         step_diffusion = time.time()
         time_tracker.update({"diffusion": step_diffusion - step_trunk})
         if hasattr(self.diffusion_module, "consume_perf_stats"):
@@ -587,6 +601,9 @@ class Protenix(nn.Module):
             distogram_logits=self.distogram_head(z),
             **sample_confidence.get_bin_params(self.configs.loss.distogram),
         )  # [N_token, N_token]
+        _sync_cuda_for_timing(sync_timings)
+        step_contact_probs = time.time()
+        time_tracker.update({"contact_probs": step_contact_probs - step_diffusion})
 
         # Confidence logits
         (
@@ -607,9 +624,15 @@ class Protenix(nn.Module):
             chunk_size=chunk_size,
         )
 
+        _sync_cuda_for_timing(sync_timings)
         step_confidence = time.time()
-        time_tracker.update({"confidence": step_confidence - step_diffusion})
-        time_tracker.update({"model_forward": time.time() - step_st})
+        time_tracker.update(
+            {
+                "confidence_head": step_confidence - step_contact_probs,
+                "confidence": step_confidence - step_diffusion,
+                "model_forward": step_confidence - step_st,
+            }
+        )
 
         # Permutation: when label is given, permute coordinates and other heads
         if label_dict is not None and symmetric_permutation is not None:
@@ -621,7 +644,10 @@ class Protenix(nn.Module):
                 and ("interested_ligand_mask" in label_dict),
             )
             last_step_seconds = step_confidence
+            _sync_cuda_for_timing(sync_timings)
             time_tracker.update({"permutation": time.time() - last_step_seconds})
+        _sync_cuda_for_timing(sync_timings)
+        step_before_summary = time.time()
 
         # Summary Confidence & Full Data
         # Computed after coordinates and logits are permuted
@@ -654,6 +680,14 @@ class Protenix(nn.Module):
             elements_one_hot=(
                 input_feature_dict["ref_element"] if mode != "inference" else None
             ),
+        )
+        _sync_cuda_for_timing(sync_timings)
+        step_summary = time.time()
+        time_tracker.update(
+            {
+                "summary_confidence": step_summary - step_before_summary,
+                "model_forward_with_summary": step_summary - step_st,
+            }
         )
 
         return pred_dict, log_dict, time_tracker
