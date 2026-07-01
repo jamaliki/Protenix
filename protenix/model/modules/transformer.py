@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from functools import partial
 from typing import Callable, Optional, Union
 
@@ -28,6 +29,14 @@ from protenix.model.modules.primitives import (
     LinearNoBias,
     rearrange_qk_to_dense_trunk,
 )
+from protenix.model.modules.fused_elementwise_triton import (
+    fused_sigmoid_mul,
+    fused_sigmoid_mul_add,
+    fused_silu_mul,
+)
+from protenix.model.modules.local_attention_bias_triton import (
+    triton_project_local_attention_bias,
+)
 from protenix.model.triangular.layers import LayerNorm
 from protenix.model.utils import (
     aggregate_atom_to_token,
@@ -35,6 +44,15 @@ from protenix.model.utils import (
     checkpoint_blocks,
     permute_final_dims,
 )
+
+
+def fused_transition_residual_enabled() -> bool:
+    return os.getenv("PROTENIX_TRITON_FUSED_TRANSITION_RESIDUAL", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
 
 
 class AttentionPairBias(nn.Module):
@@ -136,13 +154,25 @@ class AttentionPairBias(nn.Module):
         assert n_keys == z.size(-2)
         assert len(z.shape) == len(q.shape) + 2
 
-        # Multi-head attention bias
-        bias = self.linear_nobias_z(
-            self.layernorm_z(z)
-        )  # [..., n_blocks, n_queries, n_keys, n_heads]
-        bias = permute_final_dims(
-            bias, [3, 0, 1, 2]
-        )  # [..., n_heads, n_blocks, n_queries, n_keys]
+        # Multi-head attention bias.  The Triton path fuses the LayerNorm,
+        # small head projection, and permute into the final trunked layout.
+        bias = None
+        if self.layernorm_z.bias is None:
+            bias = triton_project_local_attention_bias(
+                z=z,
+                layernorm_weight=self.layernorm_z.weight,
+                linear_weight=self.linear_nobias_z.weight,
+                n_queries=n_queries,
+                n_keys=n_keys,
+                eps=self.layernorm_z.eps,
+            )
+        if bias is None:
+            bias = self.linear_nobias_z(
+                self.layernorm_z(z)
+            )  # [..., n_blocks, n_queries, n_keys, n_heads]
+            bias = permute_final_dims(
+                bias, [3, 0, 1, 2]
+            )  # [..., n_heads, n_blocks, n_queries, n_keys]
 
         # Line 11: Multi-head attention with attention bias & gating (and optionally local attention)
         q = self.attention(
@@ -249,7 +279,7 @@ class AttentionPairBias(nn.Module):
             if inplace_safe:
                 a *= torch.sigmoid(self.linear_a_last(s))
             else:
-                a = torch.sigmoid(self.linear_a_last(s)) * a
+                a = fused_sigmoid_mul(self.linear_a_last(s), a)
 
         return a
 
@@ -347,8 +377,21 @@ class DiffusionTransformerBlock(nn.Module):
             attn_out += a
         else:
             attn_out = attn_out + a
-        ff_out = self.drop_path(self.conditioned_transition_block(a=attn_out, s=s))
-        out_a = ff_out + attn_out
+        if (
+            fused_transition_residual_enabled()
+            and not self.training
+            and isinstance(self.drop_path, nn.Identity)
+        ):
+            out_a = self.conditioned_transition_block(
+                a=attn_out,
+                s=s,
+                residual=attn_out,
+            )
+        else:
+            ff_out = self.drop_path(
+                self.conditioned_transition_block(a=attn_out, s=s)
+            )
+            out_a = ff_out + attn_out
         # Avoid s/z to be deleted by torch.utils.checkpoint
         return out_a, s, z
 
@@ -575,7 +618,12 @@ class ConditionedTransitionBlock(nn.Module):
             in_features=c_s, out_features=c_a, bias=True, biasinit=biasinit
         )
 
-    def forward(self, a: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        a: torch.Tensor,
+        s: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             a (torch.Tensor): the single feature aggregate per-atom representation
@@ -588,9 +636,14 @@ class ConditionedTransitionBlock(nn.Module):
                 [..., N, c_a]
         """
         a = self.adaln(a, s)
-        b = F.silu((self.linear_nobias_a1(a))) * self.linear_nobias_a2(a)
+        b = fused_silu_mul(self.linear_nobias_a1(a), self.linear_nobias_a2(a))
         # Output projection (from adaLN-Zero [27])
-        a = torch.sigmoid(self.linear_s(s)) * self.linear_nobias_b(b)
+        gate = self.linear_s(s)
+        projected = self.linear_nobias_b(b)
+        if residual is not None:
+            a = fused_sigmoid_mul_add(gate, projected, residual)
+        else:
+            a = fused_sigmoid_mul(gate, projected)
         return a
 
 

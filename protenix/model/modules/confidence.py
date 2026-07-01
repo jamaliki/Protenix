@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional, Union
 
 import torch
@@ -21,6 +22,24 @@ from protenix.model.modules.pairformer import PairformerStack
 from protenix.model.modules.primitives import LinearNoBias
 from protenix.model.triangular.layers import LayerNorm
 from protenix.model.utils import broadcast_token_to_atom, one_hot
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str) -> Optional[float]:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    return float(value)
+
+
+def _env_int(name: str) -> Optional[int]:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    return int(value)
 
 
 class ConfidenceHead(nn.Module):
@@ -203,6 +222,30 @@ class ConfidenceHead(nn.Module):
             del z_init
             torch.cuda.empty_cache()
 
+        # For many samples, PAE/PDE logits dominate peak GPU memory:
+        # [N_sample, N_token, N_token, 64] in FP32 for each head. Protenix
+        # already offloads these logits for very large token counts; this
+        # opt-in extends the same idea to high-throughput sample batches.
+        n_token = z_trunk.shape[-2]
+        bytes_per_pair_logit = torch.finfo(torch.float32).bits // 8
+        max_pair_bins = max(self.b_pae, self.b_pde)
+        pair_logit_bytes = (
+            N_sample * n_token * n_token * max_pair_bins * bytes_per_pair_logit
+        )
+        threshold_gib = _env_float("PROTENIX_CONFIDENCE_CPU_OFFLOAD_THRESHOLD_GIB")
+        offload_pair_logits = (not self.training) and (
+            z_trunk.shape[-2] > 2000
+            or _env_flag_enabled("PROTENIX_CONFIDENCE_CPU_OFFLOAD")
+            or (
+                threshold_gib is not None
+                and pair_logit_bytes >= threshold_gib * (1024**3)
+            )
+        )
+        empty_cache_after_offload = (
+            z_trunk.shape[-2] > 2000
+            or _env_flag_enabled("PROTENIX_CONFIDENCE_CPU_OFFLOAD_EMPTY_CACHE")
+        )
+
         plddt_preds, pae_preds, pde_preds, resolved_preds = (
             [],
             [],
@@ -226,11 +269,12 @@ class ConfidenceHead(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
-            if z_trunk.shape[-2] > 2000 and (not self.training):
+            if offload_pair_logits:
                 # cpu offload pae_preds/pde_preds
                 pae_pred = pae_pred.cpu()
                 pde_pred = pde_pred.cpu()
-                torch.cuda.empty_cache()
+                if empty_cache_after_offload:
+                    torch.cuda.empty_cache()
             plddt_preds.append(plddt_pred)
             pae_preds.append(pae_pred)
             pde_preds.append(pde_pred)
@@ -254,6 +298,101 @@ class ConfidenceHead(nn.Module):
             pde_preds,
             resolved_preds,
         )
+
+    def iter_logit_chunks(
+        self,
+        input_feature_dict: dict[str, Union[torch.Tensor, int, float, dict]],
+        s_inputs: torch.Tensor,
+        s_trunk: torch.Tensor,
+        z_trunk: torch.Tensor,
+        pair_mask: torch.Tensor,
+        x_pred_coords: torch.Tensor,
+        use_embedding: bool = True,
+        triangle_multiplicative: str = "torch",
+        triangle_attention: str = "torch",
+        inplace_safe: bool = False,
+        chunk_size: Optional[int] = None,
+        sample_chunk_size: Optional[int] = None,
+    ):
+        """Yield confidence logits in sample chunks.
+
+        PAE/PDE logits have shape ``[N_sample, N_token, N_token, bins]`` and
+        are produced once per generated structure.  At high sample counts those
+        logits are useful outputs, but materializing the whole batch at once is
+        unnecessary when the caller only needs to immediately compute summary
+        confidence/full-data records.  This iterator keeps confidence
+        same-output while bounding the live logit tensors.
+        """
+
+        if self.stop_gradient:
+            s_inputs = s_inputs.detach()
+            s_trunk = s_trunk.detach()
+            z_trunk = z_trunk.detach()
+
+        s_trunk = self.input_strunk_ln(torch.clamp(s_trunk, min=-512, max=512))
+
+        if not use_embedding:
+            if inplace_safe:
+                z_trunk *= 0
+            else:
+                z_trunk = 0 * z_trunk
+
+        x_rep_atom_mask = input_feature_dict["distogram_rep_atom_mask"].bool()
+        x_pred_rep_coords = x_pred_coords[..., x_rep_atom_mask, :]
+        N_sample = x_pred_rep_coords.size(-3)
+
+        z_init = (
+            self.linear_no_bias_s1(s_inputs)[..., None, :, :]
+            + self.linear_no_bias_s2(s_inputs)[..., None, :]
+        )
+        z_trunk = z_init + z_trunk
+        if not self.training:
+            del z_init
+            torch.cuda.empty_cache()
+
+        if sample_chunk_size is None:
+            sample_chunk_size = _env_int("PROTENIX_CONFIDENCE_LOGIT_CHUNK_SIZE") or 1
+        if sample_chunk_size < 1:
+            sample_chunk_size = N_sample
+
+        for start in range(0, N_sample, sample_chunk_size):
+            end = min(start + sample_chunk_size, N_sample)
+            plddt_preds, pae_preds, pde_preds, resolved_preds = (
+                [],
+                [],
+                [],
+                [],
+            )
+            for i in range(start, end):
+                (
+                    plddt_pred,
+                    pae_pred,
+                    pde_pred,
+                    resolved_pred,
+                ) = self.memory_efficient_forward(
+                    input_feature_dict=input_feature_dict,
+                    s_trunk=s_trunk.clone() if inplace_safe else s_trunk,
+                    z_pair=z_trunk.clone() if inplace_safe else z_trunk,
+                    pair_mask=pair_mask,
+                    x_pred_rep_coords=x_pred_rep_coords[..., i, :, :],
+                    triangle_multiplicative=triangle_multiplicative,
+                    triangle_attention=triangle_attention,
+                    inplace_safe=inplace_safe,
+                    chunk_size=chunk_size,
+                )
+                plddt_preds.append(plddt_pred)
+                pae_preds.append(pae_pred)
+                pde_preds.append(pde_pred)
+                resolved_preds.append(resolved_pred)
+
+            yield (
+                start,
+                end,
+                torch.stack(plddt_preds, dim=-3),
+                torch.stack(pae_preds, dim=-4),
+                torch.stack(pde_preds, dim=-4),
+                torch.stack(resolved_preds, dim=-3),
+            )
 
     def memory_efficient_forward(
         self,

@@ -186,6 +186,18 @@ def sample_diffusion(
         logger.info("Guidance is enabled.")
         tfg = TFGEngine(tfg_cfg, device=device, dtype=dtype)
 
+    c_tau_last_schedule = noise_schedule[:-1]
+    c_tau_schedule = noise_schedule[1:]
+    gamma_schedule = torch.where(
+        c_tau_schedule > gamma_min,
+        torch.full_like(c_tau_schedule, float(gamma0)),
+        torch.zeros_like(c_tau_schedule),
+    )
+    t_hat_schedule = c_tau_last_schedule * (gamma_schedule + 1)
+    noise_scale_schedule = noise_scale_lambda * torch.sqrt(
+        t_hat_schedule**2 - c_tau_last_schedule**2
+    )
+
     def _chunk_sample_diffusion(chunk_n_sample, inplace_safe):
         # init noise
         # [..., N_sample, N_atom, 3]
@@ -193,8 +205,8 @@ def sample_diffusion(
             size=(*batch_shape, chunk_n_sample, N_atom, 3), device=device, dtype=dtype
         )  # NOTE: set seed in distributed training
 
-        for step_i, (c_tau_last, c_tau) in enumerate(
-            zip(noise_schedule[:-1], noise_schedule[1:])
+        for step_i, (c_tau, t_hat_scalar, noise_scale) in enumerate(
+            zip(c_tau_schedule, t_hat_schedule, noise_scale_schedule)
         ):
             # [..., N_sample, N_atom, 3]
             x_l = (
@@ -205,18 +217,14 @@ def sample_diffusion(
 
             # Denoise with a predictor-corrector sampler
             # 1. Add noise to move x_{c_tau_last} to x_{t_hat}
-            gamma = float(gamma0) if c_tau > gamma_min else 0
-            t_hat = c_tau_last * (gamma + 1)
-
-            delta_noise_level = torch.sqrt(t_hat**2 - c_tau_last**2)
-            x_noisy = x_l + noise_scale_lambda * delta_noise_level * torch.randn(
+            x_noisy = x_l + noise_scale * torch.randn(
                 size=x_l.shape, device=device, dtype=dtype
             )
 
             # 2. Denoise from x_{t_hat} to x_{c_tau}
             # Euler step only
             t_hat = (
-                t_hat.reshape((1,) * (len(batch_shape) + 1))
+                t_hat_scalar.reshape((1,) * (len(batch_shape) + 1))
                 .expand(*batch_shape, chunk_n_sample)
                 .to(dtype)
             )
@@ -259,7 +267,7 @@ def sample_diffusion(
 
                 delta = (x_noisy - x_denoised) / t_hat[
                     ..., None, None
-                ]  # Line 9 of AF3 uses 'x_l_hat' instead, which we believe  is a typo.
+                ]  # Line 9 of AF3 uses 'x_l_hat' instead, which we believe is a typo.
                 dt = c_tau - t_hat
                 x_l = x_noisy + step_scale_eta * dt[..., None, None] * delta
 

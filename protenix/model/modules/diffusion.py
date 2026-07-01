@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+from contextlib import nullcontext
 from typing import Optional, Union
 
 import torch
@@ -26,6 +28,58 @@ from protenix.model.modules.transformer import (
 )
 from protenix.model.triangular.layers import LayerNorm
 from protenix.model.utils import expand_at_dim, get_checkpoint_fn, permute_final_dims
+
+
+def broadcast_diffusion_s_enabled() -> bool:
+    return os.getenv("PROTENIX_BROADCAST_DIFFUSION_S", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
+def _can_broadcast_diffusion_s(
+    module: nn.Module,
+    t_hat_noise_level: torch.Tensor,
+) -> bool:
+    """Return True when diffusion conditioning is identical for every sample.
+
+    In sampling, all structures in the same denoising step usually share the
+    same scalar noise level.  If that scalar was expanded to ``N_sample`` lanes,
+    the conditioning block would redo identical work for each sample.  Keeping
+    a singleton sample lane lets later tensor ops broadcast the result instead.
+    """
+    if not broadcast_diffusion_s_enabled():
+        return False
+    if module.training or torch.is_grad_enabled():
+        return False
+    if t_hat_noise_level.size(-1) <= 1:
+        return False
+    if t_hat_noise_level.stride(-1) == 0:
+        return True
+    return bool(
+        torch.all(t_hat_noise_level == t_hat_noise_level[..., :1]).item()
+    )
+
+
+class _CudaEventTimer:
+    def __init__(
+        self,
+        events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]],
+        name: str,
+    ) -> None:
+        self.events = events
+        self.name = name
+
+    def __enter__(self) -> None:
+        self.start = torch.cuda.Event(enable_timing=True)
+        self.end = torch.cuda.Event(enable_timing=True)
+        self.start.record()
+
+    def __exit__(self, *args: object) -> None:
+        self.end.record()
+        self.events.setdefault(self.name, []).append((self.start, self.end))
 
 
 class DiffusionConditioning(nn.Module):
@@ -321,6 +375,66 @@ class DiffusionModule(nn.Module):
             blocks_per_ckpt=blocks_per_ckpt,
         )
         self.normalize = LayerNorm(c_z, create_offset=False, create_scale=False)
+        self._perf_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
+
+    def reset_perf_stats(self) -> None:
+        self._perf_events = {}
+
+    def _profile_block(self, name: str):
+        if (
+            os.getenv("PROTENIX_TIMING_DIFFUSION", "0").lower()
+            in {"0", "false", "off", "no"}
+            or not torch.cuda.is_available()
+        ):
+            return nullcontext()
+        return _CudaEventTimer(self._perf_events, name)
+
+    def consume_perf_stats(self) -> dict[str, float]:
+        stats = {}
+        for name, events in self._perf_events.items():
+            total_ms = 0.0
+            for start, end in events:
+                end.synchronize()
+                total_ms += start.elapsed_time(end)
+            stats[f"diffusion_{name}_sec"] = total_ms / 1000.0
+        self.reset_perf_stats()
+        return stats
+
+    def _diffusion_core_dtype(self, fallback: torch.dtype) -> torch.dtype:
+        if os.getenv("PROTENIX_BF16_DIFFUSION_CORE", "0").lower() in {
+            "0",
+            "false",
+            "off",
+            "no",
+        }:
+            return torch.float32
+        if fallback == torch.float16:
+            return torch.float16
+        return torch.bfloat16
+
+    def _diffusion_core_autocast(self):
+        # Precision is a local performance knob.  The token diffusion core was
+        # profiled as safe and faster in BF16, but the flag keeps default
+        # behavior unchanged and gives unsupported GPUs a clean fallback.
+        if (
+            os.getenv("PROTENIX_BF16_DIFFUSION_CORE", "0").lower()
+            in {"0", "false", "off", "no"}
+            or not torch.cuda.is_available()
+        ):
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+    def _atom_attention_autocast(self):
+        # Atom attention dominates traffic at high sample counts.  BF16 reduces
+        # memory bandwidth pressure; guards keep this inference-only opt-in from
+        # affecting training unless explicitly requested by the environment.
+        if (
+            os.getenv("PROTENIX_BF16_ATOM_ATTENTION", "0").lower()
+            in {"0", "false", "off", "no"}
+            or not torch.cuda.is_available()
+        ):
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
     def f_forward(
         self,
@@ -375,33 +489,42 @@ class DiffusionModule(nn.Module):
         blocks_per_ckpt = self.blocks_per_ckpt
         if not torch.is_grad_enabled():
             blocks_per_ckpt = None
+        conditioning_noise_level = t_hat_noise_level
+        if _can_broadcast_diffusion_s(self, t_hat_noise_level):
+            # In inference sampling, t_hat is a scalar expanded across samples.
+            # The resulting single conditioning is therefore sample-invariant;
+            # keep only one sample lane and rely on broadcasting downstream.
+            conditioning_noise_level = t_hat_noise_level[..., :1]
         # Conditioning, shared across difference samples
         # Diffusion_conditioning consumes 7-8G when token num is 768,
         # use checkpoint here if blocks_per_ckpt is not None.
-        if blocks_per_ckpt:
-            checkpoint_fn = get_checkpoint_fn()
-            s_single, z_pair = checkpoint_fn(
-                self.diffusion_conditioning,
-                t_hat_noise_level,
-                input_feature_dict["relp"],
-                s_inputs,
-                s_trunk,
-                z_trunk,
-                pair_z,
-                inplace_safe,
-                use_conditioning,
-            )
-        else:
-            s_single, z_pair = self.diffusion_conditioning(
-                t_hat_noise_level,
-                input_feature_dict["relp"],
-                s_inputs=s_inputs,
-                s_trunk=s_trunk,
-                z_trunk=z_trunk,
-                pair_z=pair_z,
-                inplace_safe=inplace_safe,
-                use_conditioning=use_conditioning,
-            )  # [..., N_sample, N_token, c_s], [..., N_token, N_token, c_z]
+        with self._profile_block("conditioning"), torch.profiler.record_function(
+            "protenix/diffusion_conditioning"
+        ):
+            if blocks_per_ckpt:
+                checkpoint_fn = get_checkpoint_fn()
+                s_single, z_pair = checkpoint_fn(
+                    self.diffusion_conditioning,
+                    conditioning_noise_level,
+                    input_feature_dict["relp"],
+                    s_inputs,
+                    s_trunk,
+                    z_trunk,
+                    pair_z,
+                    inplace_safe,
+                    use_conditioning,
+                )
+            else:
+                s_single, z_pair = self.diffusion_conditioning(
+                    conditioning_noise_level,
+                    input_feature_dict["relp"],
+                    s_inputs=s_inputs,
+                    s_trunk=s_trunk,
+                    z_trunk=z_trunk,
+                    pair_z=pair_z,
+                    inplace_safe=inplace_safe,
+                    use_conditioning=use_conditioning,
+                )  # [..., N_sample, N_token, c_s], [..., N_token, N_token, c_z]
 
         # Expand embeddings to match N_sample
         s_trunk = expand_at_dim(s_trunk, dim=-3, n=1)  # [..., N_sample, N_token, c_s]
@@ -409,49 +532,53 @@ class DiffusionModule(nn.Module):
             z_pair, dim=-4, n=1
         )  # [..., N_sample, N_token, N_token, c_z]
         # Fine-grained checkpoint for finetuning stage 2 (token num: 768) for avoiding OOM
-        if blocks_per_ckpt and self.use_fine_grained_checkpoint:
-            checkpoint_fn = get_checkpoint_fn()
-            a_token, q_skip, c_skip, p_skip = checkpoint_fn(
-                self.atom_attention_encoder,
-                input_feature_dict["atom_to_token_idx"],
-                input_feature_dict["ref_pos"],
-                input_feature_dict["ref_charge"],
-                input_feature_dict["ref_mask"],
-                input_feature_dict["ref_atom_name_chars"],
-                input_feature_dict["ref_element"],
-                input_feature_dict["d_lm"],
-                input_feature_dict["v_lm"],
-                input_feature_dict["pad_info"],
-                r_noisy,
-                s_trunk,
-                z_pair,
-                p_lm,
-                c_l,
-                inplace_safe,
-                chunk_size,
-            )
-        else:
-            # Sequence-local Atom Attention and aggregation to coarse-grained tokens
-            a_token, q_skip, c_skip, p_skip = self.atom_attention_encoder(
-                input_feature_dict["atom_to_token_idx"],
-                input_feature_dict["ref_pos"],
-                input_feature_dict["ref_charge"],
-                input_feature_dict["ref_mask"],
-                input_feature_dict["ref_atom_name_chars"],
-                input_feature_dict["ref_element"],
-                input_feature_dict["d_lm"],
-                input_feature_dict["v_lm"],
-                input_feature_dict["pad_info"],
-                r_l=r_noisy,
-                s=s_trunk,
-                z=z_pair,
-                p_lm=p_lm,
-                c_l=c_l,
-                inplace_safe=inplace_safe,
-                chunk_size=chunk_size,
-            )
-        # Upcast
-        a_token = a_token.to(dtype=torch.float32)
+        with self._profile_block("atom_encoder"), torch.profiler.record_function(
+            "protenix/atom_attention_encoder"
+        ):
+            with self._atom_attention_autocast():
+                if blocks_per_ckpt and self.use_fine_grained_checkpoint:
+                    checkpoint_fn = get_checkpoint_fn()
+                    a_token, q_skip, c_skip, p_skip = checkpoint_fn(
+                        self.atom_attention_encoder,
+                        input_feature_dict["atom_to_token_idx"],
+                        input_feature_dict["ref_pos"],
+                        input_feature_dict["ref_charge"],
+                        input_feature_dict["ref_mask"],
+                        input_feature_dict["ref_atom_name_chars"],
+                        input_feature_dict["ref_element"],
+                        input_feature_dict["d_lm"],
+                        input_feature_dict["v_lm"],
+                        input_feature_dict["pad_info"],
+                        r_noisy,
+                        s_trunk,
+                        z_pair,
+                        p_lm,
+                        c_l,
+                        inplace_safe,
+                        chunk_size,
+                    )
+                else:
+                    # Sequence-local Atom Attention and aggregation to coarse-grained tokens
+                    a_token, q_skip, c_skip, p_skip = self.atom_attention_encoder(
+                        input_feature_dict["atom_to_token_idx"],
+                        input_feature_dict["ref_pos"],
+                        input_feature_dict["ref_charge"],
+                        input_feature_dict["ref_mask"],
+                        input_feature_dict["ref_atom_name_chars"],
+                        input_feature_dict["ref_element"],
+                        input_feature_dict["d_lm"],
+                        input_feature_dict["v_lm"],
+                        input_feature_dict["pad_info"],
+                        r_l=r_noisy,
+                        s=s_trunk,
+                        z=z_pair,
+                        p_lm=p_lm,
+                        c_l=c_l,
+                        inplace_safe=inplace_safe,
+                        chunk_size=chunk_size,
+                    )
+        transformer_dtype = self._diffusion_core_dtype(a_token.dtype)
+        a_token = a_token.to(dtype=transformer_dtype)
 
         # Full self-attention on token level.
         if inplace_safe:
@@ -463,45 +590,55 @@ class DiffusionModule(nn.Module):
                 self.layernorm_s(s_single)
             )  # [..., N_sample, N_token, c_token]
         if enable_efficient_fusion:
-            z = self.normalize(z_pair.to(dtype=torch.float32))
+            z = self.normalize(z_pair.to(dtype=transformer_dtype))
             z = permute_final_dims(z, [2, 0, 1]).contiguous()
         else:
-            z = z_pair.to(dtype=torch.float32)
-        a_token = self.diffusion_transformer(
-            a=a_token.to(dtype=torch.float32),  # Upcast all inputs
-            s=s_single.to(dtype=torch.float32),
-            z=z,
-            inplace_safe=inplace_safe,
-            chunk_size=chunk_size,
-            enable_efficient_fusion=enable_efficient_fusion,
-        )
+            z = z_pair.to(dtype=transformer_dtype)
+        with self._profile_block("transformer"), torch.profiler.record_function(
+            "protenix/diffusion_transformer"
+        ):
+            with self._diffusion_core_autocast():
+                a_token = self.diffusion_transformer(
+                    a=a_token,
+                    s=s_single.to(dtype=transformer_dtype),
+                    z=z,
+                    inplace_safe=inplace_safe,
+                    chunk_size=chunk_size,
+                    enable_efficient_fusion=enable_efficient_fusion,
+                )
+        if a_token.dtype != torch.float32:
+            a_token = a_token.to(dtype=torch.float32)
 
         a_token = self.layernorm_a(a_token)
 
         # Fine-grained checkpoint for finetuning stage 2 (token num: 768) for avoiding OOM
-        if blocks_per_ckpt and self.use_fine_grained_checkpoint:
-            checkpoint_fn = get_checkpoint_fn()
-            r_update = checkpoint_fn(
-                self.atom_attention_decoder,
-                input_feature_dict["atom_to_token_idx"],
-                a_token,
-                q_skip,
-                c_skip,
-                p_skip,
-                inplace_safe,
-                chunk_size,
-            )
-        else:
-            # Broadcast token activations to atoms and run Sequence-local Atom Attention
-            r_update = self.atom_attention_decoder(
-                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
-                a=a_token,
-                q_skip=q_skip,
-                c_skip=c_skip,
-                p_skip=p_skip,
-                inplace_safe=inplace_safe,
-                chunk_size=chunk_size,
-            )
+        with self._profile_block("atom_decoder"), torch.profiler.record_function(
+            "protenix/atom_attention_decoder"
+        ):
+            with self._atom_attention_autocast():
+                if blocks_per_ckpt and self.use_fine_grained_checkpoint:
+                    checkpoint_fn = get_checkpoint_fn()
+                    r_update = checkpoint_fn(
+                        self.atom_attention_decoder,
+                        input_feature_dict["atom_to_token_idx"],
+                        a_token,
+                        q_skip,
+                        c_skip,
+                        p_skip,
+                        inplace_safe,
+                        chunk_size,
+                    )
+                else:
+                    # Broadcast token activations to atoms and run Sequence-local Atom Attention
+                    r_update = self.atom_attention_decoder(
+                        atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+                        a=a_token,
+                        q_skip=q_skip,
+                        c_skip=c_skip,
+                        p_skip=p_skip,
+                        inplace_safe=inplace_safe,
+                        chunk_size=chunk_size,
+                    )
 
         return r_update
 
@@ -554,10 +691,11 @@ class DiffusionModule(nn.Module):
         # As in EDM:
         #     r_noisy = (c_in * x_noisy)
         #     where c_in = 1 / sqrt(sigma_data^2 + sigma^2)
-        r_noisy = (
-            x_noisy
-            / torch.sqrt(self.sigma_data**2 + t_hat_noise_level**2)[..., None, None]
-        )
+        with self._profile_block("input_scale"):
+            r_noisy = (
+                x_noisy
+                / torch.sqrt(self.sigma_data**2 + t_hat_noise_level**2)[..., None, None]
+            )
 
         # Compute the update given r_noisy (the scaled x_noisy)
         # As in EDM:
@@ -587,14 +725,15 @@ class DiffusionModule(nn.Module):
         #     c_skip = 1 / (1 + s_ratio^2)
         #     c_out = sigma / sqrt(1 + s_ratio^2)
 
-        s_ratio = (t_hat_noise_level / self.sigma_data)[..., None, None].to(
-            r_update.dtype
-        )
-        x_denoised = (
-            1 / (1 + s_ratio**2) * x_noisy
-            + t_hat_noise_level[..., None, None]
-            / torch.sqrt(1 + s_ratio**2)
-            * r_update
-        ).to(r_update.dtype)
+        with self._profile_block("output_rescale"):
+            s_ratio = (t_hat_noise_level / self.sigma_data)[..., None, None].to(
+                r_update.dtype
+            )
+            x_denoised = (
+                1 / (1 + s_ratio**2) * x_noisy
+                + t_hat_noise_level[..., None, None]
+                / torch.sqrt(1 + s_ratio**2)
+                * r_update
+            ).to(r_update.dtype)
 
         return x_denoised

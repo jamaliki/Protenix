@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Any, Optional, Union
 
 import torch
@@ -19,6 +20,13 @@ from ml_collections.config_dict import ConfigDict
 
 from protenix.metrics.clash import Clash
 from protenix.utils.distributed import traverse_and_aggregate
+
+
+def _env_int(name: str) -> Optional[int]:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    return int(value)
 
 
 def merge_per_sample_confidence_scores(
@@ -922,27 +930,45 @@ def compute_full_data_and_summary(
     """Wrapper of `_compute_full_data_and_summary` by enumerating over N samples"""
 
     N_sample = pae_logits.size(0)
-    if contact_probs.dim() == 2:
-        # Convert to [N_sample, N_token, N_token]
-        contact_probs = contact_probs.unsqueeze(dim=0).expand(N_sample, -1, -1)
-    else:
-        assert contact_probs.dim() == 3
+    if contact_probs.dim() not in (2, 3):
+        raise AssertionError(
+            "contact_probs must be [N_token, N_token] or "
+            "[N_sample, N_token, N_token]"
+        )
     assert (
-        contact_probs.size(0) == plddt_logits.size(0) == pde_logits.size(0) == N_sample
+        plddt_logits.size(0)
+        == pde_logits.size(0)
+        == atom_coordinate.size(0)
+        == N_sample
     )
+    if contact_probs.dim() == 3:
+        assert contact_probs.size(0) == N_sample
+
+    sample_chunk_size = _env_int("PROTENIX_SUMMARY_SAMPLE_CHUNK_SIZE") or 1
+    if sample_chunk_size < 1:
+        sample_chunk_size = N_sample
+    # A 3D contact-prob tensor can be sample-specific. Keep the historical
+    # one-sample wrapper in that case so returned full_data dictionaries still
+    # receive a per-sample 2D contact map instead of a whole chunk.
+    if contact_probs.dim() == 3 and return_full_data:
+        sample_chunk_size = 1
 
     summary_confidence = []
     full_data = []
-    for i in range(N_sample):
+    for start in range(0, N_sample, sample_chunk_size):
+        end = min(start + sample_chunk_size, N_sample)
+        contact_probs_chunk = (
+            contact_probs if contact_probs.dim() == 2 else contact_probs[start:end]
+        )
         summary_confidence_i, full_data_i = _compute_full_data_and_summary(
             configs=configs,
-            pae_logits=pae_logits[i : i + 1],
-            plddt_logits=plddt_logits[i : i + 1],
-            pde_logits=pde_logits[i : i + 1],
-            contact_probs=contact_probs[i],
+            pae_logits=pae_logits[start:end],
+            plddt_logits=plddt_logits[start:end],
+            pde_logits=pde_logits[start:end],
+            contact_probs=contact_probs_chunk,
             token_asym_id=token_asym_id,
             token_has_frame=token_has_frame,
-            atom_coordinate=atom_coordinate[i : i + 1],
+            atom_coordinate=atom_coordinate[start:end],
             atom_to_token_idx=atom_to_token_idx,
             atom_is_polymer=atom_is_polymer,
             N_recycle=N_recycle,

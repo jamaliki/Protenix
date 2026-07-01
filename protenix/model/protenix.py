@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import os
 import random
 import time
 from typing import Any, Optional
@@ -50,6 +51,22 @@ from protenix.utils.permutation.permutation import SymmetricPermutation
 from protenix.utils.torch_utils import autocasting_disable_decorator
 
 logger = get_logger(__name__)
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str) -> Optional[int]:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    return int(value)
+
+
+def _sync_cuda_for_timing(enabled: bool) -> None:
+    if enabled and torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 def update_input_feature_dict(input_feature_dict: dict[str, Any]) -> dict[str, Any]:
@@ -353,6 +370,104 @@ class Protenix(nn.Module):
             self.confidence_head
         )(*args, **kwargs)
 
+    def run_confidence_summary_stream(self, *args: Any, **kwargs: Any) -> Any:
+        """
+        Runs confidence logits in sample chunks and immediately consumes them
+        into summary/full-data outputs, avoiding full-batch PAE/PDE logits.
+
+        This is a memory optimization, not deferred confidence: all confidence
+        outputs are still computed in the same inference call.  The difference
+        is lifetime.  Instead of keeping every sample's large pairwise logits
+        alive until summary computation, each chunk is summarized and released.
+        """
+        return autocasting_disable_decorator(self.configs.skip_amp.confidence_head)(
+            self._run_confidence_summary_stream
+        )(*args, **kwargs)
+
+    def _run_confidence_summary_stream(
+        self,
+        input_feature_dict: dict[str, Any],
+        s_inputs: torch.Tensor,
+        s_trunk: torch.Tensor,
+        z_trunk: torch.Tensor,
+        pair_mask: torch.Tensor,
+        x_pred_coords: torch.Tensor,
+        contact_probs: torch.Tensor,
+        N_recycle: int,
+        mode: str,
+        triangle_multiplicative: str = "torch",
+        triangle_attention: str = "torch",
+        inplace_safe: bool = False,
+        chunk_size: Optional[int] = None,
+        sync_timings: bool = False,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, float]]:
+        sample_chunk_size = _env_int("PROTENIX_CONFIDENCE_LOGIT_CHUNK_SIZE")
+        if sample_chunk_size is None:
+            sample_chunk_size = _env_int("PROTENIX_SUMMARY_SAMPLE_CHUNK_SIZE") or 32
+        if sample_chunk_size < 1:
+            sample_chunk_size = x_pred_coords.size(-3)
+
+        summary_confidence = []
+        full_data = []
+        timing = {"confidence_head": 0.0, "summary_confidence": 0.0}
+        last_step = time.time()
+
+        for (
+            start,
+            end,
+            plddt_logits,
+            pae_logits,
+            pde_logits,
+            _resolved_logits,
+        ) in self.confidence_head.iter_logit_chunks(
+            input_feature_dict=input_feature_dict,
+            s_inputs=s_inputs,
+            s_trunk=s_trunk,
+            z_trunk=z_trunk,
+            pair_mask=pair_mask,
+            x_pred_coords=x_pred_coords,
+            triangle_multiplicative=triangle_multiplicative,
+            triangle_attention=triangle_attention,
+            inplace_safe=inplace_safe,
+            chunk_size=chunk_size,
+            sample_chunk_size=sample_chunk_size,
+        ):
+            _sync_cuda_for_timing(sync_timings)
+            logits_done = time.time()
+            timing["confidence_head"] += logits_done - last_step
+
+            summary_i, full_i = autocasting_disable_decorator(True)(
+                sample_confidence.compute_full_data_and_summary
+            )(
+                configs=self.configs,
+                pae_logits=pae_logits,
+                plddt_logits=plddt_logits,
+                pde_logits=pde_logits,
+                contact_probs=contact_probs,
+                token_asym_id=input_feature_dict["asym_id"],
+                token_has_frame=input_feature_dict["has_frame"],
+                atom_coordinate=x_pred_coords[..., start:end, :, :],
+                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+                atom_is_polymer=1 - input_feature_dict["is_ligand"],
+                N_recycle=N_recycle,
+                interested_atom_mask=None,
+                return_full_data=True,
+                mol_id=(input_feature_dict["mol_id"] if mode != "inference" else None),
+                elements_one_hot=(
+                    input_feature_dict["ref_element"] if mode != "inference" else None
+                ),
+            )
+            _sync_cuda_for_timing(sync_timings)
+            summary_done = time.time()
+            timing["summary_confidence"] += summary_done - logits_done
+
+            summary_confidence.extend(summary_i)
+            full_data.extend(full_i)
+            del plddt_logits, pae_logits, pde_logits, _resolved_logits
+            last_step = time.time()
+
+        return summary_confidence, full_data, timing
+
     def main_inference_loop(
         self,
         input_feature_dict: dict[str, Any],
@@ -418,11 +533,10 @@ class Protenix(nn.Module):
                 "coordinate": _cat(pred_dicts, "coordinate"),
                 "summary_confidence": _list_join(pred_dicts, "summary_confidence"),
                 "full_data": _list_join(pred_dicts, "full_data"),
-                "plddt": _cat(pred_dicts, "plddt"),
-                "pae": _cat(pred_dicts, "pae"),
-                "pde": _cat(pred_dicts, "pde"),
-                "resolved": _cat(pred_dicts, "resolved"),
             }
+            for key in ["plddt", "pae", "pde", "resolved"]:
+                if all(key in pred_dict for pred_dict in pred_dicts):
+                    all_pred_dict[key] = _cat(pred_dicts, key)
 
             all_log_dict = simple_merge_dict_list(log_dicts)
             all_time_dict = simple_merge_dict_list(time_trackers)
@@ -485,6 +599,8 @@ class Protenix(nn.Module):
         Returns:
             tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]: Prediction, log, and time dictionaries.
         """
+        sync_timings = _env_flag_enabled("PROTENIX_SYNC_TIMINGS")
+        _sync_cuda_for_timing(sync_timings)
         step_st = time.time()
         N_token = input_feature_dict["residue_index"].shape[-1]
 
@@ -522,6 +638,7 @@ class Protenix(nn.Module):
 
         for key in keys_to_delete:
             del input_feature_dict[key]
+        _sync_cuda_for_timing(sync_timings)
         step_trunk = time.time()
         time_tracker.update({"pairformer": step_trunk - step_st})
         # Sample diffusion
@@ -559,6 +676,8 @@ class Protenix(nn.Module):
         else:
             cache["pair_z"] = None
             cache["p_lm/c_l"] = [None, None]
+        if hasattr(self.diffusion_module, "reset_perf_stats"):
+            self.diffusion_module.reset_perf_stats()
         pred_dict["coordinate"] = self.sample_diffusion(
             denoise_net=self.diffusion_module,
             input_feature_dict=input_feature_dict,
@@ -574,8 +693,12 @@ class Protenix(nn.Module):
             enable_efficient_fusion=self.enable_efficient_fusion,
         )
 
+        _sync_cuda_for_timing(sync_timings)
         step_diffusion = time.time()
         time_tracker.update({"diffusion": step_diffusion - step_trunk})
+        if hasattr(self.diffusion_module, "consume_perf_stats"):
+            time_tracker.update(self.diffusion_module.consume_perf_stats())
+
         # Distogram logits: log contact_probs only, to reduce the dimension
         pred_dict["contact_probs"] = autocasting_disable_decorator(True)(
             sample_confidence.compute_contact_prob
@@ -583,6 +706,56 @@ class Protenix(nn.Module):
             distogram_logits=self.distogram_head(z),
             **sample_confidence.get_bin_params(self.configs.loss.distogram),
         )  # [N_token, N_token]
+        _sync_cuda_for_timing(sync_timings)
+        step_contact_probs = time.time()
+        time_tracker.update({"contact_probs": step_contact_probs - step_diffusion})
+
+        stream_confidence_summary = (
+            _env_flag_enabled("PROTENIX_STREAM_CONFIDENCE_SUMMARY")
+            and not self.training
+            and mode == "inference"
+            and label_dict is None
+            and symmetric_permutation is None
+        )
+        if stream_confidence_summary:
+            (
+                pred_dict["summary_confidence"],
+                pred_dict["full_data"],
+                stream_timing,
+            ) = self.run_confidence_summary_stream(
+                input_feature_dict=input_feature_dict,
+                s_inputs=s_inputs,
+                s_trunk=s,
+                z_trunk=z,
+                pair_mask=None,
+                x_pred_coords=pred_dict["coordinate"],
+                contact_probs=pred_dict["contact_probs"],
+                N_recycle=N_cycle,
+                mode=mode,
+                triangle_multiplicative=self.configs.triangle_multiplicative,
+                triangle_attention=self.configs.triangle_attention,
+                inplace_safe=inplace_safe,
+                chunk_size=chunk_size,
+                sync_timings=sync_timings,
+            )
+
+            _sync_cuda_for_timing(sync_timings)
+            step_summary = time.time()
+            confidence_head_time = stream_timing["confidence_head"]
+            summary_time = stream_timing["summary_confidence"]
+            contact_time = time_tracker["contact_probs"]
+            time_tracker.update(
+                {
+                    "confidence_head": confidence_head_time,
+                    "confidence": contact_time + confidence_head_time,
+                    "model_forward": step_contact_probs - step_st
+                    + confidence_head_time,
+                    "summary_confidence": summary_time,
+                    "model_forward_with_summary": step_summary - step_st,
+                    "confidence_summary_stream": True,
+                }
+            )
+            return pred_dict, log_dict, time_tracker
 
         # Confidence logits
         (
@@ -603,9 +776,15 @@ class Protenix(nn.Module):
             chunk_size=chunk_size,
         )
 
+        _sync_cuda_for_timing(sync_timings)
         step_confidence = time.time()
-        time_tracker.update({"confidence": step_confidence - step_diffusion})
-        time_tracker.update({"model_forward": time.time() - step_st})
+        time_tracker.update(
+            {
+                "confidence_head": step_confidence - step_contact_probs,
+                "confidence": step_confidence - step_diffusion,
+                "model_forward": step_confidence - step_st,
+            }
+        )
 
         # Permutation: when label is given, permute coordinates and other heads
         if label_dict is not None and symmetric_permutation is not None:
@@ -617,7 +796,10 @@ class Protenix(nn.Module):
                 and ("interested_ligand_mask" in label_dict),
             )
             last_step_seconds = step_confidence
+            _sync_cuda_for_timing(sync_timings)
             time_tracker.update({"permutation": time.time() - last_step_seconds})
+        _sync_cuda_for_timing(sync_timings)
+        step_before_summary = time.time()
 
         # Summary Confidence & Full Data
         # Computed after coordinates and logits are permuted
@@ -650,6 +832,14 @@ class Protenix(nn.Module):
             elements_one_hot=(
                 input_feature_dict["ref_element"] if mode != "inference" else None
             ),
+        )
+        _sync_cuda_for_timing(sync_timings)
+        step_summary = time.time()
+        time_tracker.update(
+            {
+                "summary_confidence": step_summary - step_before_summary,
+                "model_forward_with_summary": step_summary - step_st,
+            }
         )
 
         return pred_dict, log_dict, time_tracker

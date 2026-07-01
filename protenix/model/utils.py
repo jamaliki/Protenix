@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import math
+import os
 from functools import partial
 from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 
@@ -23,6 +25,53 @@ import torch.nn as nn
 from scipy.spatial.transform import Rotation
 
 from protenix.utils.scatter_utils import scatter
+
+
+def gpu_random_augmentation_enabled() -> bool:
+    return os.getenv("PROTENIX_GPU_RANDOM_AUGMENT", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
+def uniform_random_rotation_gpu(N_sample: int, device: torch.device) -> torch.Tensor:
+    """Generate uniformly random rotation matrices directly on the GPU.
+
+    The original inference path generated rotations with SciPy on the CPU and
+    then copied them to CUDA.  That is fine for small sample counts, but for
+    high-throughput inference the host round trip becomes visible.  This uses
+    the standard random-unit-quaternion construction and keeps the augmentation
+    data on the same device as the coordinates.
+    """
+    u = torch.rand((N_sample, 3), device=device, dtype=torch.float32)
+    sqrt_u1 = torch.sqrt(u[:, 0])
+    sqrt_one_minus_u1 = torch.sqrt(1.0 - u[:, 0])
+    theta1 = 2.0 * math.pi * u[:, 1]
+    theta2 = 2.0 * math.pi * u[:, 2]
+    x = sqrt_one_minus_u1 * torch.sin(theta1)
+    y = sqrt_one_minus_u1 * torch.cos(theta1)
+    z = sqrt_u1 * torch.sin(theta2)
+    w = sqrt_u1 * torch.cos(theta2)
+
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    return torch.stack(
+        (
+            1.0 - 2.0 * (yy + zz),
+            2.0 * (xy - wz),
+            2.0 * (xz + wy),
+            2.0 * (xy + wz),
+            1.0 - 2.0 * (xx + zz),
+            2.0 * (yz - wx),
+            2.0 * (xz - wy),
+            2.0 * (yz + wx),
+            1.0 - 2.0 * (xx + yy),
+        ),
+        dim=-1,
+    ).reshape(N_sample, 3, 3)
 
 
 def centre_random_augmentation(
@@ -74,6 +123,27 @@ def centre_random_augmentation(
 
     # Generate N_augment (rot, trans) pairs
     batch_size_shape = x_input_coords.shape[:-3]
+    if (
+        gpu_random_augmentation_enabled()
+        and x_input_coords.is_cuda
+        and mask is None
+        and not torch.is_grad_enabled()
+    ):
+        rot_matrix_random = uniform_random_rotation_gpu(
+            N_sample=N_augment, device=device
+        ).reshape(*batch_size_shape, N_sample, 3, 3)
+        trans_random = s_trans * torch.randn(
+            size=(*batch_size_shape, N_sample, 3),
+            device=device,
+            dtype=torch.float32,
+        )
+        x_flat = x_input_coords.to(dtype=torch.float32).reshape(N_augment, N_atom, 3)
+        r_flat = rot_matrix_random.reshape(N_augment, 3, 3)
+        x_augment_coords = torch.bmm(x_flat, r_flat.transpose(-1, -2)).reshape(
+            *x_input_coords.shape
+        )
+        return (x_augment_coords + trans_random[..., None, :]).to(x_input_coords.dtype)
+
     rot_matrix_random = (
         uniform_random_rotation(N_sample=N_augment)
         .to(device)
