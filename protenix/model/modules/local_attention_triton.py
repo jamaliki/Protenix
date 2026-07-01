@@ -75,24 +75,6 @@ def triton_local_attention_bf16_output_enabled() -> bool:
     }
 
 
-def triton_local_attention_streaming_enabled() -> bool:
-    return os.getenv("PROTENIX_TRITON_LOCAL_ATTN_STREAMING", "0").lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
-
-
-def triton_local_attention_stream_block_n() -> int:
-    explicit_value = os.getenv("PROTENIX_TRITON_LOCAL_ATTN_STREAM_BLOCK_N", "64")
-    try:
-        block_n = int(explicit_value)
-    except ValueError:
-        return 64
-    return block_n if block_n in {32, 64} else 64
-
-
 _SUPPORTED_INPUT_DTYPES = {torch.float32, torch.bfloat16}
 
 
@@ -197,130 +179,6 @@ if triton_local_attention_available():
             mask=q_mask[:, None],
         )
 
-    @triton.jit
-    def _local_attention_streaming_kernel(
-        q_ptr,
-        k_ptr,
-        v_ptr,
-        bias_ptr,
-        out_ptr,
-        n_atoms: tl.constexpr,
-        n_trunks: tl.constexpr,
-        pad_left: tl.constexpr,
-        q_stride_s: tl.constexpr,
-        q_stride_h: tl.constexpr,
-        q_stride_n: tl.constexpr,
-        q_stride_d: tl.constexpr,
-        k_stride_s: tl.constexpr,
-        k_stride_h: tl.constexpr,
-        k_stride_n: tl.constexpr,
-        k_stride_d: tl.constexpr,
-        v_stride_s: tl.constexpr,
-        v_stride_h: tl.constexpr,
-        v_stride_n: tl.constexpr,
-        v_stride_d: tl.constexpr,
-        b_stride_s: tl.constexpr,
-        b_stride_h: tl.constexpr,
-        b_stride_t: tl.constexpr,
-        b_stride_q: tl.constexpr,
-        b_stride_k: tl.constexpr,
-        o_stride_s: tl.constexpr,
-        o_stride_h: tl.constexpr,
-        o_stride_n: tl.constexpr,
-        o_stride_d: tl.constexpr,
-        n_heads: tl.constexpr,
-        block_m: tl.constexpr,
-        block_n: tl.constexpr,
-        block_d: tl.constexpr,
-        stream_block_n: tl.constexpr,
-        dot_input_precision: tl.constexpr,
-    ):
-        pid = tl.program_id(0)
-        trunk = pid % n_trunks
-        head = (pid // n_trunks) % n_heads
-        sample = pid // (n_trunks * n_heads)
-
-        offs_m = tl.arange(0, block_m)
-        offs_d = tl.arange(0, block_d)
-        q_idx = trunk * block_m + offs_m
-        q_mask = q_idx < n_atoms
-
-        q_base = q_ptr + sample * q_stride_s + head * q_stride_h
-        k_base = k_ptr + sample * k_stride_s + head * k_stride_h
-        v_base = v_ptr + sample * v_stride_s + head * v_stride_h
-        b_base = (
-            bias_ptr
-            + sample * b_stride_s
-            + head * b_stride_h
-            + trunk * b_stride_t
-        )
-
-        q = tl.load(
-            q_base + q_idx[:, None] * q_stride_n + offs_d[None, :] * q_stride_d,
-            mask=q_mask[:, None],
-            other=0.0,
-        )
-
-        m_i = tl.full([block_m], -float("inf"), dtype=tl.float32)
-        l_i = tl.zeros([block_m], dtype=tl.float32)
-        acc = tl.zeros([block_m, block_d], dtype=tl.float32)
-
-        # Stream the fixed 128-key local window in smaller key blocks. This keeps
-        # only a 32 x stream_block_n score tile live instead of the full 32 x 128
-        # softmax matrix, targeting the high register pressure seen in NCU.
-        for key_block in tl.static_range(0, block_n // stream_block_n):
-            key_start = key_block * stream_block_n
-            offs_n = key_start + tl.arange(0, stream_block_n)
-            k_idx = trunk * block_m - pad_left + offs_n
-            k_mask = (k_idx >= 0) & (k_idx < n_atoms)
-
-            k = tl.load(
-                k_base
-                + k_idx[:, None] * k_stride_n
-                + offs_d[None, :] * k_stride_d,
-                mask=k_mask[:, None],
-                other=0.0,
-            )
-            bias = tl.load(
-                b_base
-                + offs_m[:, None] * b_stride_q
-                + offs_n[None, :] * b_stride_k,
-                mask=q_mask[:, None] & k_mask[None, :],
-                other=-float("inf"),
-            )
-            score = tl.dot(q, tl.trans(k), input_precision=dot_input_precision) + bias
-            score = tl.where(q_mask[:, None] & k_mask[None, :], score, -float("inf"))
-            score = tl.where(q_mask[:, None], score, 0.0)
-
-            m_ij = tl.max(score, 1)
-            m_new = tl.maximum(m_i, m_ij)
-            alpha = tl.exp(m_i - m_new)
-            prob = tl.exp(score - m_new[:, None])
-
-            v = tl.load(
-                v_base
-                + k_idx[:, None] * v_stride_n
-                + offs_d[None, :] * v_stride_d,
-                mask=k_mask[:, None],
-                other=0.0,
-            )
-            v = v.to(tl.float32)
-            acc = acc * alpha[:, None] + tl.dot(
-                prob,
-                v,
-                input_precision=dot_input_precision,
-            )
-            l_i = l_i * alpha + tl.sum(prob, 1)
-            m_i = m_new
-
-        out = acc / l_i[:, None]
-        out_base = out_ptr + sample * o_stride_s + head * o_stride_h
-        tl.store(
-            out_base + q_idx[:, None] * o_stride_n + offs_d[None, :] * o_stride_d,
-            out,
-            mask=q_mask[:, None],
-        )
-
 
 def triton_local_attention(
     q: torch.Tensor,
@@ -413,22 +271,7 @@ def triton_local_attention(
         dtype=out_dtype,
     )
     grid = (n_sample * n_heads * n_trunks,)
-    use_streaming = triton_local_attention_streaming_enabled()
-    kernel = (
-        _local_attention_streaming_kernel
-        if use_streaming
-        else _local_attention_kernel
-    )
-    kernel_kwargs = {
-        "block_m": n_queries,
-        "block_n": n_keys,
-        "block_d": head_dim,
-        "dot_input_precision": triton_local_attention_input_precision(),
-        "num_warps": triton_local_attention_num_warps(q.dtype),
-    }
-    if use_streaming:
-        kernel_kwargs["stream_block_n"] = triton_local_attention_stream_block_n()
-    kernel[grid](
+    _local_attention_kernel[grid](
         q_flat,
         k_flat,
         v_flat,
@@ -459,7 +302,11 @@ def triton_local_attention(
         out.stride(2),
         out.stride(3),
         n_heads,
-        **kernel_kwargs,
+        block_m=n_queries,
+        block_n=n_keys,
+        block_d=head_dim,
+        dot_input_precision=triton_local_attention_input_precision(),
+        num_warps=triton_local_attention_num_warps(q.dtype),
     )
     if not batch_shape:
         return out[0]
