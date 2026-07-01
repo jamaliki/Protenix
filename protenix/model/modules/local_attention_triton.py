@@ -66,6 +66,20 @@ def triton_local_attention_num_warps(dtype: torch.dtype) -> int:
     return num_warps if num_warps in {1, 2, 4, 8} else default_num_warps
 
 
+def triton_local_attention_block_m(n_queries: int) -> int:
+    """Number of query rows handled by one Triton local-attention CTA."""
+    explicit_value = os.getenv("PROTENIX_TRITON_LOCAL_ATTN_BLOCK_M")
+    if explicit_value is None:
+        return n_queries
+    try:
+        block_m = int(explicit_value)
+    except ValueError:
+        return n_queries
+    if block_m in {8, 16, 32} and n_queries % block_m == 0:
+        return block_m
+    return n_queries
+
+
 def triton_local_attention_bf16_output_enabled() -> bool:
     return os.getenv("PROTENIX_TRITON_LOCAL_ATTN_OUTPUT_BF16", "0").lower() not in {
         "0",
@@ -115,18 +129,22 @@ if triton_local_attention_available():
         block_m: tl.constexpr,
         block_n: tl.constexpr,
         block_d: tl.constexpr,
+        n_q_chunks: tl.constexpr,
+        query_window: tl.constexpr,
         dot_input_precision: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        trunk = pid % n_trunks
-        head = (pid // n_trunks) % n_heads
-        sample = pid // (n_trunks * n_heads)
+        q_chunk = pid % n_q_chunks
+        trunk = (pid // n_q_chunks) % n_trunks
+        head = (pid // (n_q_chunks * n_trunks)) % n_heads
+        sample = pid // (n_q_chunks * n_trunks * n_heads)
 
         offs_m = tl.arange(0, block_m)
         offs_n = tl.arange(0, block_n)
         offs_d = tl.arange(0, block_d)
-        q_idx = trunk * block_m + offs_m
-        k_idx = trunk * block_m - pad_left + offs_n
+        bias_q = q_chunk * block_m + offs_m
+        q_idx = trunk * query_window + bias_q
+        k_idx = trunk * query_window - pad_left + offs_n
 
         q_base = q_ptr + sample * q_stride_s + head * q_stride_h
         k_base = k_ptr + sample * k_stride_s + head * k_stride_h
@@ -151,7 +169,7 @@ if triton_local_attention_available():
             other=0.0,
         )
         bias = tl.load(
-            b_base + offs_m[:, None] * b_stride_q + offs_n[None, :] * b_stride_k,
+            b_base + bias_q[:, None] * b_stride_q + offs_n[None, :] * b_stride_k,
             mask=q_mask[:, None] & k_mask[None, :],
             other=-float("inf"),
         )
@@ -270,7 +288,9 @@ def triton_local_attention(
         device=q.device,
         dtype=out_dtype,
     )
-    grid = (n_sample * n_heads * n_trunks,)
+    block_m = triton_local_attention_block_m(n_queries)
+    n_q_chunks = n_queries // block_m
+    grid = (n_sample * n_heads * n_trunks * n_q_chunks,)
     _local_attention_kernel[grid](
         q_flat,
         k_flat,
@@ -302,9 +322,11 @@ def triton_local_attention(
         out.stride(2),
         out.stride(3),
         n_heads,
-        block_m=n_queries,
+        block_m=block_m,
         block_n=n_keys,
         block_d=head_dim,
+        n_q_chunks=n_q_chunks,
+        query_window=n_queries,
         dot_input_precision=triton_local_attention_input_precision(),
         num_warps=triton_local_attention_num_warps(q.dtype),
     )
