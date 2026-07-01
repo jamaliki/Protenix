@@ -234,6 +234,70 @@ The mechanism is now clear: this boundary is real but too small after
 sample-broadcast conditioning.  The code path was removed so future work does
 not carry another default-off branch with no throughput signal.
 
+### 3c. CuTe target from launch-level NCU, not guesswork
+
+Nsight Compute is installed on Tokyo in
+`/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/env-nsight/bin/ncu`.  The
+first focused reports were captured on `gpu-canary-0` with the representative
+trunk shape `N_sample=1280`, `N_token=245`, `c_a=768`, BF16, and broadcast
+conditioning:
+
+- `round140_ncu_trunk_boundary_20260701_172113`: baseline transition and
+  attention boundary.
+- `round141_ncu_transition_fused_input_20260701_172504`: existing
+  `PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION=1` boundary.
+
+The transition block is the better CuTe target than a whole attention
+"mega-kernel".  The attention path is dominated by vendor kernels:
+
+| attention launch | duration | SOL signal | interpretation |
+| --- | ---: | --- | --- |
+| cuDNN/FMHA BF16 attention | 4.01 ms | SM 55%, memory 77%, DRAM 14% | large library kernel; replacing it is high risk |
+| q/k/v/g/out GEMMs | 0.47-0.53 ms each | tensor pipe 77-81% | already good H100 tensor-core kernels |
+| attention gate | 0.47 ms | DRAM 91%, tensor 0% | memory-bound epilogue candidate |
+| layout/copy elementwise | 0.31 ms | DRAM 89% | memory-bound, but secondary |
+
+The transition path has two memory-bound epilogues adjacent to large GEMMs:
+
+| transition launch | duration | SOL signal | interpretation |
+| --- | ---: | --- | --- |
+| input projection GEMM `a1` | 1.00 ms | tensor pipe 83%, memory 76% | good cuBLASLt/CUTLASS kernel |
+| input projection GEMM `a2` | 1.00 ms | tensor pipe 83%, memory 76% | good cuBLASLt/CUTLASS kernel |
+| `silu(a1) * a2` Triton kernel | 0.94 ms | DRAM 91%, tensor 0% | real HBM boundary |
+| output projection GEMM | 0.95 ms | tensor pipe 89%, memory 79% | good cuBLASLt/CUTLASS kernel |
+| final `sigmoid(gate) * projected + residual` | 0.47 ms | DRAM 91%, tensor 0% | real HBM boundary |
+| AdaLN LayerNorm on `a` | 0.40 ms | DRAM 71% | material but not adjacent to a GEMM epilogue |
+| AdaLN gate/offset application | 0.31 ms | DRAM 90% | already fused/broadcast-aware; smaller target |
+
+The existing wide-input projection experiment explains what a real kernel must
+do.  Combining `a1/a2` into one cuBLAS GEMM costs 1.99 ms, essentially the same
+as two 1.00 ms GEMMs, and the split-aware `silu` consumer still costs 0.94 ms.
+So the remaining win is not "one wider GEMM"; it is avoiding the intermediate
+`[a1, a2]` write/read entirely.
+
+Concrete CuTe/CUTLASS target order:
+
+1. **Transition output GEMM epilogue**:
+   compute `linear_b(b)` and store
+   `sigmoid(linear_s(s)) * linear_b(b) + residual` directly.  This is the
+   lower-risk first custom GEMM because it is a standard matmul with an
+   auxiliary epilogue load.  Maximum observed launch removal is about 0.47 ms
+   per transition block, roughly 3% of the measured 14 ms trunk block.
+2. **Dual-input transition GEMM epilogue**:
+   compute the two `a -> a1/a2` projections and store
+   `silu(a1) * a2` directly.  This is the larger prize, removing the 0.94 ms
+   memory-bound SiLU/multiply launch and the 2H intermediate traffic.  It is
+   also harder because the kernel must keep the 1.99 ms tensor-core throughput
+   of the wide GEMM while pairing the two output halves in the epilogue.
+3. **Only then consider attention epilogues**.  The main attention kernel is
+   already a vendor FMHA launch, and the rejected `q/k/v/g` fusion shows that
+   producer fusion can lose when it disrupts the library schedule.
+
+The combined transition-epilogue ceiling is about 1.4 ms per 14 ms trunk block
+before custom-matmul overheads.  That is a real target, but not a 2x target:
+the implementation has to be vendor-quality, or the lost GEMM efficiency will
+erase the saved HBM traffic.
+
 ### 4. Use lower precision only where profiling supports it
 
 `PROTENIX_BF16_DIFFUSION_CORE=1` and `PROTENIX_BF16_ATOM_ATTENTION=1` reduce
