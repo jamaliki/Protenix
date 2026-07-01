@@ -3005,3 +3005,106 @@ Decision:
 - A legitimate follow-up would need a projection kernel that writes the desired
   head-contiguous layout directly and an output path that avoids a compensating
   copy before `linear_o`; otherwise shift effort to transition MLP fusion.
+
+### Round 55 - detailed NCU for cached atom transition activation
+
+Status: diagnostic
+
+Question:
+- Is the atom transition activation (`SiLU(a1) * a2`) leaving easy kernel-level
+  bandwidth or occupancy on the table, or is the real opportunity to remove the
+  activation materialization before the output projection?
+
+Experiment:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round112_transition_silu_detailed_ncu_20260701_121505`.
+- Commit: `e88e9ba`.
+- Workload: cached atom-transformer hotspot, `N_sample=1280`,
+  `p_samples=1`, BF16, current promoted flags,
+  `--warmup 8 --iters 30 --transition-residual 1`.
+- Tool: Nsight Compute detailed profile for `_silu_mul_kernel` in the
+  transition subrange.
+
+Key NCU metrics:
+
+| metric | value |
+| --- | ---: |
+| duration | 1.61 ms |
+| grid size | 809280 CTAs |
+| block size | 128 threads |
+| registers/thread | 32 |
+| theoretical occupancy | 100.00% |
+| achieved occupancy | 86.68% |
+| memory throughput | 91.63% |
+| compute/SM throughput | 31.50% |
+| DRAM throughput | 91.63% |
+| L2 throughput | 82.80% |
+| achieved DRAM bandwidth | 3.07 TB/s |
+| excessive global sectors | 0 |
+
+Interpretation:
+- This launch is already a clean coalesced DRAM-bound elementwise kernel. The
+  H100 is moving about `3.07 TB/s` and NCU does not report global-sector waste.
+- Increasing batch cannot fix this kernel either: the grid is already enormous,
+  occupancy is high, and the limiter is memory bandwidth for writing/reading the
+  materialized activation tensor.
+- Tuning this Triton elementwise kernel is unlikely to produce a material win.
+  The meaningful transition opportunity is to avoid the activation tensor
+  entirely or use a vendor-quality matmul epilogue that computes
+  `linear_b(SiLU(a1) * a2)` without giving up cuBLAS/CUTLASS-level GEMM
+  efficiency.
+
+Decision:
+- Screen one direct fused activation-projection prototype as a fast falsifier,
+  but promote only if it beats the current cuBLAS-backed output projection.
+
+### Round 56 - rejected fused transition activation projection
+
+Status: rejected and reverted
+
+Hypothesis:
+- Round 55 showed the activation materialization is a high-bandwidth memory
+  pass. A fused Triton kernel that computes
+  `linear_b(SiLU(a1) * a2)` directly should remove that activation write/read
+  pair and reduce the atom transition subrange.
+
+Change:
+- Commit `1c4968a` added an opt-in
+  `PROTENIX_TRITON_FUSED_SILU_LINEAR=1` path for the atom transition block.
+  The path was guarded to inference, CUDA, BF16, rank-3 inputs, hidden
+  dimension `256`, and output dimension `128`.
+- Commit `fa2bfce` reverted it after the hotspot screen below.
+
+Hotspot screen:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round113_fused_silu_linear_hotspot_20260701_121803`.
+- Workload: cached atom-transformer hotspot, `N_sample=1280`,
+  `p_samples=1`, BF16, current promoted flags,
+  `--warmup 8 --iters 30 --transition-residual 1`.
+- Correctness: exact parity on a small `N_sample=64` screen
+  (`finite=true`, `max_abs=0.0`, `mean_abs=0.0`).
+
+| variant | full atom block | attention path | transition | finite | peak reserved |
+| --- | ---: | ---: | ---: | --- | ---: |
+| base | 27.401 ms | 16.736 ms | 9.868 ms | yes | 13484 MiB |
+| fused activation projection | 31.253 ms | 16.738 ms | 13.719 ms | yes | 12704 MiB |
+| base repeat | 27.421 ms | 16.734 ms | 9.864 ms | yes | 13484 MiB |
+
+Interpretation:
+- The fused expression is numerically exact for the tested shape and reduces
+  peak memory, but it is much slower. The custom Triton matmul gives up too much
+  GEMM efficiency relative to cuBLAS for a `256 -> 128` projection at this
+  batch/atom shape.
+- This result narrows the viable "mega-kernel" path: fusing the activation into
+  a mediocre matmul is worse than keeping a very efficient memory-bound
+  activation plus cuBLAS projection. A legitimate transition rewrite needs a
+  high-quality CUTLASS/cuBLASLt-style epilogue or a substantially better Triton
+  matmul tile, not just larger fusion scope.
+
+Decision:
+- Reject and revert `1c4968a`.
+- Do not keep a default-off fused activation-projection path.
+- Next credible atom work should either:
+  1. fix local-attention layout/coalescing by producing the right Q/K/V layout
+     directly rather than copying, or
+  2. implement a vendor-quality fused MLP/output-projection epilogue.
