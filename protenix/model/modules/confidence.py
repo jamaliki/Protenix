@@ -35,6 +35,13 @@ def _env_float(name: str) -> Optional[float]:
     return float(value)
 
 
+def _env_int(name: str) -> Optional[int]:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    return int(value)
+
+
 class ConfidenceHead(nn.Module):
     """
     Implements Algorithm 31 in AF3
@@ -291,6 +298,93 @@ class ConfidenceHead(nn.Module):
             pde_preds,
             resolved_preds,
         )
+
+    def iter_logit_chunks(
+        self,
+        input_feature_dict: dict[str, Union[torch.Tensor, int, float, dict]],
+        s_inputs: torch.Tensor,
+        s_trunk: torch.Tensor,
+        z_trunk: torch.Tensor,
+        pair_mask: torch.Tensor,
+        x_pred_coords: torch.Tensor,
+        use_embedding: bool = True,
+        triangle_multiplicative: str = "torch",
+        triangle_attention: str = "torch",
+        inplace_safe: bool = False,
+        chunk_size: Optional[int] = None,
+        sample_chunk_size: Optional[int] = None,
+    ):
+        """Yield confidence logits in sample chunks without materializing all logits."""
+
+        if self.stop_gradient:
+            s_inputs = s_inputs.detach()
+            s_trunk = s_trunk.detach()
+            z_trunk = z_trunk.detach()
+
+        s_trunk = self.input_strunk_ln(torch.clamp(s_trunk, min=-512, max=512))
+
+        if not use_embedding:
+            if inplace_safe:
+                z_trunk *= 0
+            else:
+                z_trunk = 0 * z_trunk
+
+        x_rep_atom_mask = input_feature_dict["distogram_rep_atom_mask"].bool()
+        x_pred_rep_coords = x_pred_coords[..., x_rep_atom_mask, :]
+        N_sample = x_pred_rep_coords.size(-3)
+
+        z_init = (
+            self.linear_no_bias_s1(s_inputs)[..., None, :, :]
+            + self.linear_no_bias_s2(s_inputs)[..., None, :]
+        )
+        z_trunk = z_init + z_trunk
+        if not self.training:
+            del z_init
+            torch.cuda.empty_cache()
+
+        if sample_chunk_size is None:
+            sample_chunk_size = _env_int("PROTENIX_CONFIDENCE_LOGIT_CHUNK_SIZE") or 1
+        if sample_chunk_size < 1:
+            sample_chunk_size = N_sample
+
+        for start in range(0, N_sample, sample_chunk_size):
+            end = min(start + sample_chunk_size, N_sample)
+            plddt_preds, pae_preds, pde_preds, resolved_preds = (
+                [],
+                [],
+                [],
+                [],
+            )
+            for i in range(start, end):
+                (
+                    plddt_pred,
+                    pae_pred,
+                    pde_pred,
+                    resolved_pred,
+                ) = self.memory_efficient_forward(
+                    input_feature_dict=input_feature_dict,
+                    s_trunk=s_trunk.clone() if inplace_safe else s_trunk,
+                    z_pair=z_trunk.clone() if inplace_safe else z_trunk,
+                    pair_mask=pair_mask,
+                    x_pred_rep_coords=x_pred_rep_coords[..., i, :, :],
+                    triangle_multiplicative=triangle_multiplicative,
+                    triangle_attention=triangle_attention,
+                    inplace_safe=inplace_safe,
+                    chunk_size=chunk_size,
+                )
+                plddt_preds.append(plddt_pred)
+                pae_preds.append(pae_pred)
+                pde_preds.append(pde_pred)
+                resolved_preds.append(resolved_pred)
+
+            yield (
+                start,
+                end,
+                torch.stack(plddt_preds, dim=-3),
+                torch.stack(pae_preds, dim=-4),
+                torch.stack(pde_preds, dim=-4),
+                torch.stack(resolved_preds, dim=-3),
+            )
 
     def memory_efficient_forward(
         self,
