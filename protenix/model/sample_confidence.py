@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 from typing import Any, Optional, Union
 
@@ -928,6 +929,72 @@ def compute_full_data_and_summary(
     elements_one_hot: Optional[torch.Tensor] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Wrapper of `_compute_full_data_and_summary` by enumerating over N samples"""
+
+    if token_asym_id.dim() > 1:
+        batch_shape = token_asym_id.shape[:-1]
+        batch_ndim = len(batch_shape)
+        flat_batch = math.prod(batch_shape)
+
+        def flatten_batch(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if tensor is None:
+                return None
+            if tensor.shape[:batch_ndim] == batch_shape:
+                return tensor.reshape(flat_batch, *tensor.shape[batch_ndim:])
+            return tensor
+
+        pae_flat = flatten_batch(pae_logits)
+        plddt_flat = flatten_batch(plddt_logits)
+        pde_flat = flatten_batch(pde_logits)
+        atom_coordinate_flat = flatten_batch(atom_coordinate)
+        contact_probs_flat = flatten_batch(contact_probs)
+        token_asym_id_flat = flatten_batch(token_asym_id)
+        token_has_frame_flat = flatten_batch(token_has_frame)
+        atom_to_token_idx_flat = flatten_batch(atom_to_token_idx)
+        atom_is_polymer_flat = flatten_batch(atom_is_polymer)
+        interested_atom_mask_flat = flatten_batch(interested_atom_mask)
+        mol_id_flat = flatten_batch(mol_id)
+        elements_one_hot_flat = flatten_batch(elements_one_hot)
+
+        def select_batch(
+            flat_tensor: Optional[torch.Tensor],
+            original_tensor: Optional[torch.Tensor],
+            batch_idx: int,
+        ) -> Optional[torch.Tensor]:
+            if flat_tensor is None:
+                return None
+            if flat_tensor is original_tensor:
+                return flat_tensor
+            return flat_tensor[batch_idx]
+
+        summary_confidence: list[dict[str, Any]] = []
+        full_data: list[dict[str, Any]] = []
+        for batch_idx in range(flat_batch):
+            summary_i, full_i = compute_full_data_and_summary(
+                configs=configs,
+                pae_logits=pae_flat[batch_idx],
+                plddt_logits=plddt_flat[batch_idx],
+                pde_logits=pde_flat[batch_idx],
+                contact_probs=select_batch(
+                    contact_probs_flat, contact_probs, batch_idx
+                ),
+                token_asym_id=token_asym_id_flat[batch_idx],
+                token_has_frame=token_has_frame_flat[batch_idx],
+                atom_coordinate=atom_coordinate_flat[batch_idx],
+                atom_to_token_idx=atom_to_token_idx_flat[batch_idx],
+                atom_is_polymer=atom_is_polymer_flat[batch_idx],
+                N_recycle=N_recycle,
+                return_full_data=return_full_data,
+                interested_atom_mask=select_batch(
+                    interested_atom_mask_flat, interested_atom_mask, batch_idx
+                ),
+                mol_id=select_batch(mol_id_flat, mol_id, batch_idx),
+                elements_one_hot=select_batch(
+                    elements_one_hot_flat, elements_one_hot, batch_idx
+                ),
+            )
+            summary_confidence.extend(summary_i)
+            full_data.extend(full_i)
+        return summary_confidence, full_data
 
     N_sample = pae_logits.size(0)
     if contact_probs.dim() not in (2, 3):
