@@ -55,18 +55,20 @@ export PROTENIX_TRITON_LOCAL_ATTN_NUM_WARPS=1
 export PROTENIX_TRITON_LOCAL_ATTN_OUTPUT_BF16=1
 export PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS=1
 export PROTENIX_TRITON_FUSED_ELEMENTWISE=1
+export PROTENIX_TRITON_FUSED_TRANSITION_RESIDUAL=1
 export PROTENIX_BF16_ATOM_ATTENTION=1
 export PROTENIX_SUMMARY_SAMPLE_CHUNK_SIZE=32
 export PROTENIX_STREAM_CONFIDENCE_SUMMARY=1
 export PROTENIX_CONFIDENCE_LOGIT_CHUNK_SIZE=32
 ```
 
-Measured one-H100 throughput with streamed confidence summary and BF16 atom
-local-attention output is `7.824` end-to-end samples/sec and `7.837` forward
-samples/sec at `N_sample=1280`, `N_step=200`, true unchunked diffusion on the
-7r6r benchmark input, reserving `18.4 GiB`. The current max-throughput point is
-`N_sample=2560` with `7.868` end-to-end samples/sec and `7.875` forward
-samples/sec, reserving `34.8 GiB`; this is `14.90x` over the original per-GPU
+Measured one-H100 throughput with streamed confidence summary, BF16 atom
+local-attention output, and fused transition residuals is `7.793` end-to-end
+samples/sec and `7.806` forward samples/sec at `N_sample=1280`, `N_step=200`,
+true unchunked diffusion on the 7r6r benchmark input, reserving `18.4 GiB`. The
+current max-throughput point is `N_sample=2560` with `7.890` end-to-end
+samples/sec and `7.897` forward samples/sec, reserving `35.3 GiB`; this is
+`14.94x` over the original per-GPU
 default aggregate baseline of `0.528` samples/sec. Larger batches now work
 because confidence PAE/PDE logits are streamed into summary/full-data chunks
 instead of materializing the full FP32 logit stack. The marginal batch-size gain
@@ -2093,3 +2095,63 @@ Decision:
 - Reject and revert the fused final attention gate.
 - Keep looking at transition/elementwise traffic, but promote only candidates
   that pass the full N200 inference gate.
+
+### Round 40 - fused transition residual add
+
+Status: promoted behind an explicit inference flag
+
+Hypothesis:
+- Atom transition NCU showed DRAM-bound elementwise launches in the transition
+  path: the final transition gate (`triton_sigmoid_mul`) and the following
+  block residual add are separate tensor passes. Fusing the final transition
+  gate with the residual add should reduce one repeated memory pass per atom
+  transformer block.
+
+Change:
+- Added `PROTENIX_TRITON_FUSED_TRANSITION_RESIDUAL=1` in commit `24fa911`.
+- The fast path is inference-only, opt-in, and only used when DropPath is
+  identity. It changes:
+  `fused_sigmoid_mul(gate, projected) + residual` into
+  `fused_sigmoid_mul_add(gate, projected, residual)`.
+- The default remains the original two-step expression.
+
+Hotspot and parity:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round72_fused_transition_residual_hotspot_20260701_064101`.
+- Same-block/same-input parity at `N_sample=320`: all finite, max abs error
+  `0.03125`, mean abs error `7.4e-05`. The error is expected from fusing the
+  multiply/add before the BF16 store.
+
+| samples | residual fusion | attention ms | transition ms | full block ms | peak allocated MiB |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 320 | off | 8.323 | 2.462 | 11.163 | 6998 |
+| 320 | on | 8.314 | 2.458 | 10.943 | 6998 |
+| 640 | off | 16.412 | 4.856 | 21.959 | 13962 |
+| 640 | on | 16.400 | 4.853 | 21.670 | 13962 |
+| 1280 | off | 32.509 | 9.623 | 43.679 | 27889 |
+| 1280 | on | 32.590 | 9.622 | 43.141 | 27889 |
+
+Full 7r6r gate, `N_step=200`, one H100:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round73_fused_transition_residual_full_20260701_064218`.
+
+| variant | forward sec | forward samples/sec | end-to-end samples/sec | diffusion | confidence head | summary confidence | peak allocated MiB | peak reserved MiB | finite coords |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| N1280, residual fusion off | 165.808 | 7.720 | 7.707 | 138.052 s | 22.675 s | 2.216 s | 15705 | 18438 | yes |
+| N1280, residual fusion on | 163.970 | 7.806 | 7.793 | 136.654 s | 22.239 s | 2.185 s | 15705 | 18438 | yes |
+| N2560, residual fusion on | 324.176 | 7.897 | 7.890 | 273.848 s | 42.971 s | 4.589 s | 29104 | 35338 | yes |
+
+Interpretation:
+- The paired N1280 gate shows a `+1.12%` end-to-end throughput win with
+  unchanged memory.
+- The new max-throughput point is `N_sample=2560` with `7.890` end-to-end
+  samples/sec, `7.897` forward samples/sec, and `35.3 GiB` peak reserved
+  memory. This is `14.94x` over the original default per-GPU baseline.
+- The win is modest, but unlike the rejected final attention-gate fusion it
+  survives the full N200 model gate.
+
+Decision:
+- Promote `PROTENIX_TRITON_FUSED_TRANSITION_RESIDUAL=1` in the high-throughput
+  stack.
+- Continue targeting atom-transition and local-pair-bias memory traffic; batch
+  scaling remains nearly saturated.
