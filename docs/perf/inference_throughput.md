@@ -1239,3 +1239,49 @@ Next:
   adaptive LayerNorm/gating. The next candidate should be another producer/
   consumer fusion in the atom transformer or a trunk transition epilogue fusion
   that preserves cuDNN SDPA and tensor-core GEMMs.
+
+### Round 26 - rejected fused self-attention QKV projection
+
+Status: rejected and reverted
+
+Hypothesis:
+- The trunk transformer hotspot after the fused-bias promotion showed the
+  `attention_qkv_sdpa_gate_out` subrange dominates a diffusion trunk block:
+  at N640 it measured `9.76 ms` of a `16.27 ms` block, while conditioned
+  transition was `4.15 ms` and pair-bias projection was only `0.036 ms`.
+- Because trunk self-attention uses the same normalized `a` tensor for q/k/v,
+  concatenating q/k/v weights into one larger projection might remove two GEMM
+  launches and improve GEMM efficiency while preserving cuDNN SDPA.
+
+Change:
+- Added an opt-in `PROTENIX_FUSED_SELF_QKV=1` path in `Attention._prep_qkv`
+  in commit `661441a`, with cached concatenated q/k/v weights and fallback to
+  the existing three-projection path.
+
+Experiment:
+- Hotspot run:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round35_fused_self_qkv_hotspot_20260701_012856`.
+- Workload: diffusion trunk/token `DiffusionTransformerBlock`, BF16, 245
+  tokens, 16 heads, efficient conv2d pair-bias path, one H100.
+
+Results:
+| shape | fused qkv | full block ms | attention subrange ms | peak allocated MiB | parity |
+| --- | ---: | ---: | ---: | ---: | --- |
+| N320 | 0 | 8.294 | 4.925 | 2518 | reference |
+| N320 | 1 | 8.384 | 5.066 | 2647 | finite |
+| N640 | 0 | 16.267 | 9.736 | 4931 | reference |
+| N640 | 1 | 16.490 | 9.979 | 5174 | max diff `0.0` on N64 check |
+
+Interpretation:
+- The fused projection was numerically exact in the parity check but slower
+  and used more memory. On H100/PyTorch, three separate BF16 projection GEMMs
+  for this shape are already efficient enough; the larger concatenated GEMM and
+  cached fused weights do not pay for themselves.
+
+Decision:
+- Rejected. Reverted the code in `1ac182a`; do not carry the default-off path.
+
+Next:
+- Trunk attention remains material, but QKV concatenation is not the right
+  mechanism. Focus on either conditioned-transition epilogue/activation traffic
+  or atom-transformer post-fused-bias profiling.
