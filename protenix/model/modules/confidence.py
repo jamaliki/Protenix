@@ -234,6 +234,10 @@ class ConfidenceHead(nn.Module):
                 and pair_logit_bytes >= threshold_gib * (1024**3)
             )
         )
+        empty_cache_after_offload = (
+            z_trunk.shape[-2] > 2000
+            or _env_flag_enabled("PROTENIX_CONFIDENCE_CPU_OFFLOAD_EMPTY_CACHE")
+        )
 
         plddt_preds, pae_preds, pde_preds, resolved_preds = (
             [],
@@ -262,7 +266,8 @@ class ConfidenceHead(nn.Module):
                 # cpu offload pae_preds/pde_preds
                 pae_pred = pae_pred.cpu()
                 pde_pred = pde_pred.cpu()
-                torch.cuda.empty_cache()
+                if empty_cache_after_offload:
+                    torch.cuda.empty_cache()
             plddt_preds.append(plddt_pred)
             pae_preds.append(pae_pred)
             pde_preds.append(pde_pred)
