@@ -114,6 +114,13 @@ def run_attention(
     gate: torch.Tensor | None,
     args: argparse.Namespace,
 ) -> torch.Tensor:
+    fuse_gate = os.environ.get("PROTENIX_TRITON_LOCAL_ATTN_FUSE_GATE", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+    kernel_gate = gate if fuse_gate else None
     out, gate_applied = _local_attention(
         q=q,
         k=k,
@@ -124,7 +131,7 @@ def run_attention(
         use_efficient_implementation=True,
         inplace_safe=False,
         chunk_size=None,
-        gate=gate,
+        gate=kernel_gate,
         return_gate_status=True,
     )
     if gate is not None and not gate_applied:
