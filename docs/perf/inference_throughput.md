@@ -2664,3 +2664,68 @@ Decision:
 - Use this as the new launch map.
 - Next implementation candidate: broadcast-aware AdaLN fusion for inference
   shapes, with a full-workload gate required before promotion.
+
+### Round 49 - rejected broadcast-aware AdaLN fusion
+
+Status: rejected and reverted
+
+Hypothesis:
+- Round 48 showed that trunk AdaLN plus broadcast gate/add still made repeated
+  memory-bound launches. Since diffusion conditioning `s` is now computed with
+  sample dimension `1` and broadcast across the sample batch, a Triton kernel
+  that computes LayerNorm over `a=[S,T,C]` and immediately applies
+  `sigmoid(gate[1,T,C]) * norm + shift[1,T,C]` should remove one full-token
+  write/read pair in both trunk attention and transition blocks.
+
+Change:
+- Commit `5393abe` added an inference-only broadcast-aware AdaLN Triton path
+  behind `PROTENIX_TRITON_FUSED_ELEMENTWISE=1`.
+- The kernel was guarded to contiguous CUDA rank-3 tensors with
+  `a.shape=[S,T,C]`, `gate.shape=shift.shape=[1,T,C]`, matching dtypes, no
+  gradients, and `C <= 1024`. Fallback remained the existing fast LayerNorm
+  plus fused broadcast gate/add.
+
+Hotspot screen:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round99_adaln_hotspot_20260701_101303`.
+- Same-input parity versus fallback: all finite, max abs error `0.0078125`,
+  mean abs error `1.0e-08`.
+
+| target | base | fused AdaLN | delta |
+| --- | ---: | ---: | ---: |
+| adaptive LayerNorm subrange | 0.754 ms | 0.418 ms | -44.6% |
+| attention-pair-bias path | 8.239 ms | 7.904 ms | -4.1% |
+| conditioned transition | 5.292 ms | 5.101 ms | -3.6% |
+| full trunk block | 14.346 ms | 13.758 ms | -4.1% |
+| peak reserved | 8846 MiB | 8386 MiB | -5.2% |
+
+Full N2560 gates, one H100, `N_step=200`, current promoted stack:
+
+| run | order | variant | end-to-end samples/sec | forward samples/sec | forward sec | diffusion | transformer | atom decoder | confidence head | peak reserved MiB |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| round100 | base then candidate | base `84e21e2` | 9.180 | 9.190 | 278.575 | 228.198 s | 144.605 s | 30.021 s | 42.635 s | 37120 |
+| round100 | base then candidate | AdaLN `5393abe` | 9.271 | 9.280 | 275.849 | 225.193 s | 139.249 s | 32.405 s | 42.776 s | 32420 |
+| round101 | candidate then base | AdaLN `5393abe` | 9.022 | 9.031 | 283.459 | 228.059 s | 142.079 s | 32.430 s | 46.952 s | 32420 |
+| round101 | candidate then base | base `84e21e2` | 9.049 | 9.059 | 282.592 | 231.295 s | 147.643 s | 30.078 s | 43.357 s | 37120 |
+
+Interpretation:
+- The isolated mechanism is real: fused AdaLN consistently reduces the trunk
+  transformer subpath and lowers reserved memory by about `4.6 GiB` at N2560.
+- It does not survive the full-workload promotion rule. The first full gate was
+  only `+0.98%` end-to-end, which required a repeat. The reversed-order repeat
+  was `-0.30%` end-to-end. Averaging both paired gates gives only about
+  `+0.35%`, below the noise and below the bar for carrying another custom
+  Triton path in the promoted stack.
+- The full gate also shows the practical issue: the AdaLN transformer win can
+  be erased by atom-decoder and confidence-head variance. For this workload,
+  the next larger gain must remove a more central per-sample cost, not just a
+  sub-millisecond trunk epilogue.
+
+Decision:
+- Reject and revert `5393abe`.
+- Keep Round 48 as the current trunk launch map. The next credible "mega"
+  candidate is a design-level transition-MLP or confidence-head kernel that
+  removes hidden activation materialization or repeated per-sample confidence
+  pairformer work. Do not write a whole-block attention mega-kernel unless the
+  design can explain how it beats cuDNN FMHA plus tensor-core GEMMs, not just
+  how it removes launches.

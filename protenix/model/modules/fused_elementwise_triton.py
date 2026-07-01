@@ -111,36 +111,6 @@ def _broadcast_z_mode(
     return None
 
 
-def _can_use_adaptive_layernorm_broadcast_triton(
-    a: torch.Tensor,
-    gate: torch.Tensor,
-    shift: torch.Tensor,
-) -> bool:
-    if not triton_fused_elementwise_enabled():
-        return False
-    if not triton_fused_elementwise_available():
-        return False
-    if torch.is_grad_enabled():
-        return False
-    if a.dtype not in _SUPPORTED_DTYPES:
-        return False
-    if not a.is_cuda or not gate.is_cuda or not shift.is_cuda:
-        return False
-    if gate.dtype != a.dtype or shift.dtype != a.dtype:
-        return False
-    if not a.is_contiguous() or not gate.is_contiguous() or not shift.is_contiguous():
-        return False
-    if a.dim() != 3 or gate.dim() != 3 or shift.dim() != 3:
-        return False
-    if gate.shape != shift.shape:
-        return False
-    if gate.shape[0] != 1 or a.shape[0] <= 1:
-        return False
-    if gate.shape[1:] != a.shape[1:]:
-        return False
-    return 0 < a.shape[-1] <= 1024
-
-
 if triton_fused_elementwise_available():
 
     @triton.jit
@@ -236,35 +206,6 @@ if triton_fused_elementwise_available():
         out = x * (1.0 / (1.0 + tl.exp(-x))) * y
         tl.store(out_ptr + offsets, out, mask=mask)
 
-    @triton.jit
-    def _adaptive_layernorm_broadcast_kernel(
-        a_ptr,
-        gate_ptr,
-        shift_ptr,
-        out_ptr,
-        n_cols: tl.constexpr,
-        n_tokens: tl.constexpr,
-        eps: tl.constexpr,
-        block_size: tl.constexpr,
-    ):
-        row = tl.program_id(0)
-        offsets = tl.arange(0, block_size)
-        mask = offsets < n_cols
-        a_offsets = row * n_cols + offsets
-        token = row % n_tokens
-        s_offsets = token * n_cols + offsets
-
-        x = tl.load(a_ptr + a_offsets, mask=mask, other=0.0).to(tl.float32)
-        mean = tl.sum(x, axis=0) / n_cols
-        centered = tl.where(mask, x - mean, 0.0)
-        var = tl.sum(centered * centered, axis=0) / n_cols
-        norm = centered * tl.rsqrt(var + eps)
-
-        gate = tl.load(gate_ptr + s_offsets, mask=mask, other=0.0).to(tl.float32)
-        shift = tl.load(shift_ptr + s_offsets, mask=mask, other=0.0).to(tl.float32)
-        out = (1.0 / (1.0 + tl.exp(-gate))) * norm + shift
-        tl.store(out_ptr + a_offsets, out, mask=mask)
-
 
 def _grid(n_elements: int) -> tuple[int]:
     return (triton.cdiv(n_elements, _BLOCK_SIZE),)
@@ -327,31 +268,6 @@ def triton_silu_mul(x: torch.Tensor, y: torch.Tensor) -> Optional[torch.Tensor]:
     out = torch.empty_like(y)
     _silu_mul_kernel[_grid(y.numel())](
         x, y, out, y.numel(), block_size=_BLOCK_SIZE, num_warps=4
-    )
-    return out
-
-
-def triton_adaptive_layernorm_broadcast(
-    a: torch.Tensor,
-    gate: torch.Tensor,
-    shift: torch.Tensor,
-    eps: float,
-) -> Optional[torch.Tensor]:
-    if not _can_use_adaptive_layernorm_broadcast_triton(a, gate, shift):
-        return None
-    out = torch.empty_like(a)
-    n_cols = a.shape[-1]
-    block_size = triton.next_power_of_2(n_cols)
-    _adaptive_layernorm_broadcast_kernel[(a.numel() // n_cols,)](
-        a,
-        gate,
-        shift,
-        out,
-        n_cols,
-        a.shape[-2],
-        eps,
-        block_size=block_size,
-        num_warps=4,
     )
     return out
 
