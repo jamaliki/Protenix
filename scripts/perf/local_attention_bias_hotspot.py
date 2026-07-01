@@ -191,6 +191,17 @@ def main() -> None:
             iters=args.iters,
         )
 
+    with (
+        amp,
+        env_flag("PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS", "1"),
+        env_flag("PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS_ATTN", "1"),
+    ):
+        fused_attn_out, fused_attn_full_ms = cuda_time(
+            lambda: run_local_attention(module, q, kv, z, args),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+
     row = {
         "args": vars(args),
         "device": torch.cuda.get_device_name(),
@@ -203,10 +214,20 @@ def main() -> None:
         "bias_speedup": ref_bias_ms / cand_bias_ms,
         "ref_full_ms": ref_full_ms,
         "candidate_full_ms": cand_full_ms,
+        "fused_bias_attention_full_ms": fused_attn_full_ms,
         "full_speedup": ref_full_ms / cand_full_ms,
+        "fused_bias_attention_speedup_vs_ref": ref_full_ms / fused_attn_full_ms,
+        "fused_bias_attention_speedup_vs_split": cand_full_ms / fused_attn_full_ms,
         "bias_parity": compare(cand_bias, ref_bias),
         "output_parity": compare(cand_out, ref_out),
+        "fused_bias_attention_output_parity": compare(fused_attn_out, ref_out),
         "candidate_output_all_finite": bool(torch.isfinite(cand_out).all().item()),
+        "fused_bias_attention_output_all_finite": bool(
+            torch.isfinite(fused_attn_out).all().item()
+        ),
+        "fused_bias_attention_num_warps": os.environ.get(
+            "PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS_ATTN_NUM_WARPS", "4"
+        ),
         "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
         "peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
         "timestamp": time.time(),
