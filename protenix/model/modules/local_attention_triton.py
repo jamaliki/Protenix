@@ -75,6 +75,15 @@ def triton_local_attention_bf16_output_enabled() -> bool:
     }
 
 
+def triton_local_attention_contiguous_qkv_enabled() -> bool:
+    return os.getenv("PROTENIX_TRITON_LOCAL_ATTN_CONTIG_QKV", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
 _SUPPORTED_INPUT_DTYPES = {torch.float32, torch.bfloat16}
 
 
@@ -232,6 +241,11 @@ def triton_local_attention(
         for bias_dim, q_dim in zip(bias_batch_shape, batch_shape)
     ):
         return None
+
+    if triton_local_attention_contiguous_qkv_enabled():
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
 
     n_sample = prod(batch_shape) if batch_shape else 1
     flat_q_shape = (n_sample, n_heads, n_atoms, head_dim)
