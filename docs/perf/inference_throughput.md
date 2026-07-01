@@ -2155,3 +2155,104 @@ Decision:
   stack.
 - Continue targeting atom-transition and local-pair-bias memory traffic; batch
   scaling remains nearly saturated.
+
+### Round 41 - rejected 2D local-pair bias projection
+
+Status: rejected and reverted
+
+Hypothesis:
+- NCU showed `_project_local_attention_bias_kernel` as the largest remaining
+  atom-attention launch in the synthetic atom-block target: about `15.5 ms`,
+  `~97%` memory-pipe utilization, and only `~35%` SM utilization at
+  `N_sample=1280`.
+- The old vector-lane kernel maps one pair per lane and loops over the 16
+  pair channels. A 2D pair-by-channel Triton tile should load the small
+  `c_atompair=16` channel dimension more contiguously and reduce memory-pipe
+  pressure.
+
+Change:
+- Commit `4c35071` added an opt-in
+  `PROTENIX_TRITON_LOCAL_ATTN_BIAS_2D=1` path with
+  `PROTENIX_TRITON_LOCAL_ATTN_BIAS_2D_BLOCK_PAIRS=128`.
+- The path was guarded to `c_z == 16` and left the previous fused bias kernel
+  as the default fallback.
+
+Hotspot and profiler evidence:
+- Local-bias run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round74_2d_local_bias_hotspot_20260701_071350`.
+- Atom-block run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round75_2d_local_bias_atom_hotspot_20260701_071555`.
+- NCU run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round77_2d_bias_ncu_atom_20260701_074901`.
+- NCU was run inside a Slurm GPU job using
+  `/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/nsight-compute/bin/ncu`
+  (`2026.1.1`), not on the login node.
+
+Synthetic local-attention and atom-block screens were strongly positive:
+
+| screen | samples | 2D off | 2D on, block 128 | delta |
+| --- | ---: | ---: | ---: | ---: |
+| bias projection only | 640 | 7.775 ms | 3.330 ms | `-57.2%` |
+| local attention full path | 640 | 11.659 ms | 7.295 ms | `-37.4%` |
+| atom block attention subrange | 1280 | 32.594 ms | 23.899 ms | `-26.7%` |
+| full atom block | 1280 | 43.112 ms | 34.496 ms | `-20.0%` |
+
+NCU confirmed the launch-level mechanism in the synthetic atom-attention
+target:
+
+| launch family | 2D off time | 2D on time | 2D on SM % | 2D on memory % | interpretation |
+| --- | ---: | ---: | ---: | ---: | --- |
+| local bias projection | 15.537 ms | 6.608 ms | 67.7 | 75.7 | real kernel win; memory-pipe pressure reduced |
+| attention/linear GEMMs | 6.445 ms | 6.453 ms | 16.8 | 73.9 | unchanged |
+| Triton local attention | 3.395 ms | 3.396 ms | 45.5 | 66.3 | unchanged |
+| LayerNorm | 2.639 ms | 2.624 ms | 84.8 | 75.8 | unchanged |
+| elementwise/copy | 1.934 ms | 1.932 ms | 23.5 | 89.0 | unchanged |
+
+Full inference gate:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round76_2d_local_bias_full_20260701_071852`.
+- Workload: one H100, 7r6r input, `N_step=200`, unchunked diffusion, current
+  promoted stack, paired `N1280` off/on plus candidate `N2560`.
+
+| variant | forward sec | forward samples/sec | end-to-end samples/sec | diffusion | confidence head | peak allocated MiB | peak reserved MiB | finite coords |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| N1280, 2D off | 164.510 | 7.781 | 7.767 | 137.065 s | 22.359 s | 15705 | 18438 | yes |
+| N1280, 2D on, block 128 | 163.693 | 7.820 | 7.806 | 136.957 s | 21.814 s | 15705 | 18438 | yes |
+| N2560, 2D on, block 128 | 328.578 | 7.791 | 7.784 | 274.111 s | 46.646 s | 29104 | 35338 | yes |
+
+Full-path instrumentation explained the mismatch:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round79_2d_bias_full_instrument_20260701_080509`.
+- Real full inference, `N_step=5`, `N_sample=1280`, current stack, no giant
+  profiler trace. The monkeypatch counted calls into
+  `triton_project_local_attention_bias`.
+- Both variants selected the fused bias path for all 33 calls. With 2D on, all
+  33 calls were eligible for the 2D path.
+- But the actual full-path shapes were not the synthetic hotspot shape:
+  - 30 per-step calls used `z.shape == (1, 80, 32, 128, 16)`.
+  - 3 cached calls used `z.shape == (80, 32, 128, 16)`.
+  - No full-path call projected a `(1280, 80, 32, 128, 16)` pair-bias tensor.
+
+Interpretation:
+- The NCU/kernel win is real, but it optimizes a synthetic `N_sample`-expanded
+  pair-bias projection that the real cached inference path mostly avoids.
+- Protenix's diffusion shared-vars cache keeps the atom pair representation
+  sample-broadcasted with leading sample dimension `1`; the expensive
+  high-`N_sample` work is elsewhere. This is why the full `N1280` gate moved
+  only `+0.5%` end-to-end and why most of that apparent delta came from
+  pairformer/confidence noise rather than the diffusion timer.
+- The `N2560` candidate was slower than the current promoted `N2560` point
+  (`7.784` versus `7.890` end-to-end samples/sec), so there is no evidence for
+  a max-throughput promotion.
+
+Decision:
+- Reject and revert the 2D local-bias path. It is a good synthetic-kernel
+  improvement but not a legitimate full-workload throughput optimization.
+- Future atom-local-attention screens must either use the real cached full-path
+  shapes or include the call-shape instrumentation before a full gate.
+
+Next:
+- Do not spend more effort on the cached local pair-bias projection.
+- Target the real full-path costs: diffusion token transformer attention/GEMMs,
+  confidence-head/sample-summary cost, and atom-transformer work that is still
+  sample-scaled rather than cached with sample dimension `1`.
