@@ -50,19 +50,20 @@ export PROTENIX_GPU_RANDOM_AUGMENT=1
 export PROTENIX_BF16_DIFFUSION_CORE=1
 export PROTENIX_ATTENTION_FORCE_FP32=0
 export PROTENIX_TRITON_LOCAL_ATTN=1
-export PROTENIX_TRITON_LOCAL_ATTN_NUM_WARPS=4
+export PROTENIX_TRITON_LOCAL_ATTN_NUM_WARPS=1
 export PROTENIX_TRITON_FUSED_ELEMENTWISE=1
 export PROTENIX_BF16_ATOM_ATTENTION=1
 ```
 
-Best measured one-H100 throughput so far is `6.863` aggregate samples/sec at
-`N_sample=960`, `N_step=200`, true unchunked diffusion on the 7r6r benchmark
-input. This is `13.00x` over the original per-GPU default aggregate baseline
-of `0.528` samples/sec. The safer recommended setting is `N_sample=640`,
-which measured `6.813` samples/sec while reserving `50.0 GiB` instead of
-`73.8 GiB`. The goal remains open because the remaining profile still contains
-material tensor-core GEMM, cuDNN SDPA, local-attention, LayerNorm, and
-elementwise/copy work.
+Best measured one-H100 throughput so far is `6.890` aggregate samples/sec at
+`N_sample=640`, `N_step=200`, true unchunked diffusion on the 7r6r benchmark
+input after the BF16 local-attention one-warp retune. This is `13.05x` over the
+original per-GPU default aggregate baseline of `0.528` samples/sec. The
+previous `N_sample=960` run measured `6.863` samples/sec before the warp
+retune, while reserving `73.8 GiB` instead of `50.0 GiB`; repeat N960 before
+claiming the retune changes the high-memory best point. The goal remains open
+because the remaining profile still contains material tensor-core GEMM, cuDNN
+SDPA, local-attention, LayerNorm, and elementwise/copy work.
 
 ## Running report
 
@@ -990,6 +991,9 @@ Setup:
 - Installed Nsight Compute in a separate micromamba environment:
   `/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/nsight-compute/bin/ncu`.
 - Version: `2026.1.1.x` from `cuda-nsight-compute=12.4.1`.
+- Profiler commands were launched inside Slurm GPU allocations on compute
+  nodes. The login node does not need to have Nsight Compute installed and
+  should not be treated as a source of GPU-kernel truth.
 - Reports:
   - Local attention:
     `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round23_ncu_roofline_local_attention_20260630_235252/local_attention.ncu-rep`
@@ -1080,3 +1084,74 @@ Next:
   LayerNorm/elementwise fusion, and confidence-summary/logit streaming that
   computes only needed design scores without full pair-logit materialization
   when that semantic tradeoff is acceptable.
+
+### Round 24 - BF16 local-attention warp retune
+
+Status: promoted
+
+Hypothesis:
+- The Nsight Compute local-attention report showed the owned Triton atom
+  local-attention kernel is L1/TEX/on-chip-memory limited, not tensor-compute
+  limited. For the fixed 32 x 128 local window, the previous four-warp launch
+  shape likely creates unnecessary scheduler/on-chip pressure. Fewer warps
+  should reduce that pressure without changing memory footprint or semantics.
+
+Change:
+- Changed the default Triton local-attention launch shape to one warp for BF16
+  and two warps for FP32.
+- Kept `PROTENIX_TRITON_LOCAL_ATTN_NUM_WARPS={1,2,4,8}` as an explicit
+  override for future profiling or non-H100 shapes.
+
+Isolated screen:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round28_local_attention_parameter_screen_20260701_002259`.
+- Workload: one-H100 local-attention benchmark, 7r6r atom count, BF16/FP32,
+  `N_sample={320,640,960}`, `input_precision={tf32,tf32x3}`,
+  `num_warps={1,2,4,8}`.
+
+Results:
+| dtype | N_sample | best setting | best ms | previous four-warp ms | delta |
+| --- | ---: | --- | ---: | ---: | ---: |
+| BF16 | 320 | `tf32`, 1 warp | 2.160 | 2.501 | -13.6% |
+| BF16 | 640 | `tf32`, 1 warp | 4.268 | 4.991 | -14.5% |
+| BF16 | 960 | `tf32`, 1 warp | 6.382 | 7.469 | -14.5% |
+| FP32 | 320 | `tf32`, 2 warps | 2.654 | 3.673 | -27.7% |
+| FP32 | 640 | `tf32`, 2 warps | 5.281 | 7.327 | -27.9% |
+| FP32 | 960 | `tf32`, 2 warps | 7.906 | 10.987 | -28.0% |
+
+Representative full inference gates:
+- Shared workload: `N_sample=640`, BF16 diffusion core, BF16 atom attention,
+  true unchunked diffusion, one warmup 7r6r item and one timed 7r6r item per
+  variant, dump disabled.
+- Round 29c run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round29c_local_attention_warp_gate_canary_20260701_003853`.
+- Round 29d reversed-order repeat:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round29d_local_attention_warp_gate_reverse_20260701_004812`.
+
+| gate | variant | aggregate samples/sec | forward samples/sec | forward sec | atom encoder | atom decoder | diffusion | confidence | peak allocated MiB | finite coords |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 29c | 4 warps old | 6.849 | 6.869 | 93.179 | 16.263 s | 11.892 s | 72.521 s | 10.900 s | 30788 | yes |
+| 29c | 1 warp candidate | 6.867 | 6.887 | 92.935 | 15.858 s | 11.484 s | 71.717 s | 11.231 s | 30788 | yes |
+| 29d | 1 warp candidate | 6.890 | 6.910 | 92.625 | 15.859 s | 11.481 s | 71.721 s | 10.931 s | 30788 | yes |
+| 29d | 4 warps old | 6.844 | 6.864 | 93.235 | 16.270 s | 11.908 s | 72.605 s | 10.826 s | 30788 | yes |
+
+Interpretation:
+- Averaged over both gate orders, BF16 one-warp local attention measured
+  `6.879` aggregate samples/sec versus `6.847` for the previous four-warp
+  setting, a `+0.47%` full-workload gain with unchanged memory.
+- The isolated hotspot win is much larger than the full-workload win because
+  local attention is now one component inside the longer diffusion/confidence
+  path. The component breakdown still moves in the expected direction: atom
+  encoder plus decoder time falls from about `28.17 s` to `27.34 s`.
+- The result is small, so it is not a new headline speedup, but it passed the
+  required reverse-order repeat and has a clear roofline-backed mechanism.
+
+Decision:
+- Promote the BF16 one-warp default. Continue to compare future candidates
+  against this current stack.
+
+Next:
+- The local-attention roofline and warp screen both point at memory locality and
+  bias/value traffic rather than more batching. The next kernel-level work
+  should attack the actual local-attention data movement, or fuse adjacent
+  memory-bound LayerNorm/elementwise paths, not just adjust launch parameters.
