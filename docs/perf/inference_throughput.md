@@ -2729,3 +2729,116 @@ Decision:
   pairformer work. Do not write a whole-block attention mega-kernel unless the
   design can explain how it beats cuDNN FMHA plus tensor-core GEMMs, not just
   how it removes launches.
+
+### Round 50 - cached-shape atom transformer NCU refresh
+
+Status: diagnostic
+
+Question:
+- After the broadcast/cache changes, what are the real atom-transformer launch
+  bottlenecks? Prior atom-local-bias screens used a synthetic sample-expanded
+  pair tensor and overestimated pair-bias projection cost.
+
+Change:
+- Added `--p-samples` and `--transition-residual` to
+  `scripts/perf/atom_transformer_hotspot.py` so the hotspot can match the real
+  cached full-path shape:
+  `q/c=[1280,2529,128]`, `p=[1,80,32,128,16]`.
+
+Experiment:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round102_current_atom_cached_ncu_20260701_111408`.
+- Commit: `f78bfc7`.
+- Workload: one H100, BF16, `N_sample=1280`, 2529 atoms, Triton local
+  attention, BF16 local-attention output, fused local pair-bias projection,
+  fused elementwise gates, and fused transition residual.
+- NCU was run inside Slurm using
+  `/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/nsight-compute/bin/ncu`;
+  raw CSV import was generated from the `.ncu-rep` reports after the job.
+
+CUDA-event hotspot:
+
+| subrange | time per atom block |
+| --- | ---: |
+| full block | 27.333 ms |
+| attention/local-attention path | 16.709 ms |
+| conditioned transition with residual | 9.873 ms |
+| peak reserved | 12704 MiB |
+
+NCU launch-family attribution, full atom block:
+
+| launch family | invocations | kernel time | share | SM % | compute/mem % | DRAM % | L2 % | note |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Triton local attention | 1 | 3.240 ms | 32.6% | 47.7 | 69.4 | 30.5 | 48.0 | largest single atom launch |
+| Triton SiLU/mul | 1 | 1.616 ms | 16.3% | 31.5 | 91.5 | 91.5 | 82.8 | memory-bound transition activation |
+| Torch elementwise/copy | 5 | 1.350 ms | 13.6% | 7.9 | 64.4 | 61.0 | 59.4 | includes attention residual add (`0.803 ms`) |
+| GEMM | 46 | 1.187 ms | 12.0% | 19.7 | 68.4 | 68.4 | 71.1 | many small atom GEMMs |
+| Triton sigmoid/mul/add | 4 | 1.058 ms | 10.7% | 25.2 | 93.2 | 93.2 | 80.6 | memory-bound gates |
+| Triton sigmoid/mul | 2 | 0.806 ms | 8.1% | 29.8 | 91.5 | 91.5 | 82.4 | memory-bound gates |
+| LayerNorm | 6 | 0.656 ms | 6.6% | 84.8 | 75.8 | 75.8 | 79.3 | fast LN, not the largest issue |
+| Triton local bias projection | 1 | 0.016 ms | 0.2% | 26.6 | 72.8 | 19.4 | 23.7 | cached pair-bias projection is no longer material |
+
+Interpretation:
+- The real cached atom path is not dominated by the pair-bias projection. With
+  `p_samples=1`, that launch is only `16 us`.
+- The atom "meat" is now local attention plus memory-bound transition/gate
+  traffic. The next candidate should either improve `_local_attention_kernel`
+  itself or remove a full memory pass around attention/transition gates. Merely
+  optimizing sample-expanded pair bias is a dead end.
+
+Decision:
+- Use this cached-shape NCU result as the atom launch map.
+- Screen attention-residual fusion next, because NCU shows the separate
+  attention residual add as a material memory pass in the full atom block.
+
+### Round 51 - rejected fused attention residual
+
+Status: rejected and reverted
+
+Hypothesis:
+- Round 50 showed two consecutive memory-bound operations around the attention
+  output: final attention gate (`_sigmoid_mul_kernel`, `0.806 ms`) and the
+  following residual add (`~0.803 ms`). Passing the residual into
+  `AttentionPairBias` and using `fused_sigmoid_mul_add` should remove one atom
+  block memory pass, analogous to the promoted transition-residual fusion.
+
+Change:
+- Commit `5cebdf8` added `PROTENIX_TRITON_FUSED_ATTENTION_RESIDUAL=1`.
+- The path was inference-only, guarded to identity DropPath, and left the
+  default flag-off path unchanged.
+
+Hotspot screen:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round103_attention_residual_hotspot_20260701_111944`.
+
+| target | flag off | flag on | delta |
+| --- | ---: | ---: | ---: |
+| cached atom full block | 27.337 ms | 26.771 ms | -2.1% |
+| cached atom attention subrange | 16.687 ms | 16.686 ms | flat |
+| cached atom transition subrange | 9.868 ms | 9.857 ms | flat |
+| broadcast trunk full block | 14.428 ms | 14.117 ms | -2.2% |
+
+Full N1280 gate, one H100, `N_step=200`, current promoted stack:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round104_attention_residual_n1280_gate_20260701_112238`.
+
+| variant | end-to-end samples/sec | forward samples/sec | forward sec | diffusion | transformer | atom decoder | confidence head | peak reserved MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| flag off | 9.212 | 9.231 | 138.668 | 114.533 s | 72.359 s | 15.181 s | 19.246 s | 19560 |
+| flag on | 8.743 | 8.759 | 146.136 | 120.910 s | 69.358 s | 24.343 s | 20.258 s | 20340 |
+
+Interpretation:
+- The isolated block win was real but misleading. In the full model, the
+  candidate improved diffusion transformer time by about `3.0 s`, but made
+  atom decoder time about `9.2 s` slower and increased peak reserved memory by
+  `780 MiB`.
+- This is probably a value/lifetime/layout interaction in the atom decoder
+  rather than a launch-count issue. The fused expression changes where the
+  residual is held and when the BF16 store happens, and the full path pays for
+  that despite the synthetic block win.
+
+Decision:
+- Reject and revert `5cebdf8`.
+- Do not promote attention-residual fusion. Future atom work should target
+  `_local_attention_kernel` or the transition MLP activation/output materialized
+  traffic directly, with a same-run full gate required before promotion.
