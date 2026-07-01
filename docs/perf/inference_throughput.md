@@ -2042,3 +2042,54 @@ Decision:
 - Continue with current-candidate NCU and then target atom transition and
   elementwise/copy traffic, where the previous roofline still showed high DRAM
   pressure.
+
+### Round 39 - rejected final attention-gate fusion
+
+Status: rejected and reverted
+
+Hypothesis:
+- `AttentionPairBias.forward` used a plain
+  `torch.sigmoid(self.linear_a_last(s)) * a` for the final adaLN-Zero attention
+  gate, while the inner attention gate and transition gate already used the
+  Triton `fused_sigmoid_mul` helper. Replacing this non-inplace branch with
+  `fused_sigmoid_mul` might remove one repeated elementwise launch/memory pass.
+
+Change:
+- Commit `97fd021` replaced the non-inplace final gate with
+  `fused_sigmoid_mul(gate, a)`.
+- The change was reverted in commit `ac1a0cd` after the full gate failed.
+
+Hotspot:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round70_fused_final_attention_gate_20260701_062207`.
+
+| samples | revision | attention ms | transition ms | full block ms | finite |
+| ---: | --- | ---: | ---: | ---: | --- |
+| 320 | previous | 8.333 | 2.458 | 11.162 | yes |
+| 320 | fused gate | 8.168 | 2.456 | 10.947 | yes |
+| 640 | previous | 16.415 | 4.858 | 21.998 | yes |
+| 640 | fused gate | 16.145 | 4.851 | 21.682 | yes |
+| 1280 | previous | 32.599 | 9.630 | 43.695 | yes |
+| 1280 | fused gate | 32.060 | 9.625 | 43.153 | yes |
+
+Full N1280 gate:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round71_fused_final_gate_full_20260701_062328`.
+
+| variant | forward sec | forward samples/sec | end-to-end samples/sec | diffusion | confidence head | peak allocated MiB | peak reserved MiB | finite coords |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| previous | 164.692 | 7.772 | 7.759 | 138.334 s | 21.509 s | 15705 | 18438 | yes |
+| fused gate | 164.781 | 7.768 | 7.755 | 138.362 s | 21.583 s | 15705 | 18438 | yes |
+
+Interpretation:
+- The isolated atom-block hotspot improved by about `1.2%`, but this did not
+  survive a full inference gate. The paired N1280 full run was slightly slower
+  (`7.755` vs `7.759` end-to-end samples/sec) with unchanged memory.
+- This is a useful guardrail: not every elementwise fusion that wins in a block
+  screen changes the whole-model critical path once variance, confidence, and
+  pairformer timing are included.
+
+Decision:
+- Reject and revert the fused final attention gate.
+- Keep looking at transition/elementwise traffic, but promote only candidates
+  that pass the full N200 inference gate.
