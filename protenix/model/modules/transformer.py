@@ -32,6 +32,9 @@ from protenix.model.modules.fused_elementwise_triton import (
     fused_sigmoid_mul,
     fused_silu_mul,
 )
+from protenix.model.modules.local_attention_bias_triton import (
+    triton_project_local_attention_bias,
+)
 from protenix.model.triangular.layers import LayerNorm
 from protenix.model.utils import (
     aggregate_atom_to_token,
@@ -140,13 +143,25 @@ class AttentionPairBias(nn.Module):
         assert n_keys == z.size(-2)
         assert len(z.shape) == len(q.shape) + 2
 
-        # Multi-head attention bias
-        bias = self.linear_nobias_z(
-            self.layernorm_z(z)
-        )  # [..., n_blocks, n_queries, n_keys, n_heads]
-        bias = permute_final_dims(
-            bias, [3, 0, 1, 2]
-        )  # [..., n_heads, n_blocks, n_queries, n_keys]
+        # Multi-head attention bias.  The Triton path fuses the LayerNorm,
+        # small head projection, and permute into the final trunked layout.
+        bias = None
+        if self.layernorm_z.bias is None:
+            bias = triton_project_local_attention_bias(
+                z=z,
+                layernorm_weight=self.layernorm_z.weight,
+                linear_weight=self.linear_nobias_z.weight,
+                n_queries=n_queries,
+                n_keys=n_keys,
+                eps=self.layernorm_z.eps,
+            )
+        if bias is None:
+            bias = self.linear_nobias_z(
+                self.layernorm_z(z)
+            )  # [..., n_blocks, n_queries, n_keys, n_heads]
+            bias = permute_final_dims(
+                bias, [3, 0, 1, 2]
+            )  # [..., n_heads, n_blocks, n_queries, n_keys]
 
         # Line 11: Multi-head attention with attention bias & gating (and optionally local attention)
         q = self.attention(
