@@ -276,6 +276,29 @@ def write_jsonl(path: Path, row: dict[str, Any]) -> None:
         handle.write(json.dumps(row, sort_keys=True) + "\n")
 
 
+def numeric_model_timings(row: dict[str, Any]) -> dict[str, float]:
+    """Return per-component model timings recorded for one benchmark row.
+
+    Protenix records its synchronized CUDA timings under ``model_log["time"]``.
+    Older/debug rows may instead store flat numeric values directly in
+    ``model_log``.  Normalizing both forms here keeps the run summary useful:
+    it should say which model blocks consumed time, not just report aggregate
+    wall-clock throughput.
+    """
+
+    model_log = row.get("model_log", {})
+    if not isinstance(model_log, dict):
+        return {}
+    timings = model_log.get("time")
+    if not isinstance(timings, dict):
+        timings = model_log
+    return {
+        key: float(value)
+        for key, value in timings.items()
+        if isinstance(value, (int, float))
+    }
+
+
 def aggregate_metrics(out_dir: Path) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     for path in sorted(out_dir.glob("metrics_rank*.jsonl")):
@@ -293,16 +316,12 @@ def aggregate_metrics(out_dir: Path) -> dict[str, Any]:
     total_samples = sum(row["prediction_samples"] for row in timed)
     total_forward_sec = sum(row["forward_sec"] for row in timed)
     total_item_sec = sum(row["total_sec"] for row in timed)
+    model_timings_by_row = [numeric_model_timings(row) for row in timed]
     numeric_model_keys = sorted(
-        {
-            key
-            for row in timed
-            for key, value in row.get("model_log", {}).items()
-            if isinstance(value, (int, float))
-        }
+        {key for timings in model_timings_by_row for key in timings}
     )
     mean_model_log = {
-        key: sum(float(row.get("model_log", {}).get(key, 0.0)) for row in timed)
+        key: sum(timings.get(key, 0.0) for timings in model_timings_by_row)
         / total_sequences
         for key in numeric_model_keys
     }
