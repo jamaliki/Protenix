@@ -34,7 +34,6 @@ from protenix.model.modules.fused_elementwise_triton import (
     fused_sigmoid_mul_add,
     fused_silu_mul,
     fused_silu_mul_split,
-    triton_transition_input_projection_silu,
 )
 from protenix.model.modules.local_attention_bias_triton import (
     triton_project_local_attention_bias,
@@ -68,15 +67,6 @@ def fused_attention_residual_enabled() -> bool:
 
 def fused_transition_input_projection_enabled() -> bool:
     return os.getenv("PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION", "0").lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
-
-
-def fused_transition_input_gemm_enabled() -> bool:
-    return os.getenv("PROTENIX_TRITON_FUSED_TRANSITION_INPUT_GEMM", "0").lower() not in {
         "0",
         "false",
         "off",
@@ -678,9 +668,6 @@ class ConditionedTransitionBlock(nn.Module):
         )
         self._input_projection_cache_key = None
         self._input_projection_weight = None
-        self._input_projection_transpose_cache_key = None
-        self._input_projection_weight_a1_t = None
-        self._input_projection_weight_a2_t = None
 
     def _can_fuse_input_projection(self, a: torch.Tensor) -> bool:
         if not fused_transition_input_projection_enabled():
@@ -688,19 +675,6 @@ class ConditionedTransitionBlock(nn.Module):
         if torch.is_grad_enabled():
             return False
         if not a.is_cuda:
-            return False
-        hidden = self.n * self.c_a
-        return (
-            self.linear_nobias_a1.weight.shape == (hidden, self.c_a)
-            and self.linear_nobias_a2.weight.shape == (hidden, self.c_a)
-        )
-
-    def _can_fuse_input_gemm(self, a: torch.Tensor) -> bool:
-        if not fused_transition_input_gemm_enabled():
-            return False
-        if torch.is_grad_enabled():
-            return False
-        if not a.is_cuda or not a.is_contiguous():
             return False
         hidden = self.n * self.c_a
         return (
@@ -723,32 +697,6 @@ class ConditionedTransitionBlock(nn.Module):
             self._input_projection_cache_key = cache_key
         return self._input_projection_weight
 
-    def _input_projection_transposed_params(
-        self, dtype: torch.dtype
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        weights = (
-            self.linear_nobias_a1.weight,
-            self.linear_nobias_a2.weight,
-        )
-        cache_key = (
-            dtype,
-            tuple((w.data_ptr(), w._version, w.device, w.dtype) for w in weights),
-        )
-        if cache_key != self._input_projection_transpose_cache_key:
-            # LinearNoBias stores weights as [N, K], matching F.linear.  The
-            # fused Triton matmul consumes B as [K, N] so each program can load
-            # a contiguous block of output channels.  Autocast normally casts
-            # Linear weights inside F.linear; this custom kernel must do that
-            # once in the cache, not on every diffusion step.
-            self._input_projection_weight_a1_t = (
-                weights[0].to(dtype=dtype).t().contiguous()
-            )
-            self._input_projection_weight_a2_t = (
-                weights[1].to(dtype=dtype).t().contiguous()
-            )
-            self._input_projection_transpose_cache_key = cache_key
-        return self._input_projection_weight_a1_t, self._input_projection_weight_a2_t
-
     def forward(
         self,
         a: torch.Tensor,
@@ -767,19 +715,13 @@ class ConditionedTransitionBlock(nn.Module):
                 [..., N, c_a]
         """
         a = self.adaln(a, s)
-        b = None
-        if self._can_fuse_input_gemm(a):
-            b = triton_transition_input_projection_silu(
-                a,
-                *self._input_projection_transposed_params(a.dtype),
-            )
-        if b is None and self._can_fuse_input_projection(a):
+        if self._can_fuse_input_projection(a):
             hidden = self.n * self.c_a
             b = fused_silu_mul_split(
                 F.linear(a, self._input_projection_params()),
                 hidden,
             )
-        elif b is None:
+        else:
             a1 = self.linear_nobias_a1(a)
             a2 = self.linear_nobias_a2(a)
             b = fused_silu_mul(a1, a2)

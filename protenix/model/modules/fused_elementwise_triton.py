@@ -42,11 +42,7 @@ except ImportError:  # pragma: no cover - optional runtime dependency.
 
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
-_SUPPORTED_MATMUL_DTYPES = {torch.float16, torch.bfloat16}
 _BLOCK_SIZE = 1024
-_TRANSITION_INPUT_BLOCK_M = 128
-_TRANSITION_INPUT_BLOCK_N = 128
-_TRANSITION_INPUT_BLOCK_K = 64
 
 
 def triton_fused_elementwise_enabled() -> bool:
@@ -250,57 +246,6 @@ if triton_fused_elementwise_available():
         out = a * (1.0 / (1.0 + tl.exp(-a))) * b
         tl.store(out_ptr + offsets, out, mask=mask)
 
-    @triton.jit
-    def _transition_input_projection_silu_kernel(
-        x_ptr,
-        w1_t_ptr,
-        w2_t_ptr,
-        out_ptr,
-        m_size: tl.constexpr,
-        n_size: tl.constexpr,
-        k_size: tl.constexpr,
-        block_m: tl.constexpr,
-        block_n: tl.constexpr,
-        block_k: tl.constexpr,
-    ):
-        pid_m = tl.program_id(0)
-        pid_n = tl.program_id(1)
-        offsets_m = pid_m * block_m + tl.arange(0, block_m)
-        offsets_n = pid_n * block_n + tl.arange(0, block_n)
-        offsets_k = tl.arange(0, block_k)
-
-        acc1 = tl.zeros((block_m, block_n), tl.float32)
-        acc2 = tl.zeros((block_m, block_n), tl.float32)
-        for k0 in range(0, k_size, block_k):
-            k = k0 + offsets_k
-            x_tile = tl.load(
-                x_ptr + offsets_m[:, None] * k_size + k[None, :],
-                mask=(offsets_m[:, None] < m_size) & (k[None, :] < k_size),
-                other=0.0,
-            )
-            # The weights are cached as [K, N].  That makes each program load
-            # contiguous N columns instead of walking the model's native
-            # LinearNoBias [N, K] storage with a large stride.
-            w1_tile = tl.load(
-                w1_t_ptr + k[:, None] * n_size + offsets_n[None, :],
-                mask=(k[:, None] < k_size) & (offsets_n[None, :] < n_size),
-                other=0.0,
-            )
-            w2_tile = tl.load(
-                w2_t_ptr + k[:, None] * n_size + offsets_n[None, :],
-                mask=(k[:, None] < k_size) & (offsets_n[None, :] < n_size),
-                other=0.0,
-            )
-            acc1 += tl.dot(x_tile, w1_tile, out_dtype=tl.float32)
-            acc2 += tl.dot(x_tile, w2_tile, out_dtype=tl.float32)
-
-        out = acc1 * (1.0 / (1.0 + tl.exp(-acc1))) * acc2
-        tl.store(
-            out_ptr + offsets_m[:, None] * n_size + offsets_n[None, :],
-            out,
-            mask=(offsets_m[:, None] < m_size) & (offsets_n[None, :] < n_size),
-        )
-
 
 def _grid(n_elements: int) -> tuple[int]:
     return (triton.cdiv(n_elements, _BLOCK_SIZE),)
@@ -389,69 +334,6 @@ def triton_silu_mul_split(
         split_size,
         block_size=_BLOCK_SIZE,
         num_warps=4,
-    )
-    return out
-
-
-def triton_transition_input_projection_silu(
-    x: torch.Tensor,
-    weight_a1_t: torch.Tensor,
-    weight_a2_t: torch.Tensor,
-) -> Optional[torch.Tensor]:
-    if not triton_fused_elementwise_enabled():
-        return None
-    if not triton_fused_elementwise_available():
-        return None
-    if torch.is_grad_enabled():
-        return None
-    if x.dtype not in _SUPPORTED_MATMUL_DTYPES:
-        return None
-    if not x.is_cuda or not weight_a1_t.is_cuda or not weight_a2_t.is_cuda:
-        return None
-    if weight_a1_t.dtype != x.dtype or weight_a2_t.dtype != x.dtype:
-        return None
-    if (
-        not x.is_contiguous()
-        or not weight_a1_t.is_contiguous()
-        or not weight_a2_t.is_contiguous()
-    ):
-        return None
-    if x.dim() < 2 or weight_a1_t.dim() != 2 or weight_a2_t.dim() != 2:
-        return None
-
-    k_size = x.shape[-1]
-    if weight_a1_t.shape[0] != k_size or weight_a2_t.shape[0] != k_size:
-        return None
-    n_size = weight_a1_t.shape[1]
-    if weight_a2_t.shape[1] != n_size or x.numel() == 0:
-        return None
-    # These multiples are the profiled H100 path.  The masks would make other
-    # shapes correct, but the larger point of this kernel is throughput; fall
-    # back to cuBLAS outside the shape family we have measured.
-    if k_size % _TRANSITION_INPUT_BLOCK_K != 0:
-        return None
-    if n_size % _TRANSITION_INPUT_BLOCK_N != 0:
-        return None
-
-    m_size = x.numel() // k_size
-    out = torch.empty((*x.shape[:-1], n_size), dtype=x.dtype, device=x.device)
-    grid = (
-        triton.cdiv(m_size, _TRANSITION_INPUT_BLOCK_M),
-        triton.cdiv(n_size, _TRANSITION_INPUT_BLOCK_N),
-    )
-    _transition_input_projection_silu_kernel[grid](
-        x,
-        weight_a1_t,
-        weight_a2_t,
-        out,
-        m_size,
-        n_size,
-        k_size,
-        block_m=_TRANSITION_INPUT_BLOCK_M,
-        block_n=_TRANSITION_INPUT_BLOCK_N,
-        block_k=_TRANSITION_INPUT_BLOCK_K,
-        num_warps=8,
-        num_stages=3,
     )
     return out
 
