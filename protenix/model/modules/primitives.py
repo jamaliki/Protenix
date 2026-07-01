@@ -43,6 +43,7 @@ def _try_triton_local_attention(
     trunked_attn_bias: Optional[torch.Tensor],
     n_queries: int,
     n_keys: int,
+    gate: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     if trunked_attn_bias is None:
         return None
@@ -59,7 +60,17 @@ def _try_triton_local_attention(
         trunked_attn_bias=trunked_attn_bias,
         n_queries=n_queries,
         n_keys=n_keys,
+        gate=gate,
     )
+
+
+def _local_attention_gate_fusion_requested() -> bool:
+    return os.getenv("PROTENIX_TRITON_LOCAL_ATTN_FUSE_GATE", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
 
 
 def attention_force_fp32() -> bool:
@@ -634,7 +645,9 @@ def _local_attention(
     use_efficient_implementation: bool = True,
     inplace_safe: bool = False,
     chunk_size: Optional[int] = None,
-) -> torch.Tensor:
+    gate: Optional[torch.Tensor] = None,
+    return_gate_status: bool = False,
+) -> Union[torch.Tensor, tuple[torch.Tensor, bool]]:
     """Local attention
 
     Args:
@@ -657,6 +670,8 @@ def _local_attention(
             [..., Q, d]
     """
     assert q.shape == k.shape == v.shape  # local attention doesn't make sense if Q != K
+    if gate is not None:
+        assert gate.shape == q.shape
 
     if attn_bias is None and chunk_size is None and use_efficient_implementation:
         triton_out = _try_triton_local_attention(
@@ -666,8 +681,11 @@ def _local_attention(
             trunked_attn_bias=trunked_attn_bias,
             n_queries=n_queries,
             n_keys=n_keys,
+            gate=gate,
         )
         if triton_out is not None:
+            if return_gate_status:
+                return triton_out, gate is not None
             return triton_out
 
     # Prepare for attention qkv, q: [..., n_trunks, n_queries, d], kv: [..., n_trunks, n_keys, d]
@@ -730,6 +748,8 @@ def _local_attention(
     out = out.reshape(*out.shape[:-3], -1, out.shape[-1])
     if q_pad_length > 0:
         out = out[..., :-q_pad_length, :]
+    if return_gate_status:
+        return out, False
     return out
 
 
@@ -879,7 +899,13 @@ class Attention(nn.Module):
 
         return q, k, v
 
-    def _wrap_up(self, o: torch.Tensor, q_x: torch.Tensor) -> torch.Tensor:
+    def _wrap_up(
+        self,
+        o: torch.Tensor,
+        q_x: torch.Tensor,
+        gate: Optional[torch.Tensor] = None,
+        gate_already_applied: bool = False,
+    ) -> torch.Tensor:
         """
 
         Args:
@@ -891,12 +917,12 @@ class Attention(nn.Module):
         Returns:
             torch.Tensor: the output of attention
         """
-        if self.linear_g is not None:
-            g = self.linear_g(q_x)
-
-            # [*, G/Q, H, C_hidden]
-            g = g.view(g.shape[:-1] + (self.num_heads, -1))
-            o = fused_sigmoid_mul(g, o)
+        if self.linear_g is not None and not gate_already_applied:
+            if gate is None:
+                gate = self.linear_g(q_x)
+                # [*, G/Q, H, C_hidden]
+                gate = gate.view(gate.shape[:-1] + (self.num_heads, -1))
+            o = fused_sigmoid_mul(gate, o)
 
         # [*, Q, H * C_hidden]
         o = flatten_final_dims(o, num_dims=2)
@@ -950,6 +976,9 @@ class Attention(nn.Module):
                 # Expand at head dim, got shape [..., 1, n_trunks, n_queries, n_keys]
                 trunked_attn_bias = trunked_attn_bias.unsqueeze(dim=-4)
 
+        gate = None
+        gate_already_applied = False
+
         if n_queries and n_keys:
             if self.local_attention_method == "global_attention_with_bias":
                 local_attn_bias = create_local_attn_bias(
@@ -974,7 +1003,17 @@ class Attention(nn.Module):
                 )
 
             elif self.local_attention_method == "local_cross_attention":
-                o = _local_attention(
+                if self.linear_g is not None and _local_attention_gate_fusion_requested():
+                    # The atom path immediately gates the local-attention output.
+                    # When the specialized kernel can consume this tensor it saves
+                    # an elementwise launch and a full attention-output HBM trip.
+                    # If a shape guard rejects the kernel, _wrap_up reuses this
+                    # precomputed gate instead of launching the gate matmul twice.
+                    gate = self.linear_g(q_x)
+                    gate = gate.view(gate.shape[:-1] + (self.num_heads, -1))
+
+                local_gate = gate.transpose(-2, -3) if gate is not None else None
+                o, gate_already_applied = _local_attention(
                     q=q,
                     k=k,
                     v=v,
@@ -986,6 +1025,8 @@ class Attention(nn.Module):
                     use_efficient_implementation=self.use_efficient_implementation,
                     inplace_safe=inplace_safe,
                     chunk_size=chunk_size,
+                    gate=local_gate,
+                    return_gate_status=True,
                 )
             else:
                 raise ValueError(
@@ -1001,7 +1042,12 @@ class Attention(nn.Module):
                 inplace_safe=inplace_safe,
             )  # [*, H, Q, C_hidden]
         o = o.transpose(-2, -3)  # o: [*, Q, H, C_hidden]
-        o = self._wrap_up(o, q_x)  # q_x: [*, Q, c_q]
+        o = self._wrap_up(
+            o,
+            q_x,
+            gate=gate,
+            gate_already_applied=gate_already_applied,
+        )  # q_x: [*, Q, c_q]
 
         return o
 

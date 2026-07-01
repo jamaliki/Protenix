@@ -86,6 +86,15 @@ def triton_local_attention_bf16_output_enabled() -> bool:
     }
 
 
+def triton_local_attention_gate_fusion_enabled() -> bool:
+    return os.getenv("PROTENIX_TRITON_LOCAL_ATTN_FUSE_GATE", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
 _SUPPORTED_INPUT_DTYPES = {torch.float32, torch.bfloat16}
 
 
@@ -97,6 +106,7 @@ if triton_local_attention_available():
         k_ptr,
         v_ptr,
         bias_ptr,
+        gate_ptr,
         out_ptr,
         n_atoms: tl.constexpr,
         n_trunks: tl.constexpr,
@@ -118,6 +128,10 @@ if triton_local_attention_available():
         b_stride_t: tl.constexpr,
         b_stride_q: tl.constexpr,
         b_stride_k: tl.constexpr,
+        g_stride_s: tl.constexpr,
+        g_stride_h: tl.constexpr,
+        g_stride_n: tl.constexpr,
+        g_stride_d: tl.constexpr,
         o_stride_s: tl.constexpr,
         o_stride_h: tl.constexpr,
         o_stride_n: tl.constexpr,
@@ -127,6 +141,7 @@ if triton_local_attention_available():
         block_n: tl.constexpr,
         block_d: tl.constexpr,
         dot_input_precision: tl.constexpr,
+        has_gate: tl.constexpr,
     ):
         pid = tl.program_id(0)
         trunk = pid % n_trunks
@@ -148,6 +163,7 @@ if triton_local_attention_available():
             + head * b_stride_h
             + trunk * b_stride_t
         )
+        g_base = gate_ptr + sample * g_stride_s + head * g_stride_h
 
         q_mask = q_idx < n_atoms
         k_mask = (k_idx >= 0) & (k_idx < n_atoms)
@@ -183,6 +199,18 @@ if triton_local_attention_available():
         )
         v = v.to(tl.float32)
         out = tl.dot(prob, v, input_precision=dot_input_precision)
+        if has_gate:
+            # Fusion boundary: the next model op is sigmoid(gate) * attention.
+            # Applying it here avoids one extra kernel launch plus a full
+            # attention-output read/write through HBM.  We still keep the gate
+            # projection as a cuBLAS matmul; fusing that GEMM would be a much
+            # larger kernel with different numerical and maintenance risk.
+            gate = tl.load(
+                g_base + q_idx[:, None] * g_stride_n + offs_d[None, :] * g_stride_d,
+                mask=q_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            out = out * (1.0 / (1.0 + tl.exp(-gate)))
         out_base = out_ptr + sample * o_stride_s + head * o_stride_h
         tl.store(
             out_base + q_idx[:, None] * o_stride_n + offs_d[None, :] * o_stride_d,
@@ -198,6 +226,7 @@ def triton_local_attention(
     trunked_attn_bias: torch.Tensor,
     n_queries: int,
     n_keys: int,
+    gate: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """Run the H100-specialized atom local attention forward path.
 
@@ -223,13 +252,19 @@ def triton_local_attention(
         return None
     if q.shape != k.shape or q.shape != v.shape:
         return None
+    if gate is not None and gate.shape != q.shape:
+        return None
     if q.shape[-1] != 32:
         return None
     if q.dtype not in _SUPPORTED_INPUT_DTYPES:
         return None
     if k.dtype != q.dtype or v.dtype != q.dtype:
         return None
+    if gate is not None and gate.dtype != q.dtype:
+        return None
     if trunked_attn_bias.dtype not in _SUPPORTED_INPUT_DTYPES:
+        return None
+    if gate is not None and not triton_local_attention_gate_fusion_enabled():
         return None
 
     batch_shape = q.shape[:-3]
@@ -250,6 +285,7 @@ def triton_local_attention(
     q_flat = q.reshape(flat_q_shape)
     k_flat = k.reshape(flat_q_shape)
     v_flat = v.reshape(flat_q_shape)
+    gate_flat = gate.reshape(flat_q_shape) if gate is not None else None
     bias_view = trunked_attn_bias.expand(
         *batch_shape,
         n_heads,
@@ -263,6 +299,7 @@ def triton_local_attention(
         or k_flat.data_ptr() != k.data_ptr()
         or v_flat.data_ptr() != v.data_ptr()
         or bias_flat.data_ptr() != trunked_attn_bias.data_ptr()
+        or (gate is not None and gate_flat.data_ptr() != gate.data_ptr())
     ):
         return None
 
@@ -287,6 +324,7 @@ def triton_local_attention(
         k_flat,
         v_flat,
         bias_flat,
+        gate_flat if gate_flat is not None else q_flat,
         out,
         n_atoms,
         n_trunks,
@@ -308,6 +346,10 @@ def triton_local_attention(
         bias_flat.stride(2),
         bias_flat.stride(3),
         bias_flat.stride(4),
+        gate_flat.stride(0) if gate_flat is not None else 0,
+        gate_flat.stride(1) if gate_flat is not None else 0,
+        gate_flat.stride(2) if gate_flat is not None else 0,
+        gate_flat.stride(3) if gate_flat is not None else 0,
         out.stride(0),
         out.stride(1),
         out.stride(2),
@@ -317,6 +359,7 @@ def triton_local_attention(
         block_n=n_keys,
         block_d=head_dim,
         dot_input_precision=triton_local_attention_input_precision(),
+        has_gate=gate_flat is not None,
         num_warps=triton_local_attention_num_warps(q.dtype),
     )
     if not batch_shape:

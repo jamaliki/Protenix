@@ -28,6 +28,20 @@ def env_flag(name: str, value: str) -> Iterator[None]:
             os.environ[name] = old
 
 
+@contextmanager
+def env_flags(values: dict[str, str]) -> Iterator[None]:
+    old_values = {name: os.environ.get(name) for name in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for name, old in old_values.items():
+            if old is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old
+
+
 def cuda_time(fn, warmup: int, iters: int) -> tuple[torch.Tensor, float]:
     with torch.inference_mode():
         for _ in range(warmup):
@@ -73,7 +87,19 @@ def make_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, ...]:
         device=device,
         dtype=dtype,
     ).movedim(-1, -4)
-    return q, k, v, bias
+    gate = None
+    if args.gate:
+        # Match Attention._wrap_up's gate layout after view+transpose:
+        # [*, N_atom, H, D] -> [*, H, N_atom, D].
+        gate = torch.randn(
+            *leading_shape,
+            args.atoms,
+            args.heads,
+            args.head_dim,
+            device=device,
+            dtype=dtype,
+        ).transpose(-3, -2)
+    return q, k, v, bias, gate
 
 
 def run_attention(
@@ -81,9 +107,10 @@ def run_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     bias: torch.Tensor,
+    gate: torch.Tensor | None,
     args: argparse.Namespace,
 ) -> torch.Tensor:
-    return _local_attention(
+    out, gate_applied = _local_attention(
         q=q,
         k=k,
         v=v,
@@ -93,7 +120,14 @@ def run_attention(
         use_efficient_implementation=True,
         inplace_safe=False,
         chunk_size=None,
+        gate=gate,
+        return_gate_status=True,
     )
+    if gate is not None and not gate_applied:
+        # Reference for the fused-boundary candidate: local attention followed
+        # by the same gate multiply that Attention._wrap_up would run.
+        out = torch.sigmoid(gate) * out
+    return out
 
 
 def parse_args() -> argparse.Namespace:
@@ -111,6 +145,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-queries", type=int, default=32)
     parser.add_argument("--n-keys", type=int, default=128)
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument(
+        "--gate",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Include the Attention._wrap_up sigmoid gate in the timed boundary.",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=123)
@@ -122,23 +163,42 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("local_attention_hotspot requires CUDA")
     torch.manual_seed(args.seed)
-    q, k, v, bias = make_inputs(args)
+    args.gate = bool(args.gate)
+    q, k, v, bias, gate = make_inputs(args)
 
     with env_flag("PROTENIX_TRITON_LOCAL_ATTN", "0"):
         ref, ref_ms = cuda_time(
-            lambda: run_attention(q, k, v, bias, args),
+            lambda: run_attention(q, k, v, bias, gate, args),
             warmup=args.warmup,
             iters=args.iters,
         )
-    with env_flag("PROTENIX_TRITON_LOCAL_ATTN", "1"):
+    with env_flags(
+        {
+            "PROTENIX_TRITON_LOCAL_ATTN": "1",
+            "PROTENIX_TRITON_LOCAL_ATTN_FUSE_GATE": "0",
+        }
+    ):
+        triton, triton_ms = cuda_time(
+            lambda: run_attention(q, k, v, bias, gate, args),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+    with env_flags(
+        {
+            "PROTENIX_TRITON_LOCAL_ATTN": "1",
+            "PROTENIX_TRITON_LOCAL_ATTN_FUSE_GATE": "1",
+        }
+    ):
         cand, cand_ms = cuda_time(
-            lambda: run_attention(q, k, v, bias, args),
+            lambda: run_attention(q, k, v, bias, gate, args),
             warmup=args.warmup,
             iters=args.iters,
         )
 
     diff = (cand.float() - ref.float()).abs()
+    triton_diff = (triton.float() - ref.float()).abs()
     finite_diff = diff[torch.isfinite(diff)]
+    finite_triton_diff = triton_diff[torch.isfinite(triton_diff)]
     row = {
         "args": vars(args),
         "device": torch.cuda.get_device_name(),
@@ -146,16 +206,30 @@ def main() -> None:
         "q_stride": list(q.stride()),
         "bias_shape": list(bias.shape),
         "bias_stride": list(bias.stride()),
+        "gate_shape": None if gate is None else list(gate.shape),
+        "gate_stride": None if gate is None else list(gate.stride()),
         "triton_precision": os.environ.get(
             "PROTENIX_TRITON_LOCAL_ATTN_INPUT_PRECISION", "tf32"
         ),
         "triton_num_warps": os.environ.get("PROTENIX_TRITON_LOCAL_ATTN_NUM_WARPS", "4"),
         "ref_ms": ref_ms,
+        "triton_ms": triton_ms,
         "candidate_ms": cand_ms,
         "speedup": ref_ms / cand_ms,
+        "candidate_vs_triton_speedup": triton_ms / cand_ms,
         "candidate_nan_count": int(torch.isnan(cand).sum().item()),
         "ref_nan_count": int(torch.isnan(ref).sum().item()),
         "diff_nan_count": int(torch.isnan(diff).sum().item()),
+        "triton_max_abs_error": (
+            float(finite_triton_diff.max().item())
+            if finite_triton_diff.numel()
+            else float("nan")
+        ),
+        "triton_mean_abs_error": (
+            float(finite_triton_diff.mean().item())
+            if finite_triton_diff.numel()
+            else float("nan")
+        ),
         "max_abs_error": (
             float(finite_diff.max().item()) if finite_diff.numel() else float("nan")
         ),

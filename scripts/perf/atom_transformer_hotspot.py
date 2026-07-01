@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from contextlib import nullcontext
 
@@ -205,6 +206,17 @@ def main() -> None:
     row = {
         "args": vars(args),
         "device": torch.cuda.get_device_name(),
+        "env": {
+            name: os.environ.get(name)
+            for name in (
+                "PROTENIX_TRITON_LOCAL_ATTN",
+                "PROTENIX_TRITON_LOCAL_ATTN_FUSE_GATE",
+                "PROTENIX_TRITON_LOCAL_ATTN_OUTPUT_BF16",
+                "PROTENIX_TRITON_FUSED_ATTENTION_RESIDUAL",
+                "PROTENIX_TRITON_FUSED_TRANSITION_RESIDUAL",
+                "PROTENIX_TRITON_FUSED_ELEMENTWISE",
+            )
+        },
         "q_shape": list(q.shape),
         "p_shape": list(p.shape),
         "transition_residual": bool(args.transition_residual),
