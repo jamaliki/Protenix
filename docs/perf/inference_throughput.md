@@ -49,6 +49,21 @@ The same-output speedup is about **17x per GPU** over the original default.
 Numbers vary slightly by run and node state; changes below about 1% should be
 treated as noise unless repeated in a paired gate.
 
+Later boundary-fusion experiments added three more opt-in flags:
+
+```bash
+export PROTENIX_TRITON_LOCAL_ATTN_FUSE_GATE=1
+export PROTENIX_TRITON_FUSED_ATTENTION_RESIDUAL=1
+export PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION=1
+```
+
+They are not included in the headline throughput table yet.  The atom-attention
+boundary fusion is a clean isolated win and reduces peak allocated memory, but
+the paired full `N_sample=1280`, `N_step=200` gate improved forward throughput
+by only 0.15%, which is below the promotion threshold.  Keep these flags as
+experimental until a repeated `N_sample=1280/2560` gate shows a robust samples/s
+gain.
+
 ## Reproducing the benchmark
 
 Use the benchmark harness rather than timing ad hoc commands.  It records the
@@ -145,6 +160,63 @@ Two details matter:
 - the Triton kernel is deliberately narrow.  A broad replacement would be
   harder to validate and easier to make slower.
 
+The next boundary around this kernel is the attention gate.  With
+`PROTENIX_TRITON_LOCAL_ATTN_FUSE_GATE=1`, the local-attention kernel consumes
+the precomputed gate and stores `sigmoid(gate) * attention` directly.  That
+removes one elementwise launch and one full attention-output read/write.
+
+At `N_sample=1280` with cached/broadcast pair bias, the isolated
+local-attention-plus-gate boundary improved from 9.72 ms to 8.92 ms
+(1.09x).  A full atom block improved from 27.33 ms to 26.50 ms (about 3.0%)
+and peak allocation fell by about 790 MiB when combined with
+`PROTENIX_TRITON_FUSED_ATTENTION_RESIDUAL=1`.
+
+The full same-output inference gate was much smaller:
+
+| gate | baseline | candidate | delta |
+| --- | ---: | ---: | ---: |
+| `N_sample=1280`, `N_step=200`, forward samples/s | 9.156 | 9.170 | +0.15% |
+| forward sec | 139.80 | 139.59 | -0.15% |
+| peak allocated MiB | 15245.8 | 14455.4 | -790.3 |
+
+Decision: useful kernel-learning result and memory reduction, but not promoted
+as a throughput win until repeated full gates clear the noise floor.
+
+### 3b. Fuse only across a boundary the consumer can still use
+
+Two token-transformer projection fusions were screened because the diffusion
+transformer is the largest remaining diffusion subcomponent.
+
+First, combining self-attention `q/k/v/g` projections into one wider GEMM was
+rejected.  It had exact parity on a smaller shared-input check, but the
+representative trunk hotspot got slower:
+
+| path | block ms | attention ms | peak allocated MiB |
+| --- | ---: | ---: | ---: |
+| current | 14.06-14.12 | 7.47-7.50 | 7001 |
+| fused `q/k/v/g` | 14.86-14.90 | 8.29 | 7477 |
+
+The likely mechanism is that the wider GEMM and cached concatenated weights did
+not beat the existing cuBLAS launch schedule for this shape.  The code path was
+removed rather than left as default-off cruft.
+
+Second, combining the two transition input projections (`a1/a2`) was promising
+only after the consumer boundary was fixed.  The raw concatenated GEMM was 1.07x
+faster in a microbenchmark, but its split halves are non-contiguous and made the
+existing `fused_silu_mul` fall back to slower PyTorch.  A split-aware Triton
+consumer now computes `silu(first_half) * second_half` directly from the
+concatenated projection.  With that fix, the trunk block was speed-neutral
+within noise but peak allocation dropped by about 900 MiB:
+
+| path | block ms | transition ms | peak allocated MiB |
+| --- | ---: | ---: | ---: |
+| current | 13.91 / 13.91 | 5.20 / 5.27 | 7915 |
+| fused transition input | 13.80 / 13.94 | 5.22 / 5.22 | 7010 |
+
+Decision: keep the implementation guarded by
+`PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION=1` for follow-up memory/batch-size
+screens, but do not count it as a promoted throughput optimization yet.
+
 ### 4. Use lower precision only where profiling supports it
 
 `PROTENIX_BF16_DIFFUSION_CORE=1` and `PROTENIX_BF16_ATOM_ATTENTION=1` reduce
@@ -189,6 +261,22 @@ Representative full-path timing at the promoted point:
 | diffusion | about 229 s |
 | confidence head | about 42 s |
 | feature/input work | subsecond |
+
+With `PROTENIX_TIMING_DIFFUSION=1`, a shorter `N_sample=1280`, `N_step=20`
+screen split diffusion itself as:
+
+| diffusion subcomponent | time |
+| --- | ---: |
+| token diffusion transformer | 7.86 s |
+| atom encoder | 3.74 s |
+| atom decoder | 1.96 s |
+| conditioning | 0.016 s |
+| input/output scale | 0.005 s |
+
+This is why the most attractive remaining throughput target is not another
+atom-local-attention tweak; it is the token diffusion transformer, especially
+attention/transition boundaries where a custom kernel must preserve the
+consumer layout.
 
 An early confidence pairformer hotspot was profiled in a deliberately FP32
 standalone screen.  That was useful for understanding the worst case, but it
@@ -305,6 +393,8 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | BF16 final confidence logits | reduced FP32 logit matmuls but no NCU/timing win | the remaining FP32 matmuls are too small and cast traffic dominates |
 | Whole confidence head under AMP | 2.9-5.6% slower at `N_sample=128`, `N_step=20` | lower dtype is not automatically faster when FP32 uses TF32 tensor cores and casts/library paths change |
 | Generic full-token Triton attention | slower than cuDNN/SDPA | vendor kernels win unless the shape mismatch is severe |
+| Fused self-attention `q/k/v/g` projection | exact parity but trunk block slowed from about 14.1 ms to 14.9 ms | fewer launches are not enough if the wider GEMM/cache/layout is worse |
+| Fused transition `a1/a2` projection without split-aware consumer | transition slowed from about 5.3 ms to 7.0 ms | fusing the producer can break the consumer by creating non-contiguous halves |
 | CUDA graph capture of the denoiser | slower in this setup | graph overhead/constraints can outweigh launch savings |
 
 The main learning point: isolated wins are hypotheses, not promotions.  A
@@ -324,13 +414,16 @@ Production code touched by the throughput stack:
 - `protenix/model/modules/primitives.py`: SDPA fallback policy, optional
   Triton local attention, and fused elementwise gate calls.
 - `protenix/model/modules/transformer.py`: local-attention bias fusion and
-  transition-residual fusion hooks.
+  attention/transition residual fusion hooks plus guarded transition
+  input-projection fusion.
 - `protenix/model/modules/local_attention_triton.py`: narrow Triton atom local
-  attention forward kernel.
+  attention forward kernel, including optional local-attention gate fusion.
 - `protenix/model/modules/local_attention_bias_triton.py`: fused LayerNorm +
   projection + layout for atom local-attention bias.
 - `protenix/model/modules/fused_elementwise_triton.py`: small inference-only
-  Triton gate kernels with PyTorch fallbacks.
+  Triton gate kernels with PyTorch fallbacks, including the split-aware
+  `silu(first_half) * second_half` consumer for concatenated transition
+  projections.
 - `protenix/model/modules/confidence.py` and `protenix/model/protenix.py`:
   confidence-logit chunk iteration and streaming summary consumption.
 
