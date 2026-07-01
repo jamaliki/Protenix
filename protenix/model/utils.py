@@ -318,6 +318,9 @@ def broadcast_token_to_atom(
         # shape = [N_atom], easy index
         return x_token[..., atom_to_token_idx, :]
     else:
+        atom_to_token_idx = _expand_atom_to_token_idx(
+            atom_to_token_idx, target_prefix_shape=x_token.shape[:-2]
+        )
         assert atom_to_token_idx.shape[:-1] == x_token.shape[:-2]
 
     return batched_gather(
@@ -326,6 +329,27 @@ def broadcast_token_to_atom(
         dim=-2,
         no_batch_dims=len(x_token.shape[:-2]),
     )
+
+
+def _expand_atom_to_token_idx(
+    atom_to_token_idx: torch.Tensor, target_prefix_shape: torch.Size
+) -> torch.Tensor:
+    """Expand atom maps over extra leading axes such as diffusion samples.
+
+    Protein-level features carry ``[..., N_atom]`` maps.  Diffusion activations
+    can insert additional axes after the protein batch, for example
+    ``[B, N_sample, N_atom, C]``.  The atom map should be reused across those
+    extra axes, not treated as a different protein batch.
+    """
+    idx_prefix_shape = atom_to_token_idx.shape[:-1]
+    if idx_prefix_shape == target_prefix_shape:
+        return atom_to_token_idx
+    assert target_prefix_shape[: len(idx_prefix_shape)] == idx_prefix_shape
+
+    extra_shape = target_prefix_shape[len(idx_prefix_shape) :]
+    return atom_to_token_idx.reshape(
+        *idx_prefix_shape, *((1,) * len(extra_shape)), atom_to_token_idx.shape[-1]
+    ).expand(*target_prefix_shape, atom_to_token_idx.shape[-1])
 
 
 def aggregate_atom_to_token(
@@ -350,6 +374,10 @@ def aggregate_atom_to_token(
     """
 
     # Broadcasting in the given dim.
+    if len(atom_to_token_idx.shape) > 1:
+        atom_to_token_idx = _expand_atom_to_token_idx(
+            atom_to_token_idx, target_prefix_shape=x_atom.shape[:-2]
+        )
     out = scatter(
         src=x_atom, index=atom_to_token_idx, dim=-2, dim_size=n_token, reduce=reduce
     )
