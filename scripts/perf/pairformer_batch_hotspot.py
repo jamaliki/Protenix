@@ -78,6 +78,12 @@ def make_stack(args: argparse.Namespace) -> PairformerStack:
         hidden_scale_up=args.hidden_scale_up,
     ).cuda()
     stack.eval()
+    if args.randomize_zero_weights:
+        with torch.no_grad():
+            generator = torch.Generator(device="cuda").manual_seed(args.seed + 7919)
+            for parameter in stack.parameters():
+                if parameter.ndim >= 2 and not torch.any(parameter):
+                    parameter.normal_(mean=0.0, std=0.02, generator=generator)
     return stack
 
 
@@ -257,6 +263,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=8)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--enable-tf32", type=str_bool, default=True)
+    parser.add_argument("--randomize-zero-weights", type=str_bool, default=True)
     parser.add_argument("--padding-check-short-tokens", type=int, default=245)
     parser.add_argument("--padding-check-full-tokens", type=int, default=600)
     return parser.parse_args()
