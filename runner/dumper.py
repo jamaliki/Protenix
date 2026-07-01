@@ -220,6 +220,12 @@ class DataDumper:
         Returns:
             List[int]: List of indices sorted by ranking score.
         """
+        if "summary_confidence" not in data:
+            coordinate = data.get("coordinate")
+            if isinstance(coordinate, torch.Tensor):
+                return list(range(coordinate.shape[0]))
+            return []
+
         N_sample = len(data["summary_confidence"])
         if self.sorted_by_ranking_score:
             value = torch.tensor(
@@ -253,6 +259,9 @@ class DataDumper:
             seed (int): Prediction seed.
             sorted_indices (Optional[List[int]]): Indices for ranking.
         """
+        if "summary_confidence" not in data:
+            return
+
         N_sample = len(data["summary_confidence"])
         for idx in range(N_sample):
             if self.need_atom_confidence:
