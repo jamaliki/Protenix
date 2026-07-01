@@ -64,6 +64,15 @@ def fused_attention_residual_enabled() -> bool:
     }
 
 
+def fused_transition_input_projection_enabled() -> bool:
+    return os.getenv("PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
 class AttentionPairBias(nn.Module):
     """
     Implements Algorithm 24 in AF3
@@ -656,6 +665,36 @@ class ConditionedTransitionBlock(nn.Module):
         self.linear_s = BiasInitLinear(
             in_features=c_s, out_features=c_a, bias=True, biasinit=biasinit
         )
+        self._input_projection_cache_key = None
+        self._input_projection_weight = None
+
+    def _can_fuse_input_projection(self, a: torch.Tensor) -> bool:
+        if not fused_transition_input_projection_enabled():
+            return False
+        if torch.is_grad_enabled():
+            return False
+        if not a.is_cuda:
+            return False
+        hidden = self.n * self.c_a
+        return (
+            self.linear_nobias_a1.weight.shape == (hidden, self.c_a)
+            and self.linear_nobias_a2.weight.shape == (hidden, self.c_a)
+        )
+
+    def _input_projection_params(self) -> torch.Tensor:
+        weights = (
+            self.linear_nobias_a1.weight,
+            self.linear_nobias_a2.weight,
+        )
+        cache_key = tuple((w.data_ptr(), w._version) for w in weights)
+        if cache_key != self._input_projection_cache_key:
+            # The transition MLP computes SiLU(a @ W1.T) * (a @ W2.T).
+            # W1 and W2 consume the exact same normalized activation, so a
+            # single wider GEMM saves one launch and one large activation read
+            # while preserving the high-quality cuBLAS matmul implementation.
+            self._input_projection_weight = torch.cat(weights, dim=0).contiguous()
+            self._input_projection_cache_key = cache_key
+        return self._input_projection_weight
 
     def forward(
         self,
@@ -675,7 +714,15 @@ class ConditionedTransitionBlock(nn.Module):
                 [..., N, c_a]
         """
         a = self.adaln(a, s)
-        b = fused_silu_mul(self.linear_nobias_a1(a), self.linear_nobias_a2(a))
+        if self._can_fuse_input_projection(a):
+            hidden = self.n * self.c_a
+            a1, a2 = F.linear(a, self._input_projection_params()).split(
+                hidden, dim=-1
+            )
+        else:
+            a1 = self.linear_nobias_a1(a)
+            a2 = self.linear_nobias_a2(a)
+        b = fused_silu_mul(a1, a2)
         # Output projection (from adaLN-Zero [27])
         gate = self.linear_s(s)
         projected = self.linear_nobias_b(b)
