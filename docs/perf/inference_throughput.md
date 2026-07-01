@@ -2594,3 +2594,73 @@ Decision:
 - Do not pursue larger batch as the main speed strategy. Fixing the remaining
   bottleneck requires reducing per-sample work or making the atom/trunk
   sample-scaled kernels better, not just raising `N_sample`.
+
+### Round 48 - current-stack trunk NCU refresh
+
+Status: diagnostic
+
+Question:
+- After promoting broadcast `s` and broadcast-aware gates, what are the real
+  launch-level bottlenecks in the diffusion trunk block, and does the profile
+  now justify a broader custom kernel?
+
+Experiment:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round98_current_trunk_ncu_20260701_095928`.
+- Commit: `1714d91`.
+- Workload: one H100, synthetic trunk block with the promoted broadcast shape:
+  `a=[1280,245,768]`, `s=[1,245,384]`, `z=[1,128,245,245]`, BF16,
+  efficient pair-bias conv2d, residual transition enabled.
+- NCU was run inside Slurm using
+  `/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/nsight-compute/bin/ncu`;
+  the login node was not used for profiling.
+
+CUDA-event hotspot:
+
+| subrange | time per trunk block |
+| --- | ---: |
+| full block | 14.624 ms |
+| attention-pair-bias path | 8.305 ms |
+| attention q/k/v + SDPA + gate/out | 7.568 ms |
+| conditioned transition with residual | 5.351 ms |
+| adaptive LayerNorm | 0.756 ms |
+| pair-bias projection | 0.035 ms |
+
+NCU launch-family attribution, full block:
+
+| launch family | invocations | kernel time | share | SM % | compute/mem % | L2 % | L1 % | tensor % |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| FMHA | 1 | 4.038 ms | 46.7% | 54.8 | 77.1 | 34.1 | 77.2 | 17.4 |
+| GEMM | 15 | 1.316 ms | 15.2% | 79.1 | 73.1 | 63.7 | 74.2 | 78.7 |
+| Triton SiLU/mul | 1 | 0.938 ms | 10.9% | 31.3 | 91.5 | 82.7 | 15.5 | 0.4 |
+| Torch elementwise/copy | 12 | 0.797 ms | 9.2% | 11.7 | 89.3 | 80.7 | 17.7 | 0.0 |
+| Triton sigmoid/mul | 1 | 0.466 ms | 5.4% | 29.9 | 91.6 | 82.5 | 15.5 | 0.4 |
+| LayerNorm | 2 | 0.405 ms | 4.7% | 51.8 | 71.5 | 70.8 | 27.5 | 0.4 |
+| Triton broadcast sigmoid/mul/add | 3 | 0.366 ms | 4.2% | 45.4 | 90.2 | 81.5 | 22.2 | 0.5 |
+| Triton broadcast sigmoid/mul | 1 | 0.315 ms | 3.6% | 45.9 | 89.5 | 80.8 | 22.5 | 0.6 |
+
+NCU launch-family attribution, residual transition target:
+
+| launch family | invocations | kernel time | share | SM % | compute/mem % | L2 % | L1 % | tensor % |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| GEMM | 6 | 1.036 ms | 37.4% | 84.2 | 76.4 | 61.3 | 77.1 | 84.1 |
+| Triton SiLU/mul | 1 | 0.939 ms | 33.9% | 31.3 | 91.4 | 82.4 | 15.4 | 0.4 |
+| LayerNorm | 1 | 0.400 ms | 14.4% | 52.8 | 72.6 | 71.9 | 28.0 | 0.5 |
+| Triton broadcast sigmoid/mul/add | 2 | 0.391 ms | 14.1% | 42.8 | 90.4 | 81.5 | 21.0 | 0.5 |
+
+Interpretation:
+- The promoted broadcast gates moved the easy broadcast elementwise bottleneck,
+  but the remaining trunk block still has three large classes of work:
+  FMHA, tensor-core GEMMs, and memory-bound pointwise kernels.
+- A whole-block or whole-attention mega-kernel is still not an obvious first
+  move: it would need to beat a good `4.04 ms` FMHA plus tensor-core GEMMs,
+  not merely remove launch overhead.
+- The next credible fusion target is the memory traffic around AdaLN and
+  MLP/transition gates: combine full-token layernorm with broadcast gate/add
+  where possible, then consider a larger transition-MLP rewrite only if the
+  smaller fusion cannot move the full gate.
+
+Decision:
+- Use this as the new launch map.
+- Next implementation candidate: broadcast-aware AdaLN fusion for inference
+  shapes, with a full-workload gate required before promotion.
