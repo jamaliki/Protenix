@@ -333,6 +333,21 @@ so a custom kernel must preserve cuBLAS-class GEMM efficiency while deleting
 the HBM epilogue.  The Triton prototype did not.  It was reverted rather than
 kept as a default-off branch.
 
+The output boundary was also screened with a direct Triton GEMM epilogue in
+`round148_transition_output_epilogue_triton_screen_20260701_180003`.  This used
+real `ConditionedTransitionBlock` weights under BF16 autocast, a real
+`gate=[1, 245, 768]` broadcast, and `N_sample=1280`.  The baseline was
+`linear_b(b)` followed by the promoted `fused_sigmoid_mul_add` gate/residual
+kernel.  The best direct Triton tile (`M128/N256/K64`) measured 2.00 ms, slower
+than the 1.51 ms baseline (`linear_b` 1.02 ms plus gate/residual 0.47 ms).
+Parity was acceptable for BF16 (`max_abs=0.03125`, `mean_abs=3.8e-5`), so this
+is a performance rejection, not a correctness rejection.
+
+The transition-output epilogue remains a good first **native CuTe** target, but
+the implementation has to keep the vendor GEMM schedule and add the epilogue
+load/store logic.  Replacing cuBLAS with a generic Triton matmul loses more GEMM
+efficiency than the 0.47 ms memory-bound epilogue can pay back.
+
 ### 4. Use lower precision only where profiling supports it
 
 `PROTENIX_BF16_DIFFUSION_CORE=1` and `PROTENIX_BF16_ATOM_ATTENTION=1` reduce
@@ -512,6 +527,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Fused self-attention `q/k/v/g` projection | exact parity but trunk block slowed from about 14.1 ms to 14.9 ms | fewer launches are not enough if the wider GEMM/cache/layout is worse |
 | Fused transition `a1/a2` projection without split-aware consumer | transition slowed from about 5.3 ms to 7.0 ms | fusing the producer can break the consumer by creating non-contiguous halves |
 | Custom Triton transition input GEMM+SiLU | synthetic +12%, but real transition input path slowed from 3.09 ms to 3.54 ms | custom GEMM screens must use real module weights/autocast; cuBLAS efficiency is the bottleneck to match |
+| Custom Triton transition output GEMM+gate/residual | best tile 2.00 ms versus 1.51 ms for cuBLAS plus fused gate/residual | the output epilogue is still attractive, but only if implemented as a vendor-quality CuTe/CUTLASS epilogue |
 | CUDA graph capture of the denoiser | slower in this setup | graph overhead/constraints can outweigh launch savings |
 
 The main learning point: isolated wins are hypotheses, not promotions.  A
