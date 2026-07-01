@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - optional runtime dependency.
 
 _SUPPORTED_DTYPES = {torch.float32, torch.bfloat16}
 _DEFAULT_BLOCK_SIZE = 256
-_DEFAULT_NUM_WARPS = 4
+_DEFAULT_NUM_WARPS = 8
 _PREWEIGHT_CACHE: dict[
     tuple[int, int, int, int, torch.dtype, torch.device],
     tuple[torch.Tensor, torch.Tensor],
@@ -54,7 +54,7 @@ def triton_fused_local_attention_bias_available() -> bool:
 
 
 def triton_preweighted_local_attention_bias_enabled() -> bool:
-    value = os.getenv("PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS_PREWEIGHT", "0")
+    value = os.getenv("PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS_PREWEIGHT", "1")
     return value.lower() not in {
         "0",
         "false",
