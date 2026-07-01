@@ -71,6 +71,15 @@ def attention_force_fp32() -> bool:
     }
 
 
+def fused_q_scale_enabled() -> bool:
+    return os.getenv("PROTENIX_FUSED_Q_SCALE", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
 _NON_CUDNN_SDPA_BACKENDS = [
     SDPBackend.FLASH_ATTENTION,
     SDPBackend.EFFICIENT_ATTENTION,
@@ -842,6 +851,32 @@ class Attention(nn.Module):
             # zero init the output layer
             nn.init.zeros_(self.linear_o.weight)
 
+    def _linear_q_scaled(
+        self,
+        q_x: torch.Tensor,
+        scale: float,
+    ) -> Optional[torch.Tensor]:
+        if not fused_q_scale_enabled():
+            return None
+        if self.training or torch.is_grad_enabled():
+            return None
+        if not q_x.is_cuda or not q_x.is_contiguous():
+            return None
+        if self.linear_q.precision is not None:
+            return None
+        if self.linear_q.bias is None:
+            return None
+
+        flat_q_x = q_x.reshape(-1, q_x.shape[-1])
+        flat_q = torch.addmm(
+            self.linear_q.bias.reshape(1, -1),
+            flat_q_x,
+            self.linear_q.weight.t(),
+            beta=scale,
+            alpha=scale,
+        )
+        return flat_q.reshape(q_x.shape[:-1] + (self.c_hidden * self.num_heads,))
+
     def _prep_qkv(
         self, q_x: torch.Tensor, kv_x: torch.Tensor, apply_scale: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -860,7 +895,11 @@ class Attention(nn.Module):
                 # [..., H, Q/K/V, C_hidden]
         """
         # [*, Q/K/V, H * C_hidden]
-        q = self.linear_q(q_x)
+        scale = math.sqrt(self.c_hidden)
+        q = self._linear_q_scaled(q_x, 1.0 / scale) if apply_scale else None
+        q_scaled = q is not None
+        if q is None:
+            q = self.linear_q(q_x)
         k = self.linear_k(kv_x)
         v = self.linear_v(kv_x)
 
@@ -874,8 +913,8 @@ class Attention(nn.Module):
         k = k.transpose(-2, -3)
         v = v.transpose(-2, -3)
 
-        if apply_scale:
-            q = q / math.sqrt(self.c_hidden)
+        if apply_scale and not q_scaled:
+            q = q / scale
 
         return q, k, v
 
