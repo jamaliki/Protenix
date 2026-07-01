@@ -2306,3 +2306,114 @@ Decision:
   24 blocks per denoising step, 200 denoising steps, `N_sample x 245 tokens x
   16 heads x head_dim 48`, with already efficient cuDNN/SDPA and conv2d
   pair-bias projection.
+
+### Round 43 - N1280 trunk-block NCU roofline refresh
+
+Status: diagnostic
+
+Question:
+- At the current promoted `N_sample=1280` point, which exact diffusion token
+  transformer launches dominate, and are they underutilized enough to justify a
+  broad custom attention mega-kernel?
+
+Experiments:
+- CUDA-event trunk hotspot plus bounded NCU capture:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round81_n1280_trunk_roofline_20260701_082945`.
+- Corrected NCU SpeedOfLight run using `--set basic`:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round83_n1280_trunk_basic_ncu_20260701_083204`.
+- Workload: one H100, `N_sample=1280`, 245 tokens, BF16,
+  `PROTENIX_TRITON_FUSED_ELEMENTWISE=1`,
+  `PROTENIX_TRITON_FUSED_TRANSITION_RESIDUAL=1`, efficient conv2d pair-bias
+  projection.
+
+Hotspot timing:
+
+| subrange | time per trunk block |
+| --- | ---: |
+| full block | 17.879 ms |
+| attention pair-bias module | 9.323 ms |
+| attention q/k/v + SDPA + gate/out | 7.473 ms |
+| conditioned transition | 6.750 ms |
+| adaptive LayerNorm | 1.906 ms |
+| pair-bias projection | 0.038 ms |
+
+NCU launch-family attribution, attention subrange:
+
+| launch family | invocations | kernel time | share | SM % | compute/mem % | L2 % | L1 % | tensor % |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| cuDNN/CUTLASS FMHA | 1 | 4.070 ms | 54.6% | 54.8 | 77.1 | 33.9 | 77.3 | 17.4 |
+| nvJitLink/cuBLASLt GEMM | 5 | 2.580 ms | 34.6% | 80.3 | 73.9 | 67.1 | 74.9 | 80.3 |
+| Triton sigmoid gate | 1 | 0.467 ms | 6.3% | 30.1 | 91.4 | 82.6 | 15.6 | 0.4 |
+| Q-scale elementwise multiply | 1 | 0.313 ms | 4.2% | 12.4 | 89.8 | 81.6 | 20.9 | 0.0 |
+| copy/cast/fill elementwise | 8 | 0.030 ms | 0.4% | low | low | low | low | low |
+
+NCU launch-family attribution, transition subrange:
+
+| launch family | invocations | kernel time | share | SM % | compute/mem % | L2 % | L1 % | tensor % |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| nvJitLink/cuBLASLt GEMM | 6 | 3.941 ms | 59.3% | 76.7 | 73.9 | 67.3 | 71.8 | 76.7 |
+| Triton SiLU/mul | 1 | 0.938 ms | 14.1% | 31.6 | 91.5 | 82.5 | 15.5 | 0.4 |
+| fast LayerNorm | 2 | 0.657 ms | 9.9% | 67.7 | 63.5 | 67.9 | 28.8 | 0.5 |
+| Triton sigmoid/mul/add | 1 | 0.614 ms | 9.2% | 25.4 | 93.1 | 80.4 | 13.2 | 0.3 |
+| Triton sigmoid/mul | 1 | 0.467 ms | 7.0% | 30.1 | 91.3 | 82.4 | 15.7 | 0.4 |
+| copy/cast elementwise | 9 | 0.033 ms | 0.5% | low | low | low | low | low |
+
+Interpretation:
+- Larger batches do not materially improve throughput because the dominant
+  trunk launches are sample-scaled and already near the relevant H100 pipes:
+  GEMMs are tensor-pipe hot, FMHA is the largest single kernel, and the
+  remaining pointwise kernels are memory-pipe/L2 limited. Memory capacity is
+  not the limiter at `N_sample=1280`; arithmetic and memory bandwidth per
+  generated sample are.
+- The missing time between CUDA-event subranges and summed NCU kernel time is
+  still real framework/library orchestration, but the finite, graph-correct
+  capture attempts did not reduce it. A broad trunk attention mega-kernel would
+  need to beat a `4.07 ms` FMHA kernel plus `2.58 ms` of tensor-core GEMMs, not
+  merely remove Python launch overhead.
+- The most credible small same-output target exposed by this refresh was the
+  separate Q-scale multiply (`0.313 ms` per attention call), because it is a
+  mathematically foldable memory-bound pass.
+
+Decision:
+- Do not replace the trunk cuDNN/CUTLASS attention wholesale yet. Try the
+  narrow foldable Q-scale mechanism first; reject it if the GEMM path regresses.
+
+### Round 44 - rejected fused query scaling
+
+Status: rejected and reverted
+
+Hypothesis:
+- The trunk attention path computes `linear_q(q_x)` and then launches a
+  separate memory-bound multiply for `q / sqrt(head_dim)`. Folding the scale
+  into the query projection with `torch.addmm(..., alpha=scale, beta=scale)`
+  should remove the `0.313 ms` Q-scale launch without changing attention math.
+
+Change:
+- Commit `588db8f` added an opt-in `PROTENIX_FUSED_Q_SCALE=1` path in
+  `Attention._prep_qkv` for no-grad CUDA inference with contiguous inputs and
+  ordinary `Linear` precision.
+
+Experiment:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round84_fused_q_scale_hotspot_20260701_083632`.
+- Workload: same N1280 trunk hotspot as Round 43, paired flag off/on in one
+  Slurm job.
+
+Results:
+
+| target | Q-scale fusion off | Q-scale fusion on | delta | memory note | parity |
+| --- | ---: | ---: | ---: | --- | --- |
+| attention subrange | 7.524 ms | 7.708 ms | -2.4% | peak allocated +459 MiB | max abs `0.00098` |
+| attention-pair-bias module | 10.583 ms | 10.675 ms | -0.9% | unchanged peak | max abs `0.00018` |
+| full trunk block | 17.984 ms | 18.167 ms | -1.0% | unchanged peak | max abs `0.03125` |
+
+Interpretation:
+- The standalone Q-scale multiply is real and memory-bound, but using
+  `addmm(alpha=scale,beta=scale)` changed the projection implementation enough
+  to lose more than the removed multiply saved. This is another case where a
+  mathematically foldable operation does not automatically produce a better
+  cuBLASLt schedule.
+
+Decision:
+- Reject and revert `PROTENIX_FUSED_Q_SCALE`. Do not carry the default-off path.
+- Keep the Round 43 profile as the current launch-level map for trunk work.
