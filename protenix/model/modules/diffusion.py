@@ -30,6 +30,32 @@ from protenix.model.triangular.layers import LayerNorm
 from protenix.model.utils import expand_at_dim, get_checkpoint_fn, permute_final_dims
 
 
+def broadcast_diffusion_s_enabled() -> bool:
+    return os.getenv("PROTENIX_BROADCAST_DIFFUSION_S", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
+def _can_broadcast_diffusion_s(
+    module: nn.Module,
+    t_hat_noise_level: torch.Tensor,
+) -> bool:
+    if not broadcast_diffusion_s_enabled():
+        return False
+    if module.training or torch.is_grad_enabled():
+        return False
+    if t_hat_noise_level.size(-1) <= 1:
+        return False
+    if t_hat_noise_level.stride(-1) == 0:
+        return True
+    return bool(
+        torch.all(t_hat_noise_level == t_hat_noise_level[..., :1]).item()
+    )
+
+
 class _CudaEventTimer:
     def __init__(
         self,
@@ -450,6 +476,12 @@ class DiffusionModule(nn.Module):
         blocks_per_ckpt = self.blocks_per_ckpt
         if not torch.is_grad_enabled():
             blocks_per_ckpt = None
+        conditioning_noise_level = t_hat_noise_level
+        if _can_broadcast_diffusion_s(self, t_hat_noise_level):
+            # In inference sampling, t_hat is a scalar expanded across samples.
+            # The resulting single conditioning is therefore sample-invariant;
+            # keep only one sample lane and rely on broadcasting downstream.
+            conditioning_noise_level = t_hat_noise_level[..., :1]
         # Conditioning, shared across difference samples
         # Diffusion_conditioning consumes 7-8G when token num is 768,
         # use checkpoint here if blocks_per_ckpt is not None.
@@ -460,7 +492,7 @@ class DiffusionModule(nn.Module):
                 checkpoint_fn = get_checkpoint_fn()
                 s_single, z_pair = checkpoint_fn(
                     self.diffusion_conditioning,
-                    t_hat_noise_level,
+                    conditioning_noise_level,
                     input_feature_dict["relp"],
                     s_inputs,
                     s_trunk,
@@ -471,7 +503,7 @@ class DiffusionModule(nn.Module):
                 )
             else:
                 s_single, z_pair = self.diffusion_conditioning(
-                    t_hat_noise_level,
+                    conditioning_noise_level,
                     input_feature_dict["relp"],
                     s_inputs=s_inputs,
                     s_trunk=s_trunk,
