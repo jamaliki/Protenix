@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from contextlib import nullcontext
 from typing import Optional, Union
 
 import torch
@@ -40,6 +41,22 @@ def _env_int(name: str) -> Optional[int]:
     if value is None or not value.strip():
         return None
     return int(value)
+
+
+def _confidence_logit_context():
+    """Keep confidence logits FP32 unless explicitly screening BF16 matmuls.
+
+    The confidence pairformer normally inherits the caller's AMP context, but
+    the final logit projections historically force FP32 because small changes
+    there feed directly into softmax-based confidence scores.  For performance
+    screening, ``PROTENIX_BF16_CONFIDENCE_LOGITS=1`` lets the heavy projection
+    matmuls use the outer BF16 autocast context, while the returned logits are
+    still upcast below before the summary code consumes them.
+    """
+
+    if _env_flag_enabled("PROTENIX_BF16_CONFIDENCE_LOGITS"):
+        return nullcontext()
+    return torch.amp.autocast("cuda", enabled=False)
 
 
 class ConfidenceHead(nn.Module):
@@ -463,7 +480,7 @@ class ConfidenceHead(nn.Module):
             "atom_to_tokatom_idx"
         ]  # in range [0, max_atoms_per_token-1] shape: [N_atom] # influenced by crop
 
-        with torch.amp.autocast("cuda", enabled=False):
+        with _confidence_logit_context():
             pae_pred = self.linear_no_bias_pae(self.pae_ln(z_pair))
             pde_pred = self.linear_no_bias_pde(
                 self.pde_ln(z_pair + z_pair.transpose(-2, -3))
@@ -482,6 +499,14 @@ class ConfidenceHead(nn.Module):
                 self.resolved_ln(a),
                 self.resolved_weight[atom_to_tokatom_idx],
             )
+        if _env_flag_enabled("PROTENIX_BF16_CONFIDENCE_LOGITS"):
+            # Preserve the public dtype contract and keep downstream softmax
+            # reductions in FP32.  The performance experiment is only about
+            # using tensor cores for the projection matmuls themselves.
+            plddt_pred = plddt_pred.to(torch.float32)
+            pae_pred = pae_pred.to(torch.float32)
+            pde_pred = pde_pred.to(torch.float32)
+            resolved_pred = resolved_pred.to(torch.float32)
         if not self.training and z_pair.shape[-2] > 2000:
             torch.cuda.empty_cache()
         return plddt_pred, pae_pred, pde_pred, resolved_pred
