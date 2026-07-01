@@ -55,6 +55,15 @@ def fused_transition_residual_enabled() -> bool:
     }
 
 
+def fused_attention_residual_enabled() -> bool:
+    return os.getenv("PROTENIX_TRITON_FUSED_ATTENTION_RESIDUAL", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
 class AttentionPairBias(nn.Module):
     """
     Implements Algorithm 24 in AF3
@@ -238,6 +247,7 @@ class AttentionPairBias(nn.Module):
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
         enable_efficient_fusion: bool = False,
+        residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Details are given in local_forward and standard_forward"""
         # Input projections
@@ -276,10 +286,13 @@ class AttentionPairBias(nn.Module):
 
         # Output projection (from adaLN-Zero [27])
         if self.has_s:
+            gate = self.linear_a_last(s)
+            if residual is not None:
+                return fused_sigmoid_mul_add(gate, a, residual)
             if inplace_safe:
-                a *= torch.sigmoid(self.linear_a_last(s))
+                a *= torch.sigmoid(gate)
             else:
-                a = fused_sigmoid_mul(self.linear_a_last(s), a)
+                a = fused_sigmoid_mul(gate, a)
 
         return a
 
@@ -361,22 +374,28 @@ class DiffusionTransformerBlock(nn.Module):
                 - s: the single embedding [..., N, c_s]
                 - z: the pair embedding
         """
-        attn_out = self.drop_path(
-            self.attention_pair_bias(
-                a=a,
-                s=s,
-                z=z,
-                n_queries=n_queries,
-                n_keys=n_keys,
-                inplace_safe=inplace_safe,
-                chunk_size=chunk_size,
-                enable_efficient_fusion=enable_efficient_fusion,
-            )
+        fuse_attention_residual = (
+            fused_attention_residual_enabled()
+            and not self.training
+            and isinstance(self.drop_path, nn.Identity)
         )
-        if inplace_safe:
-            attn_out += a
-        else:
-            attn_out = attn_out + a
+        attn_out = self.attention_pair_bias(
+            a=a,
+            s=s,
+            z=z,
+            n_queries=n_queries,
+            n_keys=n_keys,
+            inplace_safe=inplace_safe,
+            chunk_size=chunk_size,
+            enable_efficient_fusion=enable_efficient_fusion,
+            residual=a if fuse_attention_residual else None,
+        )
+        if not fuse_attention_residual:
+            attn_out = self.drop_path(attn_out)
+            if inplace_safe:
+                attn_out += a
+            else:
+                attn_out = attn_out + a
         if (
             fused_transition_residual_enabled()
             and not self.training
