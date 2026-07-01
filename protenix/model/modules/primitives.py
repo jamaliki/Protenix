@@ -1060,8 +1060,8 @@ def gather_pair_embedding_in_dense_trunk(
 
     Args:
         x: [..., N_token, N_token, d]
-        idx_q: [N_b, N_q]
-        idx_k: [N_b, N_k]
+        idx_q: [..., N_b, N_q]
+        idx_k: [..., N_b, N_k]
 
     Return:
         y: [..., N_b, N_q, N_k, d]
@@ -1069,18 +1069,41 @@ def gather_pair_embedding_in_dense_trunk(
     """
     idx_q = idx_q.long()
     idx_k = idx_k.long()
-    assert len(idx_q.shape) == len(idx_k.shape) == 2
+    assert idx_q.shape[:-1] == idx_k.shape[:-1]
 
     # Get the shape parameters
-    N_b, N_q = idx_q.shape
-    N_k = idx_k.shape[1]
+    N_b, N_q = idx_q.shape[-2:]
+    N_k = idx_k.shape[-1]
 
     # Expand idx_q and idx_k to match the shape required for advanced indexing
-    idx_q_expanded = idx_q.unsqueeze(-1).expand(-1, -1, N_k)
-    idx_k_expanded = idx_k.unsqueeze(1).expand(-1, N_q, -1)
+    idx_q_expanded = idx_q.unsqueeze(-1).expand(*idx_q.shape, N_k)
+    idx_k_expanded = idx_k.unsqueeze(-2).expand(*idx_k.shape[:-1], N_q, N_k)
+    if idx_q.dim() == 2:
+        # Unbatched fast path.  Advanced indexing is safe here because there is
+        # no leading protein batch for PyTorch to accidentally cross-product.
+        return x[..., idx_q_expanded, idx_k_expanded, :]
 
-    # Use advanced indexing to gather the desired elements
-    y = x[..., idx_q_expanded, idx_k_expanded, :]
+    idx_batch_shape = idx_q.shape[:-2]
+    idx_batch_ndim = len(idx_batch_shape)
+    x_prefix_shape = x.shape[:-3]
+    assert x_prefix_shape[:idx_batch_ndim] == idx_batch_shape
+
+    # Batched advanced indexing can silently form the cross product between
+    # x's batch axis and the index batch axis.  Flatten the protein batch and
+    # gather each independent protein separately so y[b] only sees x[b].
+    flat_batch = math.prod(idx_batch_shape)
+    x_extra_shape = x_prefix_shape[idx_batch_ndim:]
+    x_flat = x.reshape(flat_batch, *x_extra_shape, *x.shape[-3:])
+    idx_q_flat = idx_q_expanded.reshape(flat_batch, N_b, N_q, N_k)
+    idx_k_flat = idx_k_expanded.reshape(flat_batch, N_b, N_q, N_k)
+    y = torch.stack(
+        [
+            x_flat[batch_idx][..., idx_q_flat[batch_idx], idx_k_flat[batch_idx], :]
+            for batch_idx in range(flat_batch)
+        ],
+        dim=0,
+    )
+    y = y.reshape(*idx_batch_shape, *x_extra_shape, N_b, N_q, N_k, x.shape[-1])
 
     return y
 
