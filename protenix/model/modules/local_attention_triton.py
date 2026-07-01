@@ -66,6 +66,15 @@ def triton_local_attention_num_warps(dtype: torch.dtype) -> int:
     return num_warps if num_warps in {1, 2, 4, 8} else default_num_warps
 
 
+def triton_local_attention_bf16_output_enabled() -> bool:
+    return os.getenv("PROTENIX_TRITON_LOCAL_ATTN_OUTPUT_BF16", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
 _SUPPORTED_INPUT_DTYPES = {torch.float32, torch.bfloat16}
 
 
@@ -247,12 +256,19 @@ def triton_local_attention(
         return None
 
     # The reference local-attention path forces atom attention to FP32 before
-    # SDPA and returns FP32 even when the surrounding model is BF16.
+    # SDPA and returns FP32 even when the surrounding model is BF16.  Keep that
+    # as the default, but allow an opt-in BF16 store to reduce downstream
+    # gate/projection traffic after the FP32 accumulation above.
+    out_dtype = (
+        q.dtype
+        if q.dtype == torch.bfloat16 and triton_local_attention_bf16_output_enabled()
+        else torch.float32
+    )
     out = torch.empty_strided(
         flat_q_shape,
         q_flat.stride(),
         device=q.device,
-        dtype=torch.float32,
+        dtype=out_dtype,
     )
     grid = (n_sample * n_heads * n_trunks,)
     _local_attention_kernel[grid](
