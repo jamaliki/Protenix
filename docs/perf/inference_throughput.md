@@ -41,8 +41,9 @@ Use the following for the current best high-throughput 7r6r-style inference
 path:
 
 ```bash
-# Conservative high-throughput default for the 7r6r-style benchmark.
-export N_SAMPLE=1280
+# Max-throughput point screened so far for the 7r6r-style benchmark.
+# Use N_SAMPLE=1280 instead when halving memory is worth a ~1.5% throughput hit.
+export N_SAMPLE=2560
 export SAMPLE_DIFFUSION_CHUNK_SIZE=none
 export CHUNK_SIZE=none
 export PROTENIX_GPU_RANDOM_AUGMENT=1
@@ -61,15 +62,16 @@ export PROTENIX_CONFIDENCE_LOGIT_CHUNK_SIZE=32
 export PROTENIX_BROADCAST_DIFFUSION_S=1
 ```
 
-Measured one-H100 warmed throughput at commit `8142521` is `9.043`
-end-to-end samples/sec and `9.060` forward samples/sec at `N_sample=1280`,
+Measured one-H100 warmed throughput at commit `8142521` is `9.178`
+end-to-end samples/sec and `9.187` forward samples/sec at `N_sample=2560`,
 `N_step=200`, true unchunked diffusion on the 7r6r benchmark input, reserving
-`19.1 GiB`. This is `17.13x` over the original per-GPU default aggregate
-baseline of `0.528` samples/sec. Larger-batch throughput under this newer
-stack is being remeasured in Round 47; the previous pre-broadcast stack was
-nearly flat from `N_sample=1280` to `N_sample=2560`, which is why the current
-default remains the lower-memory `N_sample=1280` point until the new batch
-ladder finishes.
+`36.3 GiB`. This is `17.38x` over the original per-GPU default aggregate
+baseline of `0.528` samples/sec. The lower-memory `N_sample=1280` point gives
+`9.043` end-to-end samples/sec and `9.060` forward samples/sec while reserving
+`19.1 GiB`, so it remains the better debug/default setting when memory
+headroom matters. Larger unchunked batches are not currently safe:
+`N_sample=3840` and `N_sample=5120` both fail during the atom encoder warmup in
+a BF16 cuBLAS GEMM followed by an illegal-memory-access report.
 
 ## Running report
 
@@ -2544,7 +2546,8 @@ Decision:
 
 ### Round 47 - current-stack batch ladder
 
-Status: running
+Status: promoted `N_sample=2560` as the max-throughput point; larger unchunked
+batches rejected for now
 
 Question:
 - With broadcast `s` and broadcast-aware gates promoted, does a larger
@@ -2554,10 +2557,40 @@ Question:
 Experiment:
 - Run directory:
   `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round96_batch_ladder_current_20260701_093445`.
+- Follow-up `N_sample=3840` run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round97_n3840_current_20260701_094703`.
 - Commit: `8142521`.
 - Workload: one H100, 7r6r input, `N_step=200`, unchunked diffusion, current
   promoted stack, one warmup item before the timed item.
-- Shapes: `N_sample=2560` and `N_sample=5120`.
+- Shapes: `N_sample=2560`, `3840`, and `5120`.
+
+Results:
+
+| shape | status | e2e samples/s | forward samples/s | forward sec | diffusion | confidence head | peak reserved MiB | notes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| N1280 | stable | 9.043 | 9.060 | 141.274 | 114.890 s | 21.213 s | 19560 | Round 46 warmed gate |
+| N2560 | stable | 9.178 | 9.187 | 278.640 | 229.201 s | 41.736 s | 37120 | max screened throughput |
+| N3840 | failed | - | - | - | - | - | - | atom encoder BF16 cuBLAS failure during warmup |
+| N5120 | failed | - | - | - | - | - | - | same atom encoder BF16 cuBLAS failure during warmup |
+
+Interpretation:
+- Doubling from N1280 to N2560 gives only `+1.5%` end-to-end throughput while
+  nearly doubling reserved memory (`19.1 GiB -> 36.3 GiB`). This confirms that
+  memory capacity was not the limiter at N1280; the dominant diffusion and
+  confidence kernels still scale close to linearly with `N_sample`.
+- Increasing batch by 3x or 4x is not just low-value; it is currently unsafe in
+  the unchunked path. Both N3840 and N5120 fail early in the atom encoder at
+  `linear_no_bias_q(q_l)` with `CUBLAS_STATUS_EXECUTION_FAILED`, followed by a
+  CUDA illegal-memory-access report. That points to a large-GEMM/workspace or
+  kernel-limit failure in the sample-scaled atom path rather than ordinary
+  Python overhead.
+- Chunking the sample dimension would avoid the failure but would serialize
+  the same work and should land near the N2560 throughput ceiling unless the
+  atom path is redesigned.
 
 Decision:
-- Pending. Keep `N_sample=1280` as the documented default until this finishes.
+- Use `N_sample=2560` for maximum throughput and `N_sample=1280` for
+  lower-memory/debug runs.
+- Do not pursue larger batch as the main speed strategy. Fixing the remaining
+  bottleneck requires reducing per-sample work or making the atom/trunk
+  sample-scaled kernels better, not just raising `N_sample`.
