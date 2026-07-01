@@ -62,6 +62,10 @@ def make_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, ...]:
     dtype = getattr(torch, args.dtype)
     n_trunks = (args.atoms + args.n_queries - 1) // args.n_queries
     leading_shape = (args.outer_batch, args.samples) if args.outer_batch else (args.samples,)
+    bias_samples = args.bias_samples if args.bias_samples is not None else args.samples
+    bias_leading_shape = (
+        (args.outer_batch, bias_samples) if args.outer_batch else (bias_samples,)
+    )
 
     # Match Attention._prep_qkv layout: linear output is [..., N_atom, H, D],
     # then transposed to [..., H, N_atom, D].
@@ -79,7 +83,7 @@ def make_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, ...]:
     # Match permute_final_dims(..., [3, 0, 1, 2]) from
     # [..., n_trunks, n_queries, n_keys, n_heads].
     bias = torch.randn(
-        *leading_shape,
+        *bias_leading_shape,
         n_trunks,
         args.n_queries,
         args.n_keys,
@@ -138,6 +142,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Optional leading batch dimension before N_sample; 1 matches Protenix batched inference.",
+    )
+    parser.add_argument(
+        "--bias-samples",
+        type=int,
+        default=None,
+        help="Optional bias sample dimension. Use 1 to mimic cached full inference.",
     )
     parser.add_argument("--atoms", type=int, default=2529)
     parser.add_argument("--heads", type=int, default=4)
