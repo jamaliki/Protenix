@@ -73,7 +73,7 @@ if triton_fused_local_attention_bias_available():
         block_size: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        offsets = pid * block_size + tl.arange(0, block_size)
+        offsets = (pid * block_size + tl.arange(0, block_size)).to(tl.int64)
         mask = offsets < total_pairs
 
         key = offsets % n_keys
@@ -93,32 +93,54 @@ if triton_fused_local_attention_bias_available():
 
         sum_z = tl.zeros((block_size,), tl.float32)
         sum_z2 = tl.zeros((block_size,), tl.float32)
+        weighted0 = tl.zeros((block_size,), tl.float32)
+        weighted1 = tl.zeros((block_size,), tl.float32)
+        weighted2 = tl.zeros((block_size,), tl.float32)
+        weighted3 = tl.zeros((block_size,), tl.float32)
+        weight_sum0 = tl.full((), 0.0, tl.float32)
+        weight_sum1 = tl.full((), 0.0, tl.float32)
+        weight_sum2 = tl.full((), 0.0, tl.float32)
+        weight_sum3 = tl.full((), 0.0, tl.float32)
         for c in range(0, c_z):
             z_c = tl.load(
                 z_base + c * z_stride_c,
                 mask=mask,
                 other=0.0,
             ).to(tl.float32)
+            ln_w = tl.load(ln_weight_ptr + c).to(tl.float32)
+            linear_w0 = tl.load(linear_weight_ptr + c).to(tl.float32)
+            linear_w1 = tl.load(linear_weight_ptr + c_z + c).to(tl.float32)
+            linear_w2 = tl.load(linear_weight_ptr + 2 * c_z + c).to(tl.float32)
+            linear_w3 = tl.load(linear_weight_ptr + 3 * c_z + c).to(tl.float32)
+            w0 = ln_w * linear_w0
+            w1 = ln_w * linear_w1
+            w2 = ln_w * linear_w2
+            w3 = ln_w * linear_w3
             sum_z += z_c
             sum_z2 += z_c * z_c
+            weighted0 += z_c * w0
+            weighted1 += z_c * w1
+            weighted2 += z_c * w2
+            weighted3 += z_c * w3
+            weight_sum0 += w0
+            weight_sum1 += w1
+            weight_sum2 += w2
+            weight_sum3 += w3
 
         inv_c = 1.0 / c_z
         mean = sum_z * inv_c
         var = sum_z2 * inv_c - mean * mean
         rstd = tl.rsqrt(var + eps)
 
-        for head in range(0, n_heads):
-            projected = tl.zeros((block_size,), tl.float32)
-            for c in range(0, c_z):
-                z_c = tl.load(
-                    z_base + c * z_stride_c,
-                    mask=mask,
-                    other=0.0,
-                ).to(tl.float32)
-                ln_w = tl.load(ln_weight_ptr + c).to(tl.float32)
-                linear_w = tl.load(linear_weight_ptr + head * c_z + c).to(tl.float32)
-                projected += (z_c - mean) * rstd * ln_w * linear_w
-
+        for head in range(0, 4):
+            if head == 0:
+                projected = (weighted0 - mean * weight_sum0) * rstd
+            elif head == 1:
+                projected = (weighted1 - mean * weight_sum1) * rstd
+            elif head == 2:
+                projected = (weighted2 - mean * weight_sum2) * rstd
+            else:
+                projected = (weighted3 - mean * weight_sum3) * rstd
             out_offsets = (
                 out_ptr
                 + sample * out_stride_s
@@ -173,6 +195,8 @@ def triton_project_local_attention_bias(
 
     c_z = z.shape[-1]
     n_heads = linear_weight.shape[0]
+    if n_heads != 4:
+        return None
     if c_z not in {16, 32}:
         return None
     if layernorm_weight.shape != (c_z,):
