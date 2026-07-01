@@ -3108,3 +3108,51 @@ Decision:
   1. fix local-attention layout/coalescing by producing the right Q/K/V layout
      directly rather than copying, or
   2. implement a vendor-quality fused MLP/output-projection epilogue.
+
+### Round 57 - rejected query-split local-attention CTA tile
+
+Status: rejected and reverted
+
+Hypothesis:
+- Round 52 showed `_local_attention_kernel` is register-limited
+  (`253 registers/thread`, `12.5%` theoretical occupancy). Splitting each
+  32-query CTA into smaller 16- or 8-query CTAs should reduce the live
+  score/prob tile and improve occupancy without changing the softmax math.
+
+Change:
+- Commit `25dec43` added an opt-in
+  `PROTENIX_TRITON_LOCAL_ATTN_BLOCK_M={16,8}` path.
+- Commit `067322b` reverted it after the hotspot screen below.
+
+Hotspot screen:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round114_query_split_local_attention_20260701_122626`.
+- Workload: cached atom-transformer hotspot, `N_sample=1280`,
+  `p_samples=1`, BF16, current promoted flags,
+  `--warmup 8 --iters 30 --transition-residual 1`.
+- Correctness: both split variants were exact against the base output
+  (`max_abs=0.0`, `mean_abs=0.0`, all finite).
+
+| variant | local-attn query tile | attention path | full atom block | peak reserved |
+| --- | ---: | ---: | ---: | ---: |
+| base | 32 | 16.705 ms | 27.364 ms | 18624 MiB |
+| query split | 16 | 16.851 ms | 27.496 ms | 20604 MiB |
+| query split | 8 | 18.958 ms | 29.603 ms | 20604 MiB |
+| base repeat | 32 | 16.697 ms | 27.343 ms | 20604 MiB |
+
+Interpretation:
+- The register/occupancy diagnosis is still useful, but splitting query rows is
+  the wrong fix. The smaller CTAs duplicate K/V and bias-window work and add
+  more launches/program scheduling; that overhead exceeds any register-pressure
+  relief.
+- This narrows local-attention options further: a successful rewrite needs to
+  reduce memory-sector waste or change producer layout directly. Merely
+  retessellating the same 32x128 local window is not enough.
+
+Decision:
+- Reject and revert `25dec43`.
+- Do not keep a default-off query-split path.
+- If continuing in local attention, the next legitimate "mega" step is a
+  layout-producing projection or an all-head fused bias/attention design that
+  reuses the 16-channel pair feature across heads; both are larger rewrites and
+  should be designed before coding.
