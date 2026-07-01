@@ -265,10 +265,11 @@ class AttentionPairBias(nn.Module):
 
         # Output projection (from adaLN-Zero [27])
         if self.has_s:
+            gate = self.linear_a_last(s)
             if inplace_safe:
-                a *= torch.sigmoid(self.linear_a_last(s))
+                a *= torch.sigmoid(gate)
             else:
-                a = torch.sigmoid(self.linear_a_last(s)) * a
+                a = fused_sigmoid_mul(gate, a)
 
         return a
 
