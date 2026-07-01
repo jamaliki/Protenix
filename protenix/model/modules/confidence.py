@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional, Union
 
 import torch
@@ -21,6 +22,17 @@ from protenix.model.modules.pairformer import PairformerStack
 from protenix.model.modules.primitives import LinearNoBias
 from protenix.model.triangular.layers import LayerNorm
 from protenix.model.utils import broadcast_token_to_atom, one_hot
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str) -> Optional[float]:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    return float(value)
 
 
 class ConfidenceHead(nn.Module):
@@ -203,6 +215,26 @@ class ConfidenceHead(nn.Module):
             del z_init
             torch.cuda.empty_cache()
 
+        # For many samples, PAE/PDE logits dominate peak GPU memory:
+        # [N_sample, N_token, N_token, 64] in FP32 for each head. Protenix
+        # already offloads these logits for very large token counts; this
+        # opt-in extends the same idea to high-throughput sample batches.
+        n_token = z_trunk.shape[-2]
+        bytes_per_pair_logit = torch.finfo(torch.float32).bits // 8
+        max_pair_bins = max(self.b_pae, self.b_pde)
+        pair_logit_bytes = (
+            N_sample * n_token * n_token * max_pair_bins * bytes_per_pair_logit
+        )
+        threshold_gib = _env_float("PROTENIX_CONFIDENCE_CPU_OFFLOAD_THRESHOLD_GIB")
+        offload_pair_logits = (not self.training) and (
+            z_trunk.shape[-2] > 2000
+            or _env_flag_enabled("PROTENIX_CONFIDENCE_CPU_OFFLOAD")
+            or (
+                threshold_gib is not None
+                and pair_logit_bytes >= threshold_gib * (1024**3)
+            )
+        )
+
         plddt_preds, pae_preds, pde_preds, resolved_preds = (
             [],
             [],
@@ -226,7 +258,7 @@ class ConfidenceHead(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
-            if z_trunk.shape[-2] > 2000 and (not self.training):
+            if offload_pair_logits:
                 # cpu offload pae_preds/pde_preds
                 pae_pred = pae_pred.cpu()
                 pde_pred = pde_pred.cpu()
