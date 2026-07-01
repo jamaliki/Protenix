@@ -1285,3 +1285,153 @@ Next:
 - Trunk attention remains material, but QKV concatenation is not the right
   mechanism. Focus on either conditioned-transition epilogue/activation traffic
   or atom-transformer post-fused-bias profiling.
+
+### Round 27 - post-fusion launch attribution with NCU
+
+Status: diagnostic
+
+Question:
+- After promoting fused atom local-attention bias projection and rejecting
+  trunk QKV concatenation, which exact launches still dominate the atom and
+  trunk transformer paths? This was run with Nsight Compute installed in the
+  cluster micromamba NCU environment:
+  `/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/nsight-compute/bin/ncu`.
+
+Experiments:
+- Atom transformer hotspot:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round36_atom_transformer_hotspot_20260701_013323`.
+- NCU atom attention/transition reports:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round39_atom_ncu_20260701_013753`.
+- Trunk block hotspot:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round34_trunk_block_hotspot_20260701_012229`.
+- Commit for NCU capture harness: `ceb6cd1`.
+
+Atom transformer hotspot, `N_sample=640`, BF16, one H100:
+
+| subrange | ms |
+| --- | ---: |
+| full atom `DiffusionTransformerBlock` | 23.239 |
+| `attention_pair_bias_local_attention` | 17.665 |
+| `conditioned_transition` | 4.854 |
+
+NCU launch attribution for one warmed atom attention call at `N_sample=640`:
+
+| launch family | time | share | NCU indication |
+| --- | ---: | ---: | --- |
+| `_project_local_attention_bias_kernel` | 7.772 ms | 44.0% | memory-pipeline dominated; `gpu__compute_memory_throughput` 96.9% |
+| `_local_attention_kernel` | 1.763 ms | 10.0% | memory/softmax/value path; DRAM 62.8%, compute-memory 66.2% |
+| q/k/v/out GEMMs, grouped | 3.221 ms | 18.3% | cuBLAS/nvjet tensor-core GEMMs; already reasonably efficient |
+| four `LayerNormForwardV2` launches | 1.327 ms | 7.5% | memory-bound LN |
+| sigmoid/gating/other elementwise | 3.586 ms | 20.3% | mostly memory-bound elementwise |
+
+NCU launch attribution for one warmed conditioned-transition call at
+`N_sample=640`:
+
+| launch family | time | share | NCU indication |
+| --- | ---: | ---: | --- |
+| transition GEMMs, grouped | 2.347 ms | 49.2% | tensor-core GEMMs; not a good hand-fusion target |
+| `_silu_mul_kernel` | 0.806 ms | 16.9% | memory-bound fused activation/mul |
+| `_sigmoid_mul_add_kernel` | 0.528 ms | 11.1% | memory-bound gate/add |
+| `_sigmoid_mul_kernel` | 0.400 ms | 8.4% | memory-bound gate |
+| two `LayerNormForwardV2` launches | 0.661 ms | 13.9% | memory-bound LN |
+
+Trunk block hotspot, `N_sample=640`, BF16, 245 tokens, 16 heads:
+
+| subrange | ms |
+| --- | ---: |
+| full trunk block | 16.268 |
+| `attention_pair_bias` total | 11.015 |
+| adaptive LN | 1.290 |
+| pair-bias projection | 0.036 |
+| `attention_qkv_sdpa_gate_out` | 9.759 |
+| conditioned transition | 4.147 |
+
+Interpretation:
+- The exact top atom launch after Round 25 is still the local pair-bias
+  producer, not the Triton local-attention softmax itself. It is a
+  linear-scaling, memory-dominated path. Bigger `N_sample` therefore mostly
+  makes this launch proportionally longer; there is little fixed overhead left
+  to amortize.
+- The trunk pair-bias projection is no longer material in the trunk hotspot.
+  The efficient `conv2d` projection path leaves trunk attention dominated by
+  q/k/v + cuDNN SDPA + output/gating, and the separate fused-QKV screen showed
+  that naive GEMM concatenation regresses.
+- A full "mega-kernel" that fuses atom bias projection with local attention is
+  only attractive if it reuses the 16-channel `z` vector across all four heads.
+  A per-head fused kernel would reread `z` four times and likely lose to the
+  current producer/consumer split. A true all-head local-attention mega-kernel
+  is possible but substantially more complex because it must avoid holding four
+  full 32 x 128 score matrices in registers at once.
+
+Decision:
+- Use the NCU result to screen a narrower producer-kernel improvement first.
+  Do not replace cuDNN SDPA or tensor-core GEMMs wholesale without an isolated
+  screen.
+
+### Round 28 - rejected preweighted/tuned local-bias producer
+
+Status: rejected and reverted
+
+Hypothesis:
+- The NCU top launch was `_project_local_attention_bias_kernel`.
+  Precomputing the tiny `layernorm_weight * linear_weight` vectors once per
+  parameter version and retuning the Triton program width/warps might reduce
+  scalar weight-load and scheduler pressure in that launch.
+
+Change:
+- Added an opt-in preweighted local-bias projection kernel and temporary
+  screening tunables in commits `181e453`, `ec82b8d`, and `58d7590`.
+- The candidate setting was
+  `PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS_PREWEIGHT=1`,
+  `PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS_BLOCK_SIZE=256`,
+  `PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS_NUM_WARPS=8`.
+
+Isolated screens:
+- Preweight screen:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round40_preweighted_bias_hotspot_20260701_014311`.
+- Block/warp micro-sweep:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round42_bias_kernel_sweep_20260701_014604`.
+- Best hotspot:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round43_bias_best_hotspots_20260701_014708`.
+
+Hotspot results:
+
+| shape | metric | current promoted | best candidate | delta | parity |
+| --- | --- | ---: | ---: | ---: | --- |
+| N640 | bias producer only | 7.774 ms | 5.034 ms | -35.2% | max bias diff `0.015625` |
+| N640 | full local-attention block | 12.799 ms | 10.312 ms | -19.4% | max output diff `0.0078125` |
+| N640 | full atom transformer block | 23.239 ms | 20.747 ms | -10.7% | finite |
+
+Representative full gates:
+- Four single-item paired gate:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round44_tuned_bias_full_gate_20260701_014912`.
+- Lower-noise repeat-3 gate:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round45_tuned_bias_repeat3_gate_20260701_020655`.
+
+| gate | variant | aggregate samples/sec | forward samples/sec | forward sec | peak allocated MiB | finite coords |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| round44 mean of two | old producer | 7.108 | 7.129 | 89.778 | 30788 | yes |
+| round44 mean of two | tuned producer | 7.176 | 7.197 | 88.928 | 30788 | yes |
+| round45 repeat-3 | old producer | 7.180 | 7.215 | 266.118 total | 30788 | yes |
+| round45 repeat-3 | tuned producer | 7.164 | 7.199 | 266.691 total | 30788 | yes |
+
+Interpretation:
+- The isolated kernel and block wins are real, but the stronger full-workload
+  repeat rejected the default: tuned was `-0.22%` aggregate and `-0.21%`
+  mean forward throughput versus the current promoted producer.
+- The reason is scope. The atom local-attention block is a small part of the
+  full `N_sample=640` inference path; the repeat-3 component timings show
+  diffusion atom encoder/decoder and trunk transformer times were essentially
+  unchanged. The initial single-item gain was dominated by confidence/pairformer
+  noise, not the intended atom-local component.
+
+Decision:
+- Rejected. Reverted the preweighted kernel, temporary tunables, and default
+  change in `bdf617c`, `2698b70`, and `f45189b`.
+- Keep the Round 25 fused local-bias producer as the promoted implementation.
+
+Next:
+- Do not spend more time shaving the atom local-bias producer unless the target
+  workload changes to one where atom transformer blocks dominate. The next
+  full-workload bottlenecks are the diffusion trunk transformer, confidence
+  summary/pairformer work, and broad memory-bound LN/gating paths.
