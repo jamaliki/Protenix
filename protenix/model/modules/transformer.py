@@ -34,6 +34,9 @@ from protenix.model.modules.fused_elementwise_triton import (
     fused_sigmoid_mul_add,
     fused_silu_mul,
 )
+from protenix.model.modules.fused_transition_linear_triton import (
+    triton_silu_mul_linear,
+)
 from protenix.model.modules.local_attention_bias_triton import (
     triton_project_local_attention_bias,
 )
@@ -636,10 +639,14 @@ class ConditionedTransitionBlock(nn.Module):
                 [..., N, c_a]
         """
         a = self.adaln(a, s)
-        b = fused_silu_mul(self.linear_nobias_a1(a), self.linear_nobias_a2(a))
+        a1 = self.linear_nobias_a1(a)
+        a2 = self.linear_nobias_a2(a)
+        projected = triton_silu_mul_linear(a1, a2, self.linear_nobias_b.weight)
+        if projected is None:
+            b = fused_silu_mul(a1, a2)
+            projected = self.linear_nobias_b(b)
         # Output projection (from adaLN-Zero [27])
         gate = self.linear_s(s)
-        projected = self.linear_nobias_b(b)
         if residual is not None:
             a = fused_sigmoid_mul_add(gate, projected, residual)
         else:
