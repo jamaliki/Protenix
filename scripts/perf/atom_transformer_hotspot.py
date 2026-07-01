@@ -77,7 +77,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--profile-target",
+        choices=["none", "attention", "transition", "block"],
+        default="none",
+        help="Capture one warmed target path with CUDA profiler APIs for NCU.",
+    )
+    parser.add_argument(
+        "--profile-iters",
+        type=int,
+        default=1,
+        help="Number of target calls inside the CUDA profiler capture range.",
+    )
     return parser.parse_args()
+
+
+def cuda_profile_capture(
+    name: str,
+    fn,
+    warmup: int,
+    iters: int,
+) -> torch.Tensor:
+    with torch.inference_mode():
+        for _ in range(warmup):
+            out = fn()
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push(name)
+        torch.cuda.cudart().cudaProfilerStart()
+        for _ in range(iters):
+            out = fn()
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+        torch.cuda.nvtx.range_pop()
+    return out
 
 
 def main() -> None:
@@ -121,6 +153,31 @@ def main() -> None:
                 n_queries=args.n_queries,
                 n_keys=args.n_keys,
             )[0]
+
+    if args.profile_target != "none":
+        profile_fns = {
+            "attention": run_attention,
+            "transition": run_transition,
+            "block": run_block,
+        }
+        out = cuda_profile_capture(
+            args.profile_target,
+            profile_fns[args.profile_target],
+            args.warmup,
+            args.profile_iters,
+        )
+        row = {
+            "args": vars(args),
+            "device": torch.cuda.get_device_name(),
+            "target": args.profile_target,
+            "out_shape": list(out.shape),
+            "out_all_finite": bool(torch.isfinite(out).all().item()),
+            "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
+            "peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
+            "timestamp": time.time(),
+        }
+        print(json.dumps(row, indent=2, sort_keys=True))
+        return
 
     transition_out, transition_ms = cuda_time(
         run_transition, args.warmup, args.iters
