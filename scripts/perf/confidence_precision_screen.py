@@ -158,6 +158,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def serializable_args(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+
+
 def make_feature_dict(args: argparse.Namespace, device: torch.device) -> dict[str, torch.Tensor]:
     rep_mask = torch.zeros(args.atoms, device=device, dtype=torch.bool)
     rep_mask[: args.tokens] = True
@@ -407,7 +414,13 @@ def main() -> None:
         torch.cuda.synchronize()
         torch.cuda.cudart().cudaProfilerStop()
         torch.cuda.nvtx.range_pop()
-        print(json.dumps({"args": vars(args), "out": output_meta(out), "load": load_info}, indent=2, sort_keys=True))
+        print(
+            json.dumps(
+                {"args": serializable_args(args), "out": output_meta(out), "load": load_info},
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return
 
     if args.reference_mode not in args.modes:
@@ -447,7 +460,7 @@ def main() -> None:
         trace = aggregate_trace(records, args.trace_row_limit)
 
     print(json.dumps({
-        "args": vars(args),
+        "args": serializable_args(args),
         "checkpoint": load_info,
         "device": torch.cuda.get_device_name(),
         "modes": MODE_CONFIGS,
