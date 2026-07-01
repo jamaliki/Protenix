@@ -71,15 +71,6 @@ def attention_force_fp32() -> bool:
     }
 
 
-def fused_self_qkv_enabled() -> bool:
-    return os.getenv("PROTENIX_FUSED_SELF_QKV", "0").lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
-
-
 _NON_CUDNN_SDPA_BACKENDS = [
     SDPBackend.FLASH_ATTENTION,
     SDPBackend.EFFICIENT_ATTENTION,
@@ -851,70 +842,6 @@ class Attention(nn.Module):
             # zero init the output layer
             nn.init.zeros_(self.linear_o.weight)
 
-    def _can_fuse_self_qkv(self, q_x: torch.Tensor, kv_x: torch.Tensor) -> bool:
-        return (
-            fused_self_qkv_enabled()
-            and not self.training
-            and not torch.is_grad_enabled()
-            and q_x is kv_x
-            and self.c_q == self.c_k == self.c_v
-            and self.linear_q.weight.shape == self.linear_k.weight.shape
-            and self.linear_q.weight.shape == self.linear_v.weight.shape
-            and self.linear_q.weight.device == self.linear_k.weight.device
-            and self.linear_q.weight.device == self.linear_v.weight.device
-            and self.linear_q.weight.dtype == self.linear_k.weight.dtype
-            and self.linear_q.weight.dtype == self.linear_v.weight.dtype
-            and self.linear_q.precision is None
-            and self.linear_k.precision is None
-            and self.linear_v.precision is None
-        )
-
-    def _fused_qkv_cache_key(self) -> tuple:
-        q_bias = self.linear_q.bias
-        return (
-            self.linear_q.weight.data_ptr(),
-            self.linear_k.weight.data_ptr(),
-            self.linear_v.weight.data_ptr(),
-            None if q_bias is None else q_bias.data_ptr(),
-            self.linear_q.weight._version,
-            self.linear_k.weight._version,
-            self.linear_v.weight._version,
-            None if q_bias is None else q_bias._version,
-            self.linear_q.weight.device,
-            self.linear_q.weight.dtype,
-        )
-
-    def _fused_self_qkv(self, q_x: torch.Tensor) -> Optional[torch.Tensor]:
-        cache_key = self._fused_qkv_cache_key()
-        weight = getattr(self, "_fused_qkv_weight", None)
-        bias = getattr(self, "_fused_qkv_bias", None)
-        if getattr(self, "_fused_qkv_key", None) != cache_key:
-            with torch.no_grad():
-                weight = torch.cat(
-                    [
-                        self.linear_q.weight,
-                        self.linear_k.weight,
-                        self.linear_v.weight,
-                    ],
-                    dim=0,
-                )
-                q_bias = self.linear_q.bias
-                if q_bias is None:
-                    bias = None
-                else:
-                    bias = torch.cat(
-                        [
-                            q_bias,
-                            torch.zeros_like(q_bias),
-                            torch.zeros_like(q_bias),
-                        ],
-                        dim=0,
-                    )
-            self._fused_qkv_key = cache_key
-            self._fused_qkv_weight = weight
-            self._fused_qkv_bias = bias
-        return F.linear(q_x, weight, bias)
-
     def _prep_qkv(
         self, q_x: torch.Tensor, kv_x: torch.Tensor, apply_scale: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -933,13 +860,9 @@ class Attention(nn.Module):
                 # [..., H, Q/K/V, C_hidden]
         """
         # [*, Q/K/V, H * C_hidden]
-        if self._can_fuse_self_qkv(q_x, kv_x):
-            qkv = self._fused_self_qkv(q_x)
-            q, k, v = qkv.split(self.c_hidden * self.num_heads, dim=-1)
-        else:
-            q = self.linear_q(q_x)
-            k = self.linear_k(kv_x)
-            v = self.linear_v(kv_x)
+        q = self.linear_q(q_x)
+        k = self.linear_k(kv_x)
+        v = self.linear_v(kv_x)
 
         # [*, Q/K/V, H, C_hidden]
         q = q.view(q.shape[:-1] + (self.num_heads, -1))
