@@ -235,7 +235,16 @@ class AttentionPairBias(nn.Module):
             weight = (self.linear_nobias_z.weight * self.layernorm_z.weight[None, :])[
                 :, :, None, None
             ]
-            bias = F.conv2d(z, weight)
+            if z.dim() > 4:
+                # Efficient diffusion passes z in channel-first form
+                # [..., c_z, N_token, N_token].  conv2d only accepts one batch
+                # axis, so flatten protein/sample axes for the 1x1 projection
+                # and restore them for attention broadcasting.
+                leading_shape = z.shape[:-3]
+                bias = F.conv2d(z.flatten(0, -4), weight)
+                bias = bias.reshape(*leading_shape, *bias.shape[-3:])
+            else:
+                bias = F.conv2d(z, weight)
         else:
             bias = self.linear_nobias_z(self.layernorm_z(z))
             bias = permute_final_dims(
