@@ -57,18 +57,16 @@ export PROTENIX_BF16_ATOM_ATTENTION=1
 export PROTENIX_SUMMARY_SAMPLE_CHUNK_SIZE=32
 ```
 
-Best measured one-H100 throughput so far is `7.484` end-to-end samples/sec and
-`7.507` forward samples/sec at
-`N_sample=640`, `N_step=200`, true unchunked diffusion on the 7r6r benchmark
-input after the fused local-attention pair-bias projection and chunked
-confidence-summary processing. This is `14.17x` over the original per-GPU
-default aggregate baseline of `0.528` samples/sec.
-The previous `N_sample=960` run measured `6.863` samples/sec before the
-one-warp and fused-bias retunes, while reserving `73.8 GiB` instead of
-`50.0 GiB`; repeat N960 before claiming the retunes change the high-memory best
-point. The goal remains open because the remaining profile still contains
-material tensor-core GEMM, cuDNN SDPA, local-attention, LayerNorm, and
-elementwise/copy work.
+Safe measured one-H100 throughput so far is `7.484` end-to-end samples/sec and
+`7.507` forward samples/sec at `N_sample=640`, `N_step=200`, true unchunked
+diffusion on the 7r6r benchmark input after the fused local-attention pair-bias
+projection and chunked confidence-summary processing. The max-throughput
+high-memory point is `N_sample=960` with `7.565` end-to-end samples/sec and
+`7.581` forward samples/sec, while reserving `73.6 GiB`; this is `14.33x` over
+the original per-GPU default aggregate baseline of `0.528` samples/sec. The
+goal remains open because the remaining profile still contains material
+tensor-core GEMM, cuDNN SDPA, local-attention, LayerNorm, and elementwise/copy
+work.
 
 ## Running report
 
@@ -1743,3 +1741,42 @@ Next:
 - Re-run the high-memory N960 point with the promoted summary chunk, because
   summary chunking keeps peak allocation unchanged at N640 and may improve the
   previous N960 result without approaching the full-output memory cliff.
+
+### Round 34 - high-memory N960 check after summary chunking
+
+Status: diagnostic; max-throughput point updated
+
+Question:
+- Once post-confidence summary processing is batched, does increasing
+  `N_sample` beyond the safe N640 point finally improve per-GPU throughput?
+
+Experiment:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round58_n960_summary_chunk32_gate_20260701_040416`.
+- Workload: one H100, `N_sample=960`, `N_step=200`, `N_cycle=10`, unchunked
+  diffusion, promoted kernel flags, `PROTENIX_SUMMARY_SAMPLE_CHUNK_SIZE=32`.
+
+Result:
+
+| N_sample | forward sec | forward samples/sec | end-to-end samples/sec | summary confidence | peak allocated MiB | peak reserved MiB | finite coords |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 960 | 126.631 | 7.581 | 7.565 | 1.590 s | 45027 | 73558 | yes |
+
+Interpretation:
+- Higher batch does help once the summary wrapper is fixed, but only modestly:
+  N960 is about `+1.1%` end-to-end throughput versus the N640 chunk-32 full
+  gate (`7.565` vs `7.484` samples/sec).
+- The cost is memory headroom. Peak allocated rises from `30.8 GiB` to
+  `45.0 GiB`, and peak reserved reaches `73.6 GiB` on an 80 GB H100. This is
+  usable for max-throughput single-job runs but fragile for additional memory
+  pressure, different inputs, larger token counts, or allocator fragmentation.
+
+Decision:
+- Keep `N_sample=640` as the safe high-throughput default in the run block.
+- Record `N_sample=960` as the current max-throughput/high-memory point when
+  the workload can tolerate running close to the 80 GB memory cliff.
+
+Next:
+- Do not retry normal N1280 without first changing confidence-logit
+  materialization; the known failure mode is the full FP32 PAE/PDE stack, not
+  the now-fixed summary wrapper.
