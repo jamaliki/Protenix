@@ -43,6 +43,13 @@ def _can_broadcast_diffusion_s(
     module: nn.Module,
     t_hat_noise_level: torch.Tensor,
 ) -> bool:
+    """Return True when diffusion conditioning is identical for every sample.
+
+    In sampling, all structures in the same denoising step usually share the
+    same scalar noise level.  If that scalar was expanded to ``N_sample`` lanes,
+    the conditioning block would redo identical work for each sample.  Keeping
+    a singleton sample lane lets later tensor ops broadcast the result instead.
+    """
     if not broadcast_diffusion_s_enabled():
         return False
     if module.training or torch.is_grad_enabled():
@@ -406,6 +413,9 @@ class DiffusionModule(nn.Module):
         return torch.bfloat16
 
     def _diffusion_core_autocast(self):
+        # Precision is a local performance knob.  The token diffusion core was
+        # profiled as safe and faster in BF16, but the flag keeps default
+        # behavior unchanged and gives unsupported GPUs a clean fallback.
         if (
             os.getenv("PROTENIX_BF16_DIFFUSION_CORE", "0").lower()
             in {"0", "false", "off", "no"}
@@ -415,6 +425,9 @@ class DiffusionModule(nn.Module):
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
     def _atom_attention_autocast(self):
+        # Atom attention dominates traffic at high sample counts.  BF16 reduces
+        # memory bandwidth pressure; guards keep this inference-only opt-in from
+        # affecting training unless explicitly requested by the environment.
         if (
             os.getenv("PROTENIX_BF16_ATOM_ATTENTION", "0").lower()
             in {"0", "false", "off", "no"}

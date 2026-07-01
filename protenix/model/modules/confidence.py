@@ -314,7 +314,15 @@ class ConfidenceHead(nn.Module):
         chunk_size: Optional[int] = None,
         sample_chunk_size: Optional[int] = None,
     ):
-        """Yield confidence logits in sample chunks without materializing all logits."""
+        """Yield confidence logits in sample chunks.
+
+        PAE/PDE logits have shape ``[N_sample, N_token, N_token, bins]`` and
+        are produced once per generated structure.  At high sample counts those
+        logits are useful outputs, but materializing the whole batch at once is
+        unnecessary when the caller only needs to immediately compute summary
+        confidence/full-data records.  This iterator keeps confidence
+        same-output while bounding the live logit tensors.
+        """
 
         if self.stop_gradient:
             s_inputs = s_inputs.detach()

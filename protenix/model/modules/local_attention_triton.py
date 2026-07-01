@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Guarded Triton forward kernel for atom local attention.
+
+The atom transformer repeatedly applies a small fixed-window attention:
+32 query atoms attend over a 128-key local neighborhood with head dimension 32.
+That shape is stable enough to specialize, and small enough that generic SDPA
+does not always map efficiently to H100.  The wrapper below is deliberately
+narrow: unsupported shapes return ``None`` so callers use the original PyTorch
+path.  This keeps the optimized path easy to reason about and avoids changing
+training/autograd behavior.
+"""
+
 from __future__ import annotations
 
 import os

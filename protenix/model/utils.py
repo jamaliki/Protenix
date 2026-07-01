@@ -37,6 +37,14 @@ def gpu_random_augmentation_enabled() -> bool:
 
 
 def uniform_random_rotation_gpu(N_sample: int, device: torch.device) -> torch.Tensor:
+    """Generate uniformly random rotation matrices directly on the GPU.
+
+    The original inference path generated rotations with SciPy on the CPU and
+    then copied them to CUDA.  That is fine for small sample counts, but for
+    high-throughput inference the host round trip becomes visible.  This uses
+    the standard random-unit-quaternion construction and keeps the augmentation
+    data on the same device as the coordinates.
+    """
     u = torch.rand((N_sample, 3), device=device, dtype=torch.float32)
     sqrt_u1 = torch.sqrt(u[:, 0])
     sqrt_one_minus_u1 = torch.sqrt(1.0 - u[:, 0])

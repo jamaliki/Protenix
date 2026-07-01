@@ -12,6 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Small Triton kernels for memory-bound inference gates.
+
+These helpers intentionally fuse only simple elementwise expressions such as
+``sigmoid(x) * y`` and ``sigmoid(x) * y + z``.  Those expressions are cheap in
+FLOPs but expensive in memory traffic when written as separate PyTorch ops:
+each intermediate tensor is written to and reread from HBM.  A one-pass Triton
+kernel is useful here because it removes intermediate memory traffic without
+trying to replace cuBLAS/cuDNN kernels that are already highly optimized.
+
+Every public helper falls back to the original PyTorch expression when the
+shape, dtype, device, or autograd mode is outside the profiled inference path.
+"""
+
 from __future__ import annotations
 
 import os
@@ -88,6 +101,10 @@ def _can_use_first_dim_broadcast_triton(
         return False
     if not x.is_contiguous() or not y.is_contiguous():
         return False
+    # The high-throughput diffusion path often has a gate tensor with sample
+    # dimension 1 and an activation tensor with sample dimension N_sample.  Let
+    # the kernel broadcast that first dimension instead of materializing the
+    # gate N_sample times.
     if x.dim() != 3 or y.dim() != 3:
         return False
     if x.shape[0] != 1 or y.shape[0] <= 1:

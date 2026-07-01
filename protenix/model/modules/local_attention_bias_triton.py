@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Fused pair-bias producer for atom local attention.
+
+The unfused path normalizes pair features, projects them to attention heads,
+then permutes to the local-attention bias layout.  At large ``N_sample`` those
+intermediates are bandwidth-heavy even though the math is small.  This kernel
+writes the final bias layout directly and removes the normalized intermediate.
+As with the attention kernel, it is inference-only and falls back for any
+unprofiled shape.
+"""
+
 from __future__ import annotations
 
 import os

@@ -374,6 +374,11 @@ class Protenix(nn.Module):
         """
         Runs confidence logits in sample chunks and immediately consumes them
         into summary/full-data outputs, avoiding full-batch PAE/PDE logits.
+
+        This is a memory optimization, not deferred confidence: all confidence
+        outputs are still computed in the same inference call.  The difference
+        is lifetime.  Instead of keeping every sample's large pairwise logits
+        alive until summary computation, each chunk is summarized and released.
         """
         return autocasting_disable_decorator(self.configs.skip_amp.confidence_head)(
             self._run_confidence_summary_stream
@@ -693,27 +698,6 @@ class Protenix(nn.Module):
         time_tracker.update({"diffusion": step_diffusion - step_trunk})
         if hasattr(self.diffusion_module, "consume_perf_stats"):
             time_tracker.update(self.diffusion_module.consume_perf_stats())
-
-        coordinate_only = (
-            _env_flag_enabled("PROTENIX_COORDINATE_ONLY")
-            and not self.training
-            and mode == "inference"
-            and label_dict is None
-            and symmetric_permutation is None
-        )
-        if coordinate_only:
-            time_tracker.update(
-                {
-                    "contact_probs": 0.0,
-                    "confidence_head": 0.0,
-                    "confidence": 0.0,
-                    "summary_confidence": 0.0,
-                    "model_forward": step_diffusion - step_st,
-                    "model_forward_with_summary": step_diffusion - step_st,
-                    "coordinate_only": True,
-                }
-            )
-            return pred_dict, log_dict, time_tracker
 
         # Distogram logits: log contact_probs only, to reduce the dimension
         pred_dict["contact_probs"] = autocasting_disable_decorator(True)(
