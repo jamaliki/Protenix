@@ -223,6 +223,29 @@ if triton_fused_elementwise_available():
         out = x * (1.0 / (1.0 + tl.exp(-x))) * y
         tl.store(out_ptr + offsets, out, mask=mask)
 
+    @triton.jit
+    def _silu_mul_split_kernel(
+        x_ptr,
+        out_ptr,
+        n_elements: tl.constexpr,
+        split_size: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = pid * block_size + tl.arange(0, block_size)
+        mask = offsets < n_elements
+        cols = offsets % split_size
+        rows = offsets // split_size
+        row_base = rows * (2 * split_size)
+        a = tl.load(x_ptr + row_base + cols, mask=mask, other=0.0).to(tl.float32)
+        b = tl.load(
+            x_ptr + row_base + split_size + cols,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        out = a * (1.0 / (1.0 + tl.exp(-a))) * b
+        tl.store(out_ptr + offsets, out, mask=mask)
+
 
 def _grid(n_elements: int) -> tuple[int]:
     return (triton.cdiv(n_elements, _BLOCK_SIZE),)
@@ -289,6 +312,32 @@ def triton_silu_mul(x: torch.Tensor, y: torch.Tensor) -> Optional[torch.Tensor]:
     return out
 
 
+def triton_silu_mul_split(
+    x: torch.Tensor,
+    split_size: int,
+) -> Optional[torch.Tensor]:
+    if not triton_fused_elementwise_enabled():
+        return None
+    if not triton_fused_elementwise_available():
+        return None
+    if torch.is_grad_enabled():
+        return None
+    if not x.is_cuda or x.dtype not in _SUPPORTED_DTYPES or not x.is_contiguous():
+        return None
+    if x.shape[-1] != 2 * split_size or x.numel() == 0:
+        return None
+    out = torch.empty((*x.shape[:-1], split_size), dtype=x.dtype, device=x.device)
+    _silu_mul_split_kernel[_grid(out.numel())](
+        x,
+        out,
+        out.numel(),
+        split_size,
+        block_size=_BLOCK_SIZE,
+        num_warps=4,
+    )
+    return out
+
+
 def fused_sigmoid_mul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = triton_sigmoid_mul(x, y)
     if out is not None:
@@ -312,3 +361,11 @@ def fused_silu_mul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     if out is not None:
         return out
     return F.silu(x) * y
+
+
+def fused_silu_mul_split(x: torch.Tensor, split_size: int) -> torch.Tensor:
+    out = triton_silu_mul_split(x, split_size)
+    if out is not None:
+        return out
+    a, b = x.split(split_size, dim=-1)
+    return F.silu(a) * b

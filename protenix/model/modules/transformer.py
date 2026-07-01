@@ -33,6 +33,7 @@ from protenix.model.modules.fused_elementwise_triton import (
     fused_sigmoid_mul,
     fused_sigmoid_mul_add,
     fused_silu_mul,
+    fused_silu_mul_split,
 )
 from protenix.model.modules.local_attention_bias_triton import (
     triton_project_local_attention_bias,
@@ -716,13 +717,14 @@ class ConditionedTransitionBlock(nn.Module):
         a = self.adaln(a, s)
         if self._can_fuse_input_projection(a):
             hidden = self.n * self.c_a
-            a1, a2 = F.linear(a, self._input_projection_params()).split(
-                hidden, dim=-1
+            b = fused_silu_mul_split(
+                F.linear(a, self._input_projection_params()),
+                hidden,
             )
         else:
             a1 = self.linear_nobias_a1(a)
             a2 = self.linear_nobias_a2(a)
-        b = fused_silu_mul(a1, a2)
+            b = fused_silu_mul(a1, a2)
         # Output projection (from adaLN-Zero [27])
         gate = self.linear_s(s)
         projected = self.linear_nobias_b(b)
