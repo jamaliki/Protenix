@@ -30,6 +30,10 @@ except ImportError:  # pragma: no cover - optional runtime dependency.
 
 _SUPPORTED_DTYPES = {torch.float32, torch.bfloat16}
 _BLOCK_SIZE = 256
+_PREWEIGHT_CACHE: dict[
+    tuple[int, int, int, int, torch.dtype, torch.device],
+    tuple[torch.Tensor, torch.Tensor],
+] = {}
 
 
 def triton_fused_local_attention_bias_enabled() -> bool:
@@ -46,6 +50,41 @@ def triton_fused_local_attention_bias_enabled() -> bool:
 
 def triton_fused_local_attention_bias_available() -> bool:
     return triton is not None and tl is not None
+
+
+def triton_preweighted_local_attention_bias_enabled() -> bool:
+    value = os.getenv("PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS_PREWEIGHT", "0")
+    return value.lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
+def _get_preweighted_bias_projection(
+    layernorm_weight: torch.Tensor,
+    linear_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (
+        layernorm_weight.data_ptr(),
+        linear_weight.data_ptr(),
+        getattr(layernorm_weight, "_version", 0),
+        getattr(linear_weight, "_version", 0),
+        linear_weight.dtype,
+        linear_weight.device,
+    )
+    cached = _PREWEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    with torch.no_grad():
+        fused_weight = (
+            linear_weight.float() * layernorm_weight.float()[None, :]
+        ).contiguous()
+        weight_sum = fused_weight.sum(dim=-1).contiguous()
+    _PREWEIGHT_CACHE[key] = (fused_weight, weight_sum)
+    return fused_weight, weight_sum
 
 
 if triton_fused_local_attention_bias_available():
@@ -154,6 +193,97 @@ if triton_fused_local_attention_bias_available():
             )
             tl.store(out_offsets, projected, mask=mask)
 
+    @triton.jit
+    def _project_local_attention_bias_preweighted_kernel(
+        z_ptr,
+        fused_weight_ptr,
+        weight_sum_ptr,
+        out_ptr,
+        total_pairs: tl.constexpr,
+        n_trunks: tl.constexpr,
+        n_queries: tl.constexpr,
+        n_keys: tl.constexpr,
+        c_z: tl.constexpr,
+        n_heads: tl.constexpr,
+        z_stride_s: tl.constexpr,
+        z_stride_t: tl.constexpr,
+        z_stride_q: tl.constexpr,
+        z_stride_k: tl.constexpr,
+        z_stride_c: tl.constexpr,
+        out_stride_s: tl.constexpr,
+        out_stride_h: tl.constexpr,
+        out_stride_t: tl.constexpr,
+        out_stride_q: tl.constexpr,
+        out_stride_k: tl.constexpr,
+        eps: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = (pid * block_size + tl.arange(0, block_size)).to(tl.int64)
+        mask = offsets < total_pairs
+
+        key = offsets % n_keys
+        tmp = offsets // n_keys
+        query = tmp % n_queries
+        tmp = tmp // n_queries
+        trunk = tmp % n_trunks
+        sample = tmp // n_trunks
+
+        z_base = (
+            z_ptr
+            + sample * z_stride_s
+            + trunk * z_stride_t
+            + query * z_stride_q
+            + key * z_stride_k
+        )
+
+        sum_z = tl.zeros((block_size,), tl.float32)
+        sum_z2 = tl.zeros((block_size,), tl.float32)
+        weighted0 = tl.zeros((block_size,), tl.float32)
+        weighted1 = tl.zeros((block_size,), tl.float32)
+        weighted2 = tl.zeros((block_size,), tl.float32)
+        weighted3 = tl.zeros((block_size,), tl.float32)
+        for c in range(0, c_z):
+            z_c = tl.load(
+                z_base + c * z_stride_c,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+            w0 = tl.load(fused_weight_ptr + c).to(tl.float32)
+            w1 = tl.load(fused_weight_ptr + c_z + c).to(tl.float32)
+            w2 = tl.load(fused_weight_ptr + 2 * c_z + c).to(tl.float32)
+            w3 = tl.load(fused_weight_ptr + 3 * c_z + c).to(tl.float32)
+            sum_z += z_c
+            sum_z2 += z_c * z_c
+            weighted0 += z_c * w0
+            weighted1 += z_c * w1
+            weighted2 += z_c * w2
+            weighted3 += z_c * w3
+
+        inv_c = 1.0 / c_z
+        mean = sum_z * inv_c
+        var = sum_z2 * inv_c - mean * mean
+        rstd = tl.rsqrt(var + eps)
+
+        for head in range(0, 4):
+            if head == 0:
+                projected = (weighted0 - mean * tl.load(weight_sum_ptr)) * rstd
+            elif head == 1:
+                projected = (weighted1 - mean * tl.load(weight_sum_ptr + 1)) * rstd
+            elif head == 2:
+                projected = (weighted2 - mean * tl.load(weight_sum_ptr + 2)) * rstd
+            else:
+                projected = (weighted3 - mean * tl.load(weight_sum_ptr + 3)) * rstd
+            out_offsets = (
+                out_ptr
+                + sample * out_stride_s
+                + head * out_stride_h
+                + trunk * out_stride_t
+                + query * out_stride_q
+                + key * out_stride_k
+            )
+            tl.store(out_offsets, projected, mask=mask)
+
 
 def triton_project_local_attention_bias(
     z: torch.Tensor,
@@ -228,31 +358,62 @@ def triton_project_local_attention_bias(
     )
     total_pairs = n_sample * n_trunks * n_queries * n_keys
     grid = (triton.cdiv(total_pairs, _BLOCK_SIZE),)
-    _project_local_attention_bias_kernel[grid](
-        z_flat,
-        layernorm_weight,
-        linear_weight,
-        out,
-        total_pairs,
-        n_trunks,
-        n_queries,
-        n_keys,
-        c_z,
-        n_heads,
-        z_flat.stride(0),
-        z_flat.stride(1),
-        z_flat.stride(2),
-        z_flat.stride(3),
-        z_flat.stride(4),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        out.stride(3),
-        out.stride(4),
-        eps,
-        block_size=_BLOCK_SIZE,
-        num_warps=4,
-    )
+    if triton_preweighted_local_attention_bias_enabled():
+        fused_weight, weight_sum = _get_preweighted_bias_projection(
+            layernorm_weight,
+            linear_weight,
+        )
+        _project_local_attention_bias_preweighted_kernel[grid](
+            z_flat,
+            fused_weight,
+            weight_sum,
+            out,
+            total_pairs,
+            n_trunks,
+            n_queries,
+            n_keys,
+            c_z,
+            n_heads,
+            z_flat.stride(0),
+            z_flat.stride(1),
+            z_flat.stride(2),
+            z_flat.stride(3),
+            z_flat.stride(4),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            out.stride(4),
+            eps,
+            block_size=_BLOCK_SIZE,
+            num_warps=4,
+        )
+    else:
+        _project_local_attention_bias_kernel[grid](
+            z_flat,
+            layernorm_weight,
+            linear_weight,
+            out,
+            total_pairs,
+            n_trunks,
+            n_queries,
+            n_keys,
+            c_z,
+            n_heads,
+            z_flat.stride(0),
+            z_flat.stride(1),
+            z_flat.stride(2),
+            z_flat.stride(3),
+            z_flat.stride(4),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            out.stride(4),
+            eps,
+            block_size=_BLOCK_SIZE,
+            num_warps=4,
+        )
     if not batch_shape:
         return out[0]
     return out.reshape(*batch_shape, n_heads, n_trunks, n_queries, n_keys)
