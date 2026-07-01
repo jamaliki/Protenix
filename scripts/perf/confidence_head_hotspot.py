@@ -75,7 +75,7 @@ def profile_cuda_ops(
         torch.cuda.synchronize()
     rows = []
     for event in profiler.key_averages():
-        cuda_us = float(getattr(event, "cuda_time_total", 0.0) or 0.0)
+        cuda_us = float(getattr(event, "cuda_time_total", 0.0) or getattr(event, "device_time_total", 0.0) or 0.0)
         if cuda_us > 0:
             rows.append({"key": event.key, "count": event.count, "cuda_time_us": cuda_us})
     rows.sort(key=lambda row: row["cuda_time_us"], reverse=True)
