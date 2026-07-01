@@ -41,7 +41,9 @@ Use the following for the current best high-throughput 7r6r-style inference
 path:
 
 ```bash
-export N_SAMPLE=320
+# Safe high-throughput default. Use N_SAMPLE=960 only for max-throughput
+# runs that can tolerate running close to the 80 GB memory cliff.
+export N_SAMPLE=640
 export SAMPLE_DIFFUSION_CHUNK_SIZE=none
 export CHUNK_SIZE=none
 export PROTENIX_GPU_RANDOM_AUGMENT=1
@@ -53,12 +55,14 @@ export PROTENIX_TRITON_FUSED_ELEMENTWISE=1
 export PROTENIX_BF16_ATOM_ATTENTION=1
 ```
 
-Best measured one-H100 throughput so far is `6.642` aggregate samples/sec at
-`N_sample=320`, `N_step=200`, true unchunked diffusion on the 7r6r benchmark
-input. This is `12.58x` over the original per-GPU default aggregate baseline
-of `0.528` samples/sec. The goal remains open because the remaining profile
-still contains material tensor-core GEMM, cuDNN SDPA, local-attention,
-LayerNorm, and elementwise/copy work.
+Best measured one-H100 throughput so far is `6.863` aggregate samples/sec at
+`N_sample=960`, `N_step=200`, true unchunked diffusion on the 7r6r benchmark
+input. This is `13.00x` over the original per-GPU default aggregate baseline
+of `0.528` samples/sec. The safer recommended setting is `N_sample=640`,
+which measured `6.813` samples/sec while reserving `50.0 GiB` instead of
+`73.8 GiB`. The goal remains open because the remaining profile still contains
+material tensor-core GEMM, cuDNN SDPA, local-attention, LayerNorm, and
+elementwise/copy work.
 
 ## Running report
 
@@ -929,3 +933,150 @@ Next:
   Skipping or deferring confidence may be useful for design-only coordinate
   generation, but it changes the inference product and should not be counted as
   a default model throughput optimization without an explicit user decision.
+
+### Round 21 - N_sample saturation and the N1280 memory cliff
+
+Status: complete
+
+Hypothesis:
+- The memory headroom at `N_sample=320` might allow substantially larger sample
+  batches, further amortizing pairformer/feature overhead and increasing
+  throughput.
+
+Experiment:
+- One-H100 saturation sweep on commit `fef90a4`, current promoted stack after
+  Round 20, true unchunked diffusion, one warmup 7r6r item and one timed 7r6r
+  item per shape.
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round22_nsample_saturation_20260630_233243`.
+
+Results:
+| N_sample | aggregate samples/sec | forward samples/sec | forward sec | confidence | diffusion | transformer | peak allocated MiB | peak reserved MiB | notes |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 320 | 6.515 | 6.551 | 48.850 | 5.682 s | 36.737 s | 21.714 s | 16549 | 26242 | finite |
+| 640 | 6.813 | 6.832 | 93.675 | 11.030 s | 72.958 s | 43.437 s | 30788 | 50032 | finite |
+| 960 | 6.863 | 6.876 | 139.608 | 16.659 s | 109.145 s | 65.146 s | 45027 | 73820 | finite; best throughput but little memory margin |
+| 1280 | failed | failed | - | - | - | - | - | - | OOM in confidence `pde_preds = torch.stack(...)` |
+
+Interpretation:
+- Larger batches help only weakly once `N_sample >= 640`. The fixed pairformer
+  and feature-prep costs are already amortized; diffusion and confidence scale
+  almost linearly with sample count.
+- `N_sample=1280` does not fail in the diffusion coordinate generator. It fails
+  when the full-output confidence path materializes large FP32 PAE/PDE logits:
+  `N_sample x N_token x N_token x 64` for each pair head. The failed allocation
+  was `18.32 GiB` with the process already using `65.71 GiB`.
+- The practical high-throughput setting is therefore not "as large as memory
+  permits". It is `N_sample=640` as a safe default, or `N_sample=960` when
+  accepting a narrow H100 80 GB memory margin for a small extra throughput gain.
+
+Decision:
+- Update the recommended stack to `N_sample=640` safe, with `N_sample=960` as
+  the current best measured single-run throughput.
+- Do not promote `N_sample=1280` without changing the confidence-output memory
+  behavior.
+
+### Round 22 - Nsight Compute roofline screen
+
+Status: complete
+
+Hypothesis:
+- If the remaining kernels are near peak tensor compute, then further large
+  "mega-kernel" rewrites are unlikely to help. If they are memory/locality or
+  latency limited, the next work should reduce traffic, launches, or improve
+  tiling rather than simply increase batch size.
+
+Setup:
+- Installed Nsight Compute in a separate micromamba environment:
+  `/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/nsight-compute/bin/ncu`.
+- Version: `2026.1.1.x` from `cuda-nsight-compute=12.4.1`.
+- Reports:
+  - Local attention:
+    `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round23_ncu_roofline_local_attention_20260630_235252/local_attention.ncu-rep`
+  - Trunk SDPA/GEMM:
+    `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round24_ncu_roofline_trunk_kernels_20260630_235337/`
+  - LayerNorm retry:
+    `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round25b_ncu_layernorm_roofline_20260630_235720/bf16_layernorm.ncu-rep`
+
+Results:
+| kernel | representative shape | duration | SM throughput | memory throughput | DRAM/L2/L1 signal | interpretation |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| Triton atom local attention | `N_sample=640`, 2529 atoms, BF16, 32x128 local windows | 5.10 ms | 32.2% | 91.5% | DRAM 21.7%, L1/TEX 91.5%, L2 47.5% | on-chip/L1 traffic limited, not tensor-compute limited |
+| cuDNN trunk flash SDPA | 640 x 245 tokens x 16 heads x head_dim 48 | 1.66 ms | 51.5% | 37.8% | DRAM 17.2%, L2 37.8% | not peak compute or HBM; likely latency/scheduler/shape efficiency |
+| BF16 tensor-core GEMM with bias | trunk GEMM family, `nvjet_sm90_tst_..._bias_TNN` | 163 us | 59.3% | 62.5% | DRAM 62.5%, L2 75.5%, 2.09 TB/s | compute/memory balanced; reduce both work and traffic |
+| BF16 fast LayerNorm | `LayerNormForwardV2<BFloat16, float4>` | 194 us | 54.4% | 73.5% | 2.46 TB/s, L2 73.0%, L1/TEX 29.0% | memory-bandwidth heavy; fusion/recompute can help more than more batching |
+
+Interpretation:
+- We are not hitting maximum tensor compute on the major remaining kernels.
+  The strongest owned kernel, atom local attention, is already near the L1/TEX
+  roof and only at about one third SM throughput. Bigger sample batches do not
+  fix that; better tiling/reuse or less bias/value traffic is required.
+- cuDNN SDPA is not saturating compute either, but the previous full-token
+  Triton replacement lost to cuDNN. The path forward is not a broad SDPA
+  replacement unless it preserves vendor-level tensor-core efficiency.
+- LayerNorm and elementwise/copy families remain plausible fusion targets
+  because their roofline position is memory/traffic dominated.
+
+Decision:
+- Use the roofline as a constraint on further "mega-kernel" work:
+  - local atom attention: optimize memory locality/reuse first;
+  - trunk attention: avoid replacing cuDNN SDPA wholesale;
+  - GEMM-heavy paths: only pursue epilogue-style fusions that preserve strong
+    tensor-core GEMMs;
+  - LayerNorm/elementwise: narrow fusion remains credible.
+
+### Round 23 - opt-in confidence pair-logit CPU offload
+
+Status: capacity mode kept; rejected as a throughput setting
+
+Hypothesis:
+- `N_sample=1280` fails because confidence materializes full PAE/PDE logits on
+  GPU. Offloading those pair logits to CPU as they are produced should make the
+  4x larger batch fit, proving whether batch size alone can improve throughput.
+
+Change:
+- Added `PROTENIX_CONFIDENCE_CPU_OFFLOAD=1`, extending Protenix's existing
+  large-token PAE/PDE CPU-offload behavior to high sample-count inference.
+- Added optional
+  `PROTENIX_CONFIDENCE_CPU_OFFLOAD_THRESHOLD_GIB=<float>` for size-triggered
+  offload.
+- Avoided `torch.cuda.empty_cache()` per sample for high-sample offload; the old
+  cache purge remains only for the original `N_token > 2000` path or when
+  `PROTENIX_CONFIDENCE_CPU_OFFLOAD_EMPTY_CACHE=1` is set.
+
+Experiments:
+- First N1280 offload run on `gpu-8` was cancelled after warmup because the
+  node was hot (`81-84 C`) and the initial implementation purged the CUDA
+  allocator cache per sample. Warmup throughput was only `2.98` samples/sec.
+- Corrected run on cool `gpu-14`, commit `c927824`, one warmup item and one
+  timed item, run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round27_confidence_offload_n1280_noempty_20260701_001110`.
+
+Results:
+| run | aggregate samples/sec | forward samples/sec | forward sec | confidence | diffusion | transformer | peak allocated MiB | peak reserved MiB | finite coords |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| N960, normal confidence | 6.863 | 6.876 | 139.608 | 16.659 s | 109.145 s | 65.146 s | 45027 | 73820 | yes |
+| N1280, confidence CPU offload | 6.472 | 6.480 | 197.536 | 30.864 s | 145.531 s | 87.314 s | 18073 | 21598 | yes |
+
+Interpretation:
+- The 4x-from-N320 batch can be made to fit; peak GPU allocation falls to
+  `18.1 GiB` because the giant PAE/PDE logits are no longer stacked on GPU.
+- It is not a throughput improvement. Diffusion scales almost linearly with the
+  extra samples and confidence becomes slower from CPU/GPU pair-logit traffic.
+- This confirms that higher batches do not help because the workload has little
+  fixed overhead left to amortize. The remaining bottlenecks are per-sample
+  diffusion transformer, atom attention, confidence pairformer, LayerNorm, and
+  elementwise/memory traffic.
+
+Decision:
+- Keep the offload path as an explicit capacity mode for users who need very
+  large `N_sample` runs to fit.
+- Do not include `PROTENIX_CONFIDENCE_CPU_OFFLOAD=1` or `N_sample=1280` in the
+  promoted throughput stack.
+
+Next:
+- For real throughput, do not spend more time increasing `N_sample` alone.
+  Work on the linear-scaling kernels: local-attention memory traffic,
+  LayerNorm/elementwise fusion, and confidence-summary/logit streaming that
+  computes only needed design scores without full pair-logit materialization
+  when that semantic tradeoff is acceptable.
