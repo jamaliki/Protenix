@@ -57,18 +57,6 @@ def _env_flag_enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _env_optional_bool(name: str) -> Optional[bool]:
-    value = os.environ.get(name)
-    if value is None or not value.strip():
-        return None
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"{name} must be a boolean value, got {value!r}")
-
-
 def _env_int(name: str) -> Optional[int]:
     value = os.environ.get(name)
     if value is None or not value.strip():
@@ -745,14 +733,6 @@ class Protenix(nn.Module):
             and label_dict is None
             and symmetric_permutation is None
         )
-        confidence_inplace_override = _env_optional_bool(
-            "PROTENIX_CONFIDENCE_INPLACE_SAFE"
-        )
-        confidence_inplace_safe = (
-            inplace_safe
-            if confidence_inplace_override is None
-            else (inplace_safe and confidence_inplace_override)
-        )
         if stream_confidence_summary:
             (
                 pred_dict["summary_confidence"],
@@ -770,7 +750,7 @@ class Protenix(nn.Module):
                 mode=mode,
                 triangle_multiplicative=self.configs.triangle_multiplicative,
                 triangle_attention=self.configs.triangle_attention,
-                inplace_safe=confidence_inplace_safe,
+                inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
                 sync_timings=sync_timings,
             )
@@ -808,7 +788,7 @@ class Protenix(nn.Module):
             x_pred_coords=pred_dict["coordinate"],
             triangle_multiplicative=self.configs.triangle_multiplicative,
             triangle_attention=self.configs.triangle_attention,
-            inplace_safe=confidence_inplace_safe,
+            inplace_safe=inplace_safe,
             chunk_size=chunk_size,
         )
 

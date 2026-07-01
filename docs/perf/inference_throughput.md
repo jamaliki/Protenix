@@ -3389,3 +3389,65 @@ Decision:
 - If that screen wins, add an opt-in production flag and gate it in the full
   same-output inference workload before promotion. If it loses, document and
   move on to a true pairformer-kernel design.
+
+### Round 61 - rejected confidence non-inplace override
+
+Status: rejected and reverted
+
+Hypothesis:
+- In inference, Protenix sets `inplace_safe=True`. The confidence head then
+  clones `s_trunk` and `z_trunk` before each per-sample pairformer call so the
+  pairformer can update its inputs in place. Round 60 showed copy/cast traffic
+  is material inside confidence. Forcing the confidence path alone to
+  non-inplace might avoid those per-sample clones and reduce confidence time.
+
+Change:
+- Commit `2843a6d` added a temporary opt-in
+  `PROTENIX_CONFIDENCE_INPLACE_SAFE=0` override for confidence only.
+- This commit was reverted after the full gate below because the workload
+  movement was below the promotion threshold.
+
+Isolated screen:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round124_confidence_inplace_screen_20260701_131427`.
+- Workload: synthetic confidence hotspot, 7r6r-style dimensions, one H100,
+  `--samples 32 --dtype float32 --warmup 5 --iters 20`, two repeats per mode.
+
+| mode | pairformer ms | full confidence-head sample ms | peak reserved MiB | interpretation |
+| --- | ---: | ---: | ---: | --- |
+| non-inplace/no clones | 16.263 | 16.760 | 6300 | faster in the isolated screen |
+| clone + inplace | 16.494 | 17.006 | 6220 | current real inference behavior |
+
+The isolated screen showed a real but small local win: about `1.4-1.5%` for one
+confidence sample. Because confidence is only about `42 s` of a `278 s`
+same-output forward at N2560, this predicted only a roughly `0.2%` full-run
+ceiling before noise.
+
+Full gate:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round125_confidence_no_inplace_n2560_gate_20260701_131851`.
+- Commit: `2843a6d`.
+- Workload: one H100, 7r6r input, `N_sample=2560`, `N_step=200`,
+  `N_cycle=10`, unchunked diffusion, current promoted stack, one warmup item
+  before the timed item, dump disabled.
+
+| variant | e2e samples/sec | forward samples/sec | forward sec | peak reserved MiB |
+| --- | ---: | ---: | ---: | ---: |
+| default confidence clone+inplace | 9.206 | 9.215 | 277.813 | 37120 |
+| `PROTENIX_CONFIDENCE_INPLACE_SAFE=0` | 9.214 | 9.223 | 277.572 | 37120 |
+
+Interpretation:
+- The candidate saved only `0.241 s` from a `277.8 s` forward and improved
+  end-to-end throughput by `0.08%`. That is below run-to-run noise and well
+  below the bar for carrying a new production flag.
+- This result confirms the scale model: avoiding confidence clones is a tidy
+  cleanup, not a material throughput lever. With confidence required, the next
+  real wins cannot come from confidence epilogues or clone micro-optimizations.
+
+Decision:
+- Reject and revert the production override.
+- Keep the hotspot harness switch because it is useful for future confidence
+  pairformer experiments.
+- Future same-output work should target the dominant diffusion/atom/trunk
+  kernels directly, or start a deliberate confidence-pairformer precision /
+  kernel campaign. Do not spend more time on confidence-head wrapper plumbing.
