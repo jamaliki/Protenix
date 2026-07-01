@@ -215,6 +215,7 @@ def main() -> None:
                 "PROTENIX_TRITON_FUSED_ATTENTION_RESIDUAL",
                 "PROTENIX_TRITON_FUSED_TRANSITION_RESIDUAL",
                 "PROTENIX_TRITON_FUSED_ELEMENTWISE",
+                "PROTENIX_FUSED_QKVG_PROJECTION",
             )
         },
         "q_shape": list(q.shape),

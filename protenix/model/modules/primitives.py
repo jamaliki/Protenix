@@ -73,6 +73,15 @@ def _local_attention_gate_fusion_requested() -> bool:
     }
 
 
+def fused_qkvg_projection_enabled() -> bool:
+    return os.getenv("PROTENIX_FUSED_QKVG_PROJECTION", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
 def attention_force_fp32() -> bool:
     return os.getenv("PROTENIX_ATTENTION_FORCE_FP32", "1").lower() not in {
         "0",
@@ -861,6 +870,62 @@ class Attention(nn.Module):
         if self.zero_init:
             # zero init the output layer
             nn.init.zeros_(self.linear_o.weight)
+        self._qkvg_cache_key = None
+        self._qkvg_weight = None
+        self._qkvg_bias = None
+
+    def _can_fuse_qkvg_projection(
+        self,
+        q_x: torch.Tensor,
+        kv_x: torch.Tensor,
+    ) -> bool:
+        if not fused_qkvg_projection_enabled():
+            return False
+        if torch.is_grad_enabled():
+            return False
+        if self.linear_g is None:
+            return False
+        if not q_x.is_cuda:
+            return False
+        if q_x.shape != kv_x.shape or q_x.stride() != kv_x.stride():
+            return False
+        if q_x.data_ptr() != kv_x.data_ptr():
+            return False
+        hidden = self.c_hidden * self.num_heads
+        return (
+            self.c_q == self.c_k == self.c_v
+            and self.linear_q.weight.shape == (hidden, self.c_q)
+            and self.linear_k.weight.shape == (hidden, self.c_q)
+            and self.linear_v.weight.shape == (hidden, self.c_q)
+            and self.linear_g.weight.shape == (hidden, self.c_q)
+        )
+
+    def _qkvg_params(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        assert self.linear_g is not None
+        weights = (
+            self.linear_q.weight,
+            self.linear_k.weight,
+            self.linear_v.weight,
+            self.linear_g.weight,
+        )
+        bias = self.linear_q.bias
+        cache_key = tuple((w.data_ptr(), w._version) for w in weights) + (
+            None if bias is None else (bias.data_ptr(), bias._version),
+        )
+        if cache_key != self._qkvg_cache_key:
+            # All four projections consume the same self-attention input.  One
+            # larger GEMM reads that input once, launches once, and gives cuBLAS
+            # a wider output tile.  We cache the concatenated weights because
+            # rebuilding them every diffusion block would erase the gain.
+            self._qkvg_weight = torch.cat(weights, dim=0).contiguous()
+            if bias is None:
+                self._qkvg_bias = None
+            else:
+                hidden = self.c_hidden * self.num_heads
+                zeros = bias.new_zeros(3 * hidden)
+                self._qkvg_bias = torch.cat((bias, zeros), dim=0).contiguous()
+            self._qkvg_cache_key = cache_key
+        return self._qkvg_weight, self._qkvg_bias
 
     def _prep_qkv(
         self, q_x: torch.Tensor, kv_x: torch.Tensor, apply_scale: bool = True
@@ -898,6 +963,24 @@ class Attention(nn.Module):
             q = q / math.sqrt(self.c_hidden)
 
         return q, k, v
+
+    def _prep_qkv_gate_fused(
+        self,
+        q_x: torch.Tensor,
+        apply_scale: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden = self.c_hidden * self.num_heads
+        weight, bias = self._qkvg_params()
+        qkvg = F.linear(q_x, weight, bias)
+        q, k, v, gate = qkvg.split(hidden, dim=-1)
+
+        q = q.view(q.shape[:-1] + (self.num_heads, -1)).transpose(-2, -3)
+        k = k.view(k.shape[:-1] + (self.num_heads, -1)).transpose(-2, -3)
+        v = v.view(v.shape[:-1] + (self.num_heads, -1)).transpose(-2, -3)
+        gate = gate.view(gate.shape[:-1] + (self.num_heads, -1))
+        if apply_scale:
+            q = q / math.sqrt(self.c_hidden)
+        return q, k, v, gate
 
     def _wrap_up(
         self,
@@ -963,7 +1046,12 @@ class Attention(nn.Module):
                 [*, Q, C_q]
         """
 
-        q, k, v = self._prep_qkv(q_x=q_x, kv_x=kv_x, apply_scale=True)
+        gate = None
+        gate_already_applied = False
+        if self._can_fuse_qkvg_projection(q_x=q_x, kv_x=kv_x):
+            q, k, v, gate = self._prep_qkv_gate_fused(q_x=q_x, apply_scale=True)
+        else:
+            q, k, v = self._prep_qkv(q_x=q_x, kv_x=kv_x, apply_scale=True)
 
         if attn_bias is not None:
             if len(attn_bias.shape) != len(q.shape):
@@ -975,9 +1063,6 @@ class Attention(nn.Module):
             if len(trunked_attn_bias.shape) != len(q.shape) + 1:
                 # Expand at head dim, got shape [..., 1, n_trunks, n_queries, n_keys]
                 trunked_attn_bias = trunked_attn_bias.unsqueeze(dim=-4)
-
-        gate = None
-        gate_already_applied = False
 
         if n_queries and n_keys:
             if self.local_attention_method == "global_attention_with_bias":
