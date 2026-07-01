@@ -289,15 +289,31 @@ def aggregate_metrics(out_dir: Path) -> dict[str, Any]:
     wall_start = min(row["wall_start"] for row in timed)
     wall_end = max(row["wall_end"] for row in timed)
     total_wall_sec = wall_end - wall_start
+    total_sequences = len(timed)
     total_samples = sum(row["prediction_samples"] for row in timed)
     total_forward_sec = sum(row["forward_sec"] for row in timed)
     total_item_sec = sum(row["total_sec"] for row in timed)
+    numeric_model_keys = sorted(
+        {
+            key
+            for row in timed
+            for key, value in row.get("model_log", {}).items()
+            if isinstance(value, (int, float))
+        }
+    )
+    mean_model_log = {
+        key: sum(float(row.get("model_log", {}).get(key, 0.0)) for row in timed)
+        / total_sequences
+        for key in numeric_model_keys
+    }
 
     return {
         "timed_items": len(timed),
         "ranks": sorted({row["rank"] for row in timed}),
+        "total_sequences": total_sequences,
         "total_samples": total_samples,
         "total_wall_sec": total_wall_sec,
+        "aggregate_sequences_per_sec": total_sequences / total_wall_sec,
         "aggregate_samples_per_sec": total_samples / total_wall_sec,
         "sum_forward_sec": total_forward_sec,
         "sum_item_sec": total_item_sec,
@@ -311,10 +327,16 @@ def aggregate_metrics(out_dir: Path) -> dict[str, Any]:
         / len(timed),
         "max_peak_allocated_mib": max(row["peak_allocated_mib"] for row in timed),
         "max_peak_reserved_mib": max(row["peak_reserved_mib"] for row in timed),
+        "min_n_token": min(row["n_token"] for row in timed),
+        "mean_n_token": sum(row["n_token"] for row in timed) / total_sequences,
+        "max_n_token": max(row["n_token"] for row in timed),
+        "mean_n_atom": sum(row["n_atom"] for row in timed) / total_sequences,
+        "mean_n_msa": sum(row["n_msa"] for row in timed) / total_sequences,
         "mean_forward_sec": total_forward_sec / len(timed),
         "mean_feature_sec": sum(row["feature_total_sec"] for row in timed)
         / len(timed),
         "mean_dump_sec": sum(row["dump_sec"] for row in timed) / len(timed),
+        "mean_model_log": mean_model_log,
     }
 
 
