@@ -54,12 +54,15 @@ export PROTENIX_TRITON_LOCAL_ATTN_NUM_WARPS=1
 export PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS=1
 export PROTENIX_TRITON_FUSED_ELEMENTWISE=1
 export PROTENIX_BF16_ATOM_ATTENTION=1
+export PROTENIX_SUMMARY_SAMPLE_CHUNK_SIZE=32
 ```
 
-Best measured one-H100 throughput so far is `7.162` aggregate samples/sec at
+Best measured one-H100 throughput so far is `7.484` end-to-end samples/sec and
+`7.507` forward samples/sec at
 `N_sample=640`, `N_step=200`, true unchunked diffusion on the 7r6r benchmark
-input after the fused local-attention pair-bias projection. This is `13.56x`
-over the original per-GPU default aggregate baseline of `0.528` samples/sec.
+input after the fused local-attention pair-bias projection and chunked
+confidence-summary processing. This is `14.17x` over the original per-GPU
+default aggregate baseline of `0.528` samples/sec.
 The previous `N_sample=960` run measured `6.863` samples/sec before the
 one-warp and fused-bias retunes, while reserving `73.8 GiB` instead of
 `50.0 GiB`; repeat N960 before claiming the retunes change the high-memory best
@@ -1668,3 +1671,75 @@ Next:
   `model_forward` component, so the next useful measurement is whether
   confidence summary/logit processing is a GPU, CPU, or synchronization
   bottleneck before writing another kernel.
+
+### Round 33 - promoted confidence-summary sample chunking
+
+Status: promoted
+
+Question:
+- The previous model timing ended `model_forward` before
+  `compute_full_data_and_summary`. Is the post-confidence confidence-summary
+  path material, and can it be batched safely over samples?
+
+Change:
+- Added optional synchronized phase timing with `PROTENIX_SYNC_TIMINGS=1` in
+  commit `8cbadc9`.
+- Added opt-in `PROTENIX_SUMMARY_SAMPLE_CHUNK_SIZE` in commit `2ceea90`.
+  The default value preserves the historical one-sample wrapper; the promoted
+  throughput stack sets it to `32`.
+
+Diagnostics:
+- Nsight Compute `2026.1.1` is installed in the cluster environment at
+  `/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/nsight-compute/bin/ncu`;
+  as expected, it is used from Slurm compute-node jobs, not the login node.
+- Synchronized N640/N20 timing gate:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round54_sync_summary_timing_20260701_031749`.
+  The timed row showed `summary_confidence=7.25 s` out of `28.01 s` forward,
+  so summary processing was about 26% of the short-forward wall time.
+- Summary chunk screen:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round56_summary_chunk_fastscreen_20260701_032534`.
+- Full N640/N200 promotion gate:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round57_summary_chunk_full_gate_20260701_034709`.
+- Synthetic remote parity check passed for chunk 4 versus chunk 1 across all
+  summary and full-data keys.
+
+Summary chunk screen, `N_sample=640`, `N_step=20`, synchronized timings:
+
+| summary chunk | forward sec | forward samples/sec | summary confidence | peak allocated MiB | finite coords |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 37.613 | 17.015 | 7.098 s | 30788 | yes |
+| 4 | 33.697 | 18.993 | 2.531 s | 30788 | yes |
+| 8 | 33.242 | 19.252 | 1.804 s | 30788 | yes |
+| 16 | 31.924 | 20.047 | 1.278 s | 30788 | yes |
+| 32 | 31.755 | 20.154 | 1.072 s | 30788 | yes |
+| 64 | 32.478 | 19.706 | 1.018 s | 30788 | yes |
+| 128 | 31.869 | 20.083 | 0.949 s | 30788 | yes |
+| all | 31.972 | 20.018 | 0.931 s | 47426 | yes |
+
+Full gate, `N_sample=640`, `N_step=200`, normal async runtime timing:
+
+| summary chunk | forward sec | forward samples/sec | end-to-end samples/sec | summary confidence | peak allocated MiB | finite coords |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 90.826 | 7.046 | 7.026 | 7.010 s | 30788 | yes |
+| 32 | 85.251 | 7.507 | 7.484 | 1.039 s | 30788 | yes |
+
+Interpretation:
+- The bottleneck was not the confidence head pairformer itself; it was the
+  post-confidence summary/logit processing wrapper enumerating samples one by
+  one. The inner `_compute_full_data_and_summary` already supports a leading
+  sample batch for the tensor-heavy probability and chain-score reductions.
+- Chunk 32 removes about six seconds from the full N640/N200 workload without
+  increasing peak allocated memory. Larger chunks shave a little more summary
+  time in the short screen but do not improve total forward time and the
+  all-sample chunk increases peak allocated memory by about 16.6 GiB.
+
+Decision:
+- Promote `PROTENIX_SUMMARY_SAMPLE_CHUNK_SIZE=32` in the high-throughput stack.
+- Keep the code path opt-in rather than changing upstream default behavior,
+  because very large token counts or sample-specific contact-prob tensors may
+  need the conservative one-sample wrapper.
+
+Next:
+- Re-run the high-memory N960 point with the promoted summary chunk, because
+  summary chunking keeps peak allocation unchanged at N640 and may improve the
+  previous N960 result without approaching the full-output memory cliff.
