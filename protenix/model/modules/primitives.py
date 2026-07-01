@@ -62,36 +62,6 @@ def _try_triton_local_attention(
     )
 
 
-def _try_triton_local_attention_with_bias_projection(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    z: torch.Tensor,
-    layernorm_weight: Optional[torch.Tensor],
-    linear_weight: torch.Tensor,
-    n_queries: int,
-    n_keys: int,
-    eps: float,
-) -> Optional[torch.Tensor]:
-    try:
-        from protenix.model.modules.local_attention_fused_bias_triton import (
-            triton_local_attention_with_bias_projection,
-        )
-    except Exception:
-        return None
-    return triton_local_attention_with_bias_projection(
-        q=q,
-        k=k,
-        v=v,
-        z=z,
-        layernorm_weight=layernorm_weight,
-        linear_weight=linear_weight,
-        n_queries=n_queries,
-        n_keys=n_keys,
-        eps=eps,
-    )
-
-
 def attention_force_fp32() -> bool:
     return os.getenv("PROTENIX_ATTENTION_FORCE_FP32", "1").lower() not in {
         "0",
@@ -935,38 +905,6 @@ class Attention(nn.Module):
         o = self.linear_o(o)
 
         return o
-
-    def local_attention_with_bias_projection(
-        self,
-        q_x: torch.Tensor,
-        kv_x: torch.Tensor,
-        z: torch.Tensor,
-        layernorm_weight: Optional[torch.Tensor],
-        linear_weight: torch.Tensor,
-        n_queries: int,
-        n_keys: int,
-        eps: float,
-        chunk_size: Optional[int] = None,
-    ) -> Optional[torch.Tensor]:
-        if self.local_attention_method != "local_cross_attention":
-            return None
-        if chunk_size is not None:
-            return None
-        q, k, v = self._prep_qkv(q_x=q_x, kv_x=kv_x, apply_scale=True)
-        o = _try_triton_local_attention_with_bias_projection(
-            q=q,
-            k=k,
-            v=v,
-            z=z,
-            layernorm_weight=layernorm_weight,
-            linear_weight=linear_weight,
-            n_queries=n_queries,
-            n_keys=n_keys,
-            eps=eps,
-        )
-        if o is None:
-            return None
-        return self._wrap_up(o.transpose(-2, -3), q_x)
 
     def forward(
         self,

@@ -143,21 +143,6 @@ class AttentionPairBias(nn.Module):
         assert n_keys == z.size(-2)
         assert len(z.shape) == len(q.shape) + 2
 
-        if self.layernorm_z.bias is None:
-            q_fused = self.attention.local_attention_with_bias_projection(
-                q_x=q,
-                kv_x=kv,
-                z=z,
-                layernorm_weight=self.layernorm_z.weight,
-                linear_weight=self.linear_nobias_z.weight,
-                n_queries=n_queries,
-                n_keys=n_keys,
-                eps=self.layernorm_z.eps,
-                chunk_size=chunk_size,
-            )
-            if q_fused is not None:
-                return q_fused
-
         # Multi-head attention bias.  The Triton path fuses the LayerNorm,
         # small head projection, and permute into the final trunked layout.
         bias = None
