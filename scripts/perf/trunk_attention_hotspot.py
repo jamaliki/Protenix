@@ -66,8 +66,9 @@ def make_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, torch.Tensor, t
         device=device,
         dtype=dtype,
     )
+    s_samples = args.samples if args.s_samples is None else args.s_samples
     s = torch.randn(
-        args.samples,
+        s_samples,
         args.tokens,
         args.c_s,
         device=device,
@@ -113,6 +114,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples", type=int, default=160)
     parser.add_argument(
+        "--s-samples",
+        type=int,
+        default=None,
+        help="Leading sample/batch size for conditioning s. Use 1 to mimic broadcast diffusion conditioning.",
+    )
+    parser.add_argument(
         "--z-samples",
         type=int,
         default=1,
@@ -141,6 +148,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of target calls inside the CUDA profiler capture range.",
+    )
+    parser.add_argument(
+        "--transition-residual",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Pass the residual into ConditionedTransitionBlock, matching the promoted fused residual path.",
     )
     return parser.parse_args()
 
@@ -252,7 +266,11 @@ def main() -> None:
 
     def run_transition() -> torch.Tensor:
         with amp:
-            return block.conditioned_transition_block(a=attn_residual, s=s)
+            return block.conditioned_transition_block(
+                a=attn_residual,
+                s=s,
+                residual=attn_residual if args.transition_residual else None,
+            )
 
     def run_block() -> torch.Tensor:
         with amp:
@@ -315,6 +333,7 @@ def main() -> None:
         "a_shape": list(a.shape),
         "s_shape": list(s.shape),
         "z_shape": list(z.shape),
+        "transition_residual": bool(args.transition_residual),
         "out_shape": list(out.shape),
         "block_out_shape": list(block_out.shape),
         "full_block_ms": block_ms,

@@ -42,8 +42,6 @@ path:
 
 ```bash
 # Conservative high-throughput default for the 7r6r-style benchmark.
-# N_SAMPLE=2560 is the current max-throughput point, but the marginal gain
-# over N_SAMPLE=1280 is only about 0.6% and memory rises to 36.4 GiB reserved.
 export N_SAMPLE=1280
 export SAMPLE_DIFFUSION_CHUNK_SIZE=none
 export CHUNK_SIZE=none
@@ -60,20 +58,18 @@ export PROTENIX_BF16_ATOM_ATTENTION=1
 export PROTENIX_SUMMARY_SAMPLE_CHUNK_SIZE=32
 export PROTENIX_STREAM_CONFIDENCE_SUMMARY=1
 export PROTENIX_CONFIDENCE_LOGIT_CHUNK_SIZE=32
+export PROTENIX_BROADCAST_DIFFUSION_S=1
 ```
 
-Measured one-H100 throughput with streamed confidence summary, BF16 atom
-local-attention output, and fused transition residuals is `7.793` end-to-end
-samples/sec and `7.806` forward samples/sec at `N_sample=1280`, `N_step=200`,
-true unchunked diffusion on the 7r6r benchmark input, reserving `18.4 GiB`. The
-current max-throughput point is `N_sample=2560` with `7.890` end-to-end
-samples/sec and `7.897` forward samples/sec, reserving `35.3 GiB`; this is
-`14.94x` over the original per-GPU
-default aggregate baseline of `0.528` samples/sec. Larger batches now work
-because confidence PAE/PDE logits are streamed into summary/full-data chunks
-instead of materializing the full FP32 logit stack. The marginal batch-size gain
-is now nearly exhausted; the remaining profile is dominated by diffusion and
-confidence kernels that scale almost linearly in `N_sample`.
+Measured one-H100 warmed throughput at commit `8142521` is `9.043`
+end-to-end samples/sec and `9.060` forward samples/sec at `N_sample=1280`,
+`N_step=200`, true unchunked diffusion on the 7r6r benchmark input, reserving
+`19.1 GiB`. This is `17.13x` over the original per-GPU default aggregate
+baseline of `0.528` samples/sec. Larger-batch throughput under this newer
+stack is being remeasured in Round 47; the previous pre-broadcast stack was
+nearly flat from `N_sample=1280` to `N_sample=2560`, which is why the current
+default remains the lower-memory `N_sample=1280` point until the new batch
+ladder finishes.
 
 ## Running report
 
@@ -2417,3 +2413,151 @@ Interpretation:
 Decision:
 - Reject and revert `PROTENIX_FUSED_Q_SCALE`. Do not carry the default-off path.
 - Keep the Round 43 profile as the current launch-level map for trunk work.
+
+### Round 45 - broadcast diffusion conditioning over samples
+
+Status: promoted
+
+Hypothesis:
+- In inference, each denoising step uses one scalar `t_hat` that is expanded
+  across all samples. The diffusion conditioning single embedding `s` is
+  therefore identical for every sample lane at a given step, but the old path
+  recomputed conditioning with shape `[N_sample, N_token, c_s]`.
+- Computing `s` with sample dimension `1` and relying on downstream
+  broadcasting should remove redundant conditioning work and reduce repeated
+  broadcast-gate traffic in the trunk without changing model outputs.
+
+Change:
+- Commit `cce4c76` added `PROTENIX_BROADCAST_DIFFUSION_S=1`.
+- The guard is inference-only (`not training`, no grad, `N_sample > 1`) and
+  only fires when `t_hat_noise_level` is provably sample-identical. The common
+  inference path has stride `0` in the sample dimension, so the guard avoids a
+  synchronization; the equality check is only a fallback for materialized but
+  still identical tensors.
+
+Experiments:
+- Isolated trunk screen:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round85_broadcast_s_hotspot_20260701_084011`.
+- Corrected warmed full gate:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round95_warmed_broadcast_s_gate_n200_7r6r_20260701_091451`.
+- Workload: one H100, 7r6r input, `N_sample=1280`, `N_step=200`, unchunked
+  diffusion, current promoted stack, one warmup item before the timed item.
+
+Hotspot results with broadcast `s`:
+
+| target | full `s` | broadcast `s` | delta | parity |
+| --- | ---: | ---: | ---: | --- |
+| adaptive LayerNorm | 1.902 ms | 1.646 ms | -13.5% | exact |
+| attention-pair-bias module | 10.532 ms | 9.764 ms | -7.3% | exact |
+| transition with residual | 6.859 ms | 6.754 ms | -1.5% | max abs `0.03125` |
+| full trunk block | 17.841 ms | 17.313 ms | -3.0% | max abs `0.03125` |
+
+Warmed full-gate results:
+
+| variant | e2e samples/s | forward samples/s | forward sec | diffusion | conditioning | transformer | peak reserved MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| no broadcast | 7.850 | 7.863 | 162.781 | 136.713 s | 1.972 s | 89.360 s | 18438 |
+| broadcast `s` | 8.250 | 8.265 | 154.871 | 128.526 s | 0.035 s | 83.426 s | 17980 |
+
+Interpretation:
+- The initial no-warmup N20/N200 screens were directionally useful but
+  overestimated the win because the first variant paid one-time kernel/cache
+  costs. The corrected warmed gate is the promotion result.
+- Broadcasting `s` still gives a real `+5.1%` warmed end-to-end win and cuts
+  diffusion conditioning from `~2.0 s` to `~0.04 s`. The larger movement is in
+  the diffusion transformer because all sample-broadcast `s` projections and
+  gates become smaller or cheaper.
+
+Decision:
+- Promote `PROTENIX_BROADCAST_DIFFUSION_S=1` as part of the throughput stack.
+- This also creates a new kernel opportunity: many `sigmoid(s_projection) *
+  full_sample_tensor (+ residual)` operations now have a broadcast first
+  operand that the old same-shape Triton elementwise fusion cannot handle.
+
+### Round 46 - broadcast-aware fused sigmoid gates
+
+Status: promoted
+
+Hypothesis:
+- After Round 45, trunk and atom blocks repeatedly apply small broadcast gates
+  with shape `[1, N_token, c]` to full sample tensors with shape
+  `[N_sample, N_token, c]`.
+- The existing `PROTENIX_TRITON_FUSED_ELEMENTWISE=1` kernels only support
+  same-shape tensors, so these cases fell back to separate PyTorch broadcast
+  elementwise launches. A narrow Triton kernel that indexes the gate with
+  `offset % gate_numel` should recover fusion without attempting a broad
+  attention mega-kernel.
+
+Change:
+- Commit `8142521` added guarded first-dimension-broadcast variants for
+  `fused_sigmoid_mul` and `fused_sigmoid_mul_add`.
+- The optimized path is intentionally narrow: contiguous CUDA tensors,
+  matching dtype, rank-3 shapes, `x.shape == [1, T, C]`, and
+  `y.shape == [S, T, C]`. The addend `z` may be either broadcast-shaped or
+  full-shaped. All other shapes keep the previous fallback behavior.
+- `AttentionPairBias` now routes the final output gate through
+  `fused_sigmoid_mul`, so broadcast gates in the trunk attention path can use
+  the same fused implementation.
+
+Experiments:
+- Direct broadcast-gate microbenchmark:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round93_broadcast_gate_direct_20260701_091232`.
+- Warmed full gate:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round95_warmed_broadcast_s_gate_n200_7r6r_20260701_091451`.
+- Workload: one H100, 7r6r input, `N_sample=1280`, `N_step=200`, unchunked
+  diffusion, broadcast `s` enabled, one warmup item before the timed item.
+
+Direct kernel results for `x=[1,245,768]`, `y=[1280,245,768]`:
+
+| operation | base fallback | broadcast Triton | delta | parity |
+| --- | ---: | ---: | ---: | --- |
+| `sigmoid(x) * y` | 0.610 ms | 0.321 ms | -47.4% | max abs `0.03125` |
+| `sigmoid(x) * y + z_full` | 1.081 ms | 0.474 ms | -56.2% | max abs `0.03125` |
+| `sigmoid(x) * y + z_broadcast` | 1.218 ms | 0.321 ms | -73.7% | max abs `0.03125` |
+
+Warmed full-gate results:
+
+| variant | e2e samples/s | forward samples/s | forward sec | diffusion | transformer | atom decoder | peak reserved MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| no broadcast | 7.850 | 7.863 | 162.781 | 136.713 s | 89.360 s | 18.026 s | 18438 |
+| broadcast `s` only | 8.250 | 8.265 | 154.871 | 128.526 s | 83.426 s | 17.834 s | 17980 |
+| broadcast `s` + broadcast gates | 9.043 | 9.060 | 141.274 | 114.890 s | 72.724 s | 15.191 s | 19560 |
+
+Interpretation:
+- This is a real full-workload win, not just a microbenchmark win. The
+  candidate improves warmed end-to-end throughput by `+9.6%` over broadcast
+  `s` alone and by `+15.2%` over the prior no-broadcast stack.
+- The movement is exactly where expected: diffusion transformer time drops
+  from `83.4 s` to `72.7 s`; atom decoder also drops because it uses the same
+  broadcast-gate primitive in sample-scaled blocks.
+- This is the right level of fusion for the current profile. It removes
+  memory-bound broadcast elementwise launches around every block while leaving
+  cuDNN FMHA and cuBLASLt GEMMs intact.
+
+Decision:
+- Promote commit `8142521` with `PROTENIX_BROADCAST_DIFFUSION_S=1`.
+- The current measured one-H100 speedup is `17.13x` over the original
+  `0.528` samples/sec default.
+- Next credible kernel target is a broadcast-aware AdaLN fusion that combines
+  full-token layernorm with the broadcast gate/add, rather than a wholesale
+  trunk-attention mega-kernel.
+
+### Round 47 - current-stack batch ladder
+
+Status: running
+
+Question:
+- With broadcast `s` and broadcast-aware gates promoted, does a larger
+  `N_sample` now improve per-GPU throughput, or is the workload still limited
+  by sample-linear compute/memory traffic?
+
+Experiment:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round96_batch_ladder_current_20260701_093445`.
+- Commit: `8142521`.
+- Workload: one H100, 7r6r input, `N_step=200`, unchunked diffusion, current
+  promoted stack, one warmup item before the timed item.
+- Shapes: `N_sample=2560` and `N_sample=5120`.
+
+Decision:
+- Pending. Keep `N_sample=1280` as the documented default until this finishes.
