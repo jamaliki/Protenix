@@ -33,6 +33,7 @@ from protenix.model.utils import (
 from protenix.model.modules.fused_elementwise_triton import (
     fused_sigmoid_mul,
     fused_sigmoid_mul_add,
+    triton_adaptive_layernorm_broadcast,
 )
 
 
@@ -244,9 +245,19 @@ class AdaptiveLayerNorm(nn.Module):
             torch.Tensor: the updated a from AdaLN
                 [..., N_token, c_a]
         """
-        a = self.layernorm_a(a)
         s = self.layernorm_s(s)
-        a = fused_sigmoid_mul_add(self.linear_s(s), a, self.linear_nobias_s(s))
+        gate = self.linear_s(s)
+        shift = self.linear_nobias_s(s)
+        out = triton_adaptive_layernorm_broadcast(
+            a=a,
+            gate=gate,
+            shift=shift,
+            eps=self.layernorm_a.eps,
+        )
+        if out is not None:
+            return out
+        a = self.layernorm_a(a)
+        a = fused_sigmoid_mul_add(gate, a, shift)
         return a
 
 
