@@ -52,8 +52,9 @@ def make_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, torch.Tensor, t
         dtype=dtype,
     )
     c = torch.randn_like(q)
+    p_samples = args.p_samples if args.p_samples is not None else args.samples
     p = torch.randn(
-        args.samples,
+        p_samples,
         n_trunks,
         args.n_queries,
         args.n_keys,
@@ -67,6 +68,12 @@ def make_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, torch.Tensor, t
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples", type=int, default=320)
+    parser.add_argument(
+        "--p-samples",
+        type=int,
+        default=None,
+        help="Leading sample/batch size for atom pair bias. Use 1 to mimic the cached full inference path.",
+    )
     parser.add_argument("--atoms", type=int, default=2529)
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--c-atom", type=int, default=128)
