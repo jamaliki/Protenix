@@ -1988,6 +1988,35 @@ Full 7r6r gate, `N_step=200`, one H100, normal async throughput timing:
 | N1280, BF16 local-attn output | 163.327 | 7.837 | 7.824 | 137.897 s | 20.733 s | 2.080 s | 15705 | 18438 | yes |
 | N2560, BF16 local-attn output | 325.095 | 7.875 | 7.868 | 275.907 s | 42.099 s | 4.451 s | 29104 | 34818 | yes |
 
+Targeted NCU after the BF16-output change:
+- Run directory:
+  `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/round69_bf16out_ncu_atom_20260701_061813`.
+- Commit profiled: `c9f9584` (before the later final-attention-gate fusion
+  experiment).
+- NCU version: `2026.1.1`, run inside a Slurm GPU job.
+
+Atom-attention target at `N_sample=1280`:
+
+| family | FP32 output time | BF16 output time | BF16 SM % | BF16 memory % | BF16 DRAM % | interpretation |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| local bias projection | 15.537 ms | 15.537 ms | 35.2 | 97.0 | 32.2 | unchanged; still the largest memory-pipe launch |
+| attention/linear GEMMs | 6.453 ms | 6.448 ms | 17.0 | 73.9 | 73.9 | unchanged; tensor utilization remains low/memory-active |
+| PyTorch elementwise/copy | 5.031 ms | 1.931 ms | 23.7 | 89.1 | 88.8 | main removed traffic from matching BF16 gate dtype |
+| Triton local attention | 3.488 ms | 3.393 ms | 45.5 | 66.3 | 58.1 | small store-bandwidth win, still occupancy/memory bound |
+| LayerNorm | 2.636 ms | 2.634 ms | 84.9 | 75.5 | 75.5 | unchanged |
+| AdaLN sigmoid-mul-add | 2.116 ms | 2.116 ms | 25.3 | 93.2 | 93.2 | unchanged, DRAM-bound elementwise |
+| Triton attention gate | not used | 0.806 ms | 30.0 | 91.5 | 91.5 | replaces fallback sigmoid/mul elementwise traffic |
+
+Current atom-transition target at `N_sample=1280`, BF16 local-attention output:
+
+| family | time | SM % | memory % | DRAM % | interpretation |
+| --- | ---: | ---: | ---: | ---: | --- |
+| transition GEMMs | 4.699 ms | 21.1 | 76.5 | 76.5 | memory-active low tensor utilization |
+| Triton SiLU-mul | 1.616 ms | 31.5 | 91.5 | 91.5 | DRAM-bound elementwise |
+| LayerNorm | 1.318 ms | 84.9 | 75.4 | 75.4 | high SM but still memory-active |
+| AdaLN sigmoid-mul-add | 1.057 ms | 25.4 | 93.3 | 93.3 | DRAM-bound elementwise |
+| final transition gate | 0.806 ms | 29.8 | 91.5 | 91.5 | DRAM-bound elementwise |
+
 Interpretation:
 - The paired N1280 gate shows a real but bounded win: `+2.3%` end-to-end
   throughput, `-13.1%` peak allocated memory, and `-14.6%` peak reserved
@@ -1999,6 +2028,10 @@ Interpretation:
 - This is the kind of fusion/detail work that the roofline supported: reduce
   memory traffic on the repeated atom-attention path without re-reading pair
   features per head or making a giant kernel with worse locality.
+- The NCU launch-level mechanism is specific: BF16 output does not speed up the
+  bias projection or GEMMs, but it enables the existing Triton BF16 attention
+  gate and removes about `3.1 ms` of fallback PyTorch elementwise/copy time from
+  the isolated atom-attention target.
 
 Decision:
 - Promote `PROTENIX_TRITON_LOCAL_ATTN_OUTPUT_BF16=1` in the high-throughput
