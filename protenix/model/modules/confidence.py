@@ -73,7 +73,7 @@ def _select_representative_atom_coords(
         for batch_idx in range(flat_batch)
     ]
     selected = torch.stack(selected_items, dim=0)
-    return selected.reshape(*mask_prefix_shape, *extra_shape, *selected.shape[1:])
+    return selected.reshape(*mask_prefix_shape, *selected.shape[1:])
 
 
 def _atom_weight_einsum(
