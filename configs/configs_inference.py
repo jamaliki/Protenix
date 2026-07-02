@@ -34,8 +34,11 @@ inference_configs = {
     "inference_batch_size": 1,
     # "auto" first tries full-model exact-shape batching, then same-token trunk
     # batching, then padded-token trunk batching for different sequence lengths.
-    # Atom-shaped diffusion/confidence work stays per record.  "exact", "token",
-    # and "padded" force one boundary for debugging or benchmarking.
+    # Atom-shaped diffusion/confidence work stays per record.  "trunk_exact"
+    # loops the pairformer trunk at each record's true token length, then batches
+    # the diffusion tail; use it when padded pairformer drift is unacceptable but
+    # some low-sample batching is still useful.  "exact", "token", and "padded"
+    # force one boundary for debugging or benchmarking.
     "inference_batch_mode": "auto",
     # Optional fallback for callers that feed unsorted records directly into
     # infer_predict.  The CLI sorts raw campaign records by length before

@@ -1336,17 +1336,17 @@ class Protenix(nn.Module):
                 ]
             else:
                 decoder_outputs = []
-                for out_idx, (
+                for (
                     batch_idx,
                     x_noisy,
                     t_hat,
                     q_skip,
                     c_skip,
                     p_skip,
-                ) in enumerate(decoder_inputs):
+                ) in decoder_inputs:
                     n_token = token_counts[batch_idx]
                     a_token = dm.layernorm_a(
-                        a_batch[out_idx, :, :n_token]
+                        a_batch[batch_idx, :, :n_token]
                     )
 
                     with dm._profile_block(

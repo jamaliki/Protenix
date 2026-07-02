@@ -254,6 +254,74 @@ class TestCampaignJsonBatching(unittest.TestCase):
             "padded",
         )
 
+    def test_trunk_exact_mode_groups_lengths_but_preserves_trunk_boundary(self):
+        def make_data(n_token: int, n_atom: int) -> dict:
+            return {
+                "N_token": torch.tensor([n_token]),
+                "input_feature_dict": {
+                    "residue_index": torch.zeros(n_token, dtype=torch.long),
+                    "token_index": torch.zeros(n_token, dtype=torch.long),
+                    "token_bonds": torch.zeros(n_token, n_token),
+                    "msa": torch.zeros(1, n_token, dtype=torch.long),
+                    "restype": torch.zeros(n_token, 32),
+                    "ref_pos": torch.zeros(n_atom, 3),
+                    "atom_to_token_idx": torch.zeros(n_atom, dtype=torch.long),
+                },
+            }
+
+        short_token = make_data(32, 200)
+        long_token = make_data(40, 250)
+
+        self.assertEqual(
+            _input_batch_signature(short_token, "trunk_exact"),
+            _input_batch_signature(long_token, "trunk_exact"),
+        )
+        self.assertEqual(
+            _effective_batch_mode(
+                [(short_token, None), (long_token, None)], "trunk_exact"
+            ),
+            "trunk_exact",
+        )
+
+    def test_trunk_exact_prediction_batch_requests_singleton_trunk(self):
+        class DummyRunner:
+            def __init__(self):
+                self.configs_seen = []
+                self.exact_token_trunk = None
+
+            def update_model_configs(self, configs):
+                self.configs_seen.append(configs)
+
+            def predict_token_batch(self, data_items, *, exact_token_trunk=False):
+                self.exact_token_trunk = exact_token_trunk
+                return [{"ok": data["N_token"].item()} for data in data_items]
+
+        def make_data(n_token: int) -> dict:
+            return {
+                "N_token": torch.tensor([n_token]),
+                "input_feature_dict": {
+                    "residue_index": torch.zeros(n_token, dtype=torch.long),
+                    "token_bonds": torch.zeros(n_token, n_token),
+                },
+            }
+
+        runner = DummyRunner()
+        configs = SimpleNamespace(
+            model_name="protenix_base_default_v1.0.0",
+            skip_amp=SimpleNamespace(),
+        )
+
+        result = _run_prediction_batch(
+            runner,
+            configs,
+            [(make_data(32), None), (make_data(40), None)],
+            "trunk_exact",
+        )
+
+        self.assertEqual(result, [{"ok": 32}, {"ok": 40}])
+        self.assertTrue(runner.exact_token_trunk)
+        self.assertEqual(len(runner.configs_seen), 1)
+
     def test_token_padding_does_not_pad_restype_class_axis(self):
         n_token = 32
         feature_tree = {

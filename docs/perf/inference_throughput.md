@@ -121,10 +121,25 @@ different-length design campaign case.  Padded batching is a controlled
 numerical-change feature, not a bitwise singleton reproduction path: the masks
 block padded content, but BF16/TF32 reductions can still differ slightly because
 kernels see a different physical token/atom length.  Use
-`--batch_mode exact --batch_size 1` for bitwise singleton debugging.  Directory
-inputs are handled as one campaign: all preprocessed JSON records are merged
-into a short-lived, length-sorted file before inference so many one-record JSONs
-can still fill batches.
+`--batch_mode exact --batch_size 1` for bitwise singleton debugging.
+
+If the pairformer padded-token drift is unacceptable but you still want some
+low-sample batching for different token counts, use:
+
+```bash
+protenix pred ... --batch_size 16 --batch_mode trunk_exact
+```
+
+This runs the input embedding and pairformer trunk once per record at each
+record's real token length, then batches the diffusion tail using the same
+masked token/atom boundaries as the high-throughput path.  It is deliberately
+named `trunk_exact`, not `exact`: it protects the largest schedule-sensitive
+pairformer boundary while preserving useful denoising throughput, but the
+batched diffusion tail still uses padded masked kernels and therefore should be
+validated against the tolerance required by the campaign.  Directory inputs are
+handled as one campaign: all preprocessed JSON records are merged into a
+short-lived, length-sorted file before inference so many one-record JSONs can
+still fill batches.
 
 Public CLI gates on one H100, repeated `7r6r` inputs, `N_sample=1`,
 `N_step=200`, confidence enabled, and normal CIF/JSON dumping:

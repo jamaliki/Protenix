@@ -149,10 +149,18 @@ length, but padded values are masked from model attention/reduction paths.  Use
 matters.  See `docs/perf/inference_throughput.md` for the padding deep dive and
 reproduction commands.
 
+If most of your concern is the pairformer trunk drift from padding different
+token counts, use `--batch_mode trunk_exact --batch_size 16`.  This keeps the
+pairformer trunk at each record's real token length and then batches the
+diffusion tail.  It is slower than `auto`, but it is the right compromise when
+you want mixed-length batching without changing the largest trunk reduction
+boundary.
+
 For mixed token lengths, input order matters unless records are packed by
 length.  This branch automatically writes a transient length-sorted campaign
-JSON before featurization when `--batch_size > 1` and `--batch_mode auto` or
-`padded` are used.  Good logs show high `token_pad_eff` and tight ranges such as
+JSON before featurization when `--batch_size > 1` and `--batch_mode auto`,
+`padded`, or `trunk_exact` are used.  Good logs show high `token_pad_eff` and
+tight ranges such as
 `Predicting 8 padded-token-trunk (auto) input(s): N_token 184-196,
 token_pad_eff 96.9%`.  The optional `--token_bucket_size N` knob additionally
 splits the streaming queue into approximate token buckets for advanced callers;

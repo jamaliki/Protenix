@@ -342,7 +342,7 @@ def get_default_runner(
         use_rna_msa (bool): Whether to use RNA MSA.
         use_seeds_in_json (bool): Whether to use seeds defined in the JSON file.
         inference_batch_size (int): Number of compatible inputs per model forward.
-        inference_batch_mode (str): Batching boundary: "auto", "exact", "token", or "padded".
+        inference_batch_mode (str): Batching boundary: "auto", "exact", "token", "padded", or "trunk_exact".
         inference_token_bucket_size (int): Optional queue bucket width for padded-token batching.
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Whether to use TFG guidance.
@@ -514,7 +514,7 @@ def inference_jsons(
         use_rna_msa (bool): Whether to use RNA MSA.
         use_seeds_in_json (bool): Whether to use seeds from JSON.
         inference_batch_size (int): Number of compatible inputs per model forward.
-        inference_batch_mode (str): Batching boundary: "auto", "exact", "token", or "padded".
+        inference_batch_mode (str): Batching boundary: "auto", "exact", "token", "padded", or "trunk_exact".
         inference_token_bucket_size (int): Optional queue bucket width for padded-token batching.
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Use TFG guidance.
@@ -600,7 +600,7 @@ def inference_jsons(
             configs["seeds"] = list(seed_key)
             sort_records = (
                 inference_batch_size > 1
-                and inference_batch_mode in {"auto", "padded"}
+                and inference_batch_mode in {"auto", "padded", "trunk_exact"}
                 and not use_seeds_in_json
             )
             merged_json, cleanup_json = write_campaign_json(
@@ -770,12 +770,13 @@ def protenix_cli() -> None:
 )
 @click.option(
     "--batch_mode",
-    type=click.Choice(["auto", "exact", "token", "padded"]),
+    type=click.Choice(["auto", "exact", "token", "padded", "trunk_exact"]),
     default="auto",
     help=(
         "'auto' uses full-model same-shape batches when possible, then same-token "
-        "trunk batches, then padded-token trunk batches. 'exact', 'token', and "
-        "'padded' force one boundary."
+        "trunk batches, then padded-token trunk batches. 'trunk_exact' loops the "
+        "pairformer trunk at each real token length and batches the diffusion "
+        "tail. 'exact', 'token', and 'padded' force one boundary."
     ),
 )
 @click.option(
@@ -922,7 +923,7 @@ def predict(
         use_seeds_in_json (bool): Use seeds from JSON.
         need_atom_confidence (bool): Compute atom-level confidence scores.
         batch_size (int): Number of compatible inputs per model forward.
-        batch_mode (str): Batching boundary: "auto", "exact", "token", or "padded".
+        batch_mode (str): Batching boundary: "auto", "exact", "token", "padded", or "trunk_exact".
         token_bucket_size (int): Optional queue bucket width for padded-token batching.
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Use TFG guidance.
