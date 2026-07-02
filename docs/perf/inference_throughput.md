@@ -771,6 +771,47 @@ improved each triangle-multiplication module by about 3%, but only moved total
 B64 block time from 65.79 ms to 65.57 ms (+0.34%).  That is below promotion
 threshold and not worth depending on a per-shape external tuning cache.
 
+#### CUEQ triangle-attention archaeology
+
+The CUEQ Python wrappers and headers explain the boundary clearly.  On H100
+(`sm90`), `cuequivariance_ops_torch.triangle_attention` detaches and
+materializes contiguous q/k/v tensors before dispatch; the exposed standard
+FMHA entrypoint takes raw q/k/v pointers and no strides.  Strided q/k/v support
+exists only in the SM100/Blackwell path.  The installed Python package is
+Apache-2.0, but the `cuequivariance-ops-torch-cu12` extension is marked NVIDIA
+proprietary, so the safe route is behavioral profiling plus a clean-room kernel,
+not copying or disassembling the binary.
+
+`scripts/perf/cueq_triangle_kernel_archaeology.py` verifies this on the target
+shape.  It builds identical q/k/v values both as contiguous CUEQ tensors and as
+views from the packed projection layout `[B, I, J, 3*H*D]`.  The view path is
+numerically exact but triggers three hidden `aten::contiguous/clone/copy_`
+launches inside CUEQ.  Current Protenix replaces those copies with one
+`_qkv_to_heads_first_kernel`, then keeps CUEQ/cuDNN for FMHA.
+
+Boundary-only B64/N245, BF16, H100:
+
+| variant | mean ms | important launches |
+| --- | ---: | --- |
+| already-contiguous q/k/v into CUEQ | 6.06 | cuDNN FMHA 6.09 ms |
+| packed qkv views into CUEQ | 10.40 | cuDNN FMHA 6.09 ms + hidden copies 5.49 ms |
+| current Triton layout producer + CUEQ | 8.19 | layout 2.07 ms + cuDNN FMHA 6.09 ms |
+| legacy Triton triangle attention | 14.90 | Triton attention 8.93 ms + layout/copy/scale 6.72 ms |
+
+A corrected packed-qkv Triton prototype was hill-climbed over nearby tiles on
+the same full module.  The best screened tile (`BLOCK_M=128`, `BLOCK_N=16`,
+`num_warps=2`) was still 22.17 ms versus 16.85 ms for CUEQ; the common
+`64x32,w2` tile was 23.42 ms.  The earlier apparent packed-qkv win was invalid:
+it loaded the triangle bias as `(row, key)` instead of the correct
+`(query, key)` broadcast.  After fixing that semantic bug, the bias traffic and
+schedule quality make the simple Triton implementation slower.
+
+Decision: the remaining attractive fusion boundary is real, but modest.  A
+perfect strided/packed cuDNN binding could at most remove about 2.1 ms from the
+B64 attention boundary.  A larger win requires a vendor-quality CuTe/CUTLASS
+FMHA-style kernel that matches cuDNN while also reading packed qkv and full
+triangle bias directly.
+
 ## Negative results worth remembering
 
 These failed because the real workload, not the isolated kernel, is the gate:
@@ -790,6 +831,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Unguarded pairformer transition input fusion at B96 | failed before producing model output | the concatenated pair-transition activation is too large; keep the shape guard |
 | Custom Triton transition output GEMM+gate/residual | best tile 2.00 ms versus 1.51 ms for cuBLAS plus fused gate/residual | the output epilogue is still attractive, but only if implemented as a vendor-quality CuTe/CUTLASS epilogue |
 | Naive fused Triton triangle attention | correct at N64, but B16/N245 slowed from 4.24-4.26 ms to 6.22-7.78 ms | the right boundary still needs a vendor-quality CUEQ/CuTe schedule |
+| Packed-qkv Triton triangle attention with correct `(query,key)` bias | best B64/N245 tile 22.17 ms versus 16.85 ms for CUEQ | removing q/k/v materialization is not enough if the attention schedule falls behind cuDNN |
 | CUEQ triangle-multiplication ONDEMAND tuning | total B64 block +0.34%, below noise | the shipped/default schedule is close enough for this shape |
 | Inference DataLoader workers for exact-shape batches | B8 had a small screen win, but B32 hit tensor-sharing failures unless switched to slower file-system sharing; clean B32 no-worker batching was better | do not add host-pipeline complexity unless it survives the actual many-input gate |
 | CUDA graph capture of the denoiser | slower in this setup | graph overhead/constraints can outweigh launch savings |
@@ -843,6 +885,9 @@ Profiling and reproducibility helpers:
 - `scripts/perf/trunk_attention_hotspot.py`: trunk attention block screen.
 - `scripts/perf/triangle_attention_breakdown.py`: per-launch/subrange screen
   for CUEQ triangle attention and its layout/epilogue boundaries.
+- `scripts/perf/cueq_triangle_kernel_archaeology.py`: CUEQ boundary archaeology
+  screen; compares contiguous q/k/v, packed qkv views, the current Triton
+  layout producer, and the legacy Triton triangle-attention implementation.
 - `scripts/perf/confidence_head_hotspot.py`: confidence pairformer screen.
 - `scripts/perf/confidence_precision_screen.py`: confidence precision/parity
   screen with real checkpoint weights and matmul dtype tracing.
