@@ -13,10 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <ATen/core/ScalarType.h>
-#include <c10/util/BFloat16.h>
-#include <c10/util/Exception.h>
-#include <c10/util/Half.h>
+#include <ATen/ATen.h>
 
 #include "compat.h"
 
