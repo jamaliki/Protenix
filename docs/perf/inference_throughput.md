@@ -370,6 +370,25 @@ keep the branch as an audit trail, but do not merge it into `main`.  The lesson
 is the same as above: a local subrange win is only a hypothesis until the
 measured full-workload subtotal moves in the expected direction.
 
+Another narrow epilogue branch, `codex/transition-addmm-residual`, tried to
+fold the pairformer transition residual add into the final transition GEMM with
+`torch.addmm(beta=1)`.  This was the right kind of small boundary experiment:
+it kept the library GEMM mainloop and asked the GEMM epilogue to consume the
+caller residual, rather than replacing the matmul with a custom kernel.  The
+actual-shape one-block gate rejected it:
+
+| shape | baseline block ms | addmm-residual block ms | speedup | peak reserved | parity |
+| --- | ---: | ---: | ---: | --- | --- |
+| B20, N=148 | 8.056 | 8.077 | 0.997x | 1570 -> 1670 MiB | exact |
+| B12, N=220 | 10.514 | 10.522 | 0.999x | 2412 -> 2412 MiB | exact |
+| B16, N=220 | 13.825 | 13.858 | 0.998x | 3032 -> 3072 MiB | exact |
+
+Job `95730`
+(`runs/transition_addmm_residual_exact_20260702_181131`, commit `b22b74f`)
+therefore rejects the branch.  The likely mechanism is that `torch.addmm` with
+nonzero beta does not beat the existing `F.linear` plus simple in-place residual
+add for these shapes, even though it is algebraically equivalent.
+
 A batch-size follow-up on commit `7de6bdf` screened fixed B16/B20/B24/B32 with
 conditioning batching enabled (job `95646`,
 `runs/batchsize_screen_cond_b16_32_20260702_171044`).  The node was slower than
@@ -1428,6 +1447,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Custom Triton transition input GEMM+SiLU | synthetic +12%, but real transition input path slowed from 3.09 ms to 3.54 ms | custom GEMM screens must use real module weights/autocast; cuBLAS efficiency is the bottleneck to match |
 | Unguarded pairformer transition input fusion at B96 | failed before producing model output | the concatenated pair-transition activation is too large; keep the shape guard |
 | Scoped pairformer transition elementwise fusion | isolated pair-transition subrange improved 18-19%, but the full representative gate showed pairformer flat/slower | subrange wins must be rejected when the measured full-workload subtotal does not move |
+| Pairformer transition residual via `torch.addmm(beta=1)` | exact parity, but actual-shape blocks were neutral/slower (`0.997-0.999x`) and sometimes used more memory | preserving the library GEMM is necessary but not sufficient; the epilogue path still has to beat `F.linear` plus a simple add |
 | Custom Triton transition output GEMM+gate/residual | best tile 2.00 ms versus 1.51 ms for cuBLAS plus fused gate/residual | the output epilogue is still attractive, but only if implemented as a vendor-quality CuTe/CUTLASS epilogue |
 | Naive fused Triton triangle attention | correct at N64, but B16/N245 slowed from 4.24-4.26 ms to 6.22-7.78 ms | the right boundary still needs a vendor-quality CUEQ/CuTe schedule |
 | Replacing CUEQ triangle attention with existing `triattention` or torch backends | actual-shape one-block screens were slower: TriAttention `1.11-1.15x` slower, torch about `1.9-2.3x` slower | keep CUEQ; target its layout/wrapper/epilogue boundaries instead |
