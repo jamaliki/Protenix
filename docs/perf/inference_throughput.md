@@ -407,6 +407,16 @@ dependent on the representative `N_sample=5` gate (`afterany:95869`).  It
 uses `--valid-fraction 0.8` at `tokens=124` and `220`, so it measures the
 padding-mask case that actually matters for sorted mixed-token batches.
 
+`scripts/perf/diffusion_transformer_sample_axis_probe.py` is the corresponding
+one-block probe.  Raw SDPA can answer whether rank-5 broadcast attention is
+available, but the model-level decision needs the q/k/v projections, attention
+gate, residual, and conditioned transition too.  That script compares the
+current flattened `[record * sample, token, channel]` block against a rank-5
+candidate that keeps `a` as `[record, sample, token, channel]` and keeps the
+diffusion conditioning `s` sample-invariant as `[record, 1, token, channel]`.
+It also includes the current Protenix rank-5 FP32-upcast policy as a rejection
+control.
+
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`
 (`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/fusion_flags_pair_b16_n200_20260702_170343`)
