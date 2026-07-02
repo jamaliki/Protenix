@@ -313,61 +313,87 @@ class InferenceRunner(object):
                 prepared_features.append(feature_dict)
                 s_inputs_list.append(s_inputs)
 
-            if pad_token_trunk:
-                trunk_feature_dict = _stack_tree(
-                    [
-                        _pad_token_trunk_tree(
-                            _trunk_feature_dict(feature_dict),
-                            n_token=n_token_i,
-                            max_tokens=max_tokens,
-                        )
-                        for feature_dict, n_token_i in zip(
-                            prepared_features, token_counts
-                        )
-                    ]
-                )
-                s_inputs_batch = torch.stack(
-                    [
-                        _pad_tensor_token_axes(
-                            s_inputs,
-                            token_axes=(0,),
-                            max_tokens=max_tokens,
-                        )
-                        for s_inputs in s_inputs_list
-                    ],
-                    dim=0,
-                )
-                pair_mask = _make_pair_mask(
-                    token_counts=token_counts,
-                    max_tokens=max_tokens,
-                    device=s_inputs_batch.device,
-                    dtype=s_inputs_batch.dtype,
-                )
-            else:
-                trunk_feature_dict = _stack_tree(
-                    [
-                        _trunk_feature_dict(feature_dict)
-                        for feature_dict in prepared_features
-                    ]
-                )
-                s_inputs_batch = torch.stack(s_inputs_list, dim=0)
-                pair_mask = None
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            trunk_start = time.perf_counter()
-            s_batch, z_batch = self.model.get_pairformer_output_from_s_inputs(
-                input_feature_dict=trunk_feature_dict,
-                s_inputs=s_inputs_batch,
-                N_cycle=self.model.N_cycle,
-                inplace_safe=inplace_safe,
-                chunk_size=chunk_size,
-                pair_mask=pair_mask,
+            trunk_batch_size = _token_trunk_batch_size(
+                len(data_items), pad_token_trunk
             )
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            trunk_sec_per_item = (
-                time.perf_counter() - trunk_start
-            ) / len(data_items)
+            s_outputs: list[torch.Tensor] = []
+            z_outputs: list[torch.Tensor] = []
+            trunk_sec_per_items: list[float] = []
+
+            for start in range(0, len(data_items), trunk_batch_size):
+                end = min(start + trunk_batch_size, len(data_items))
+                chunk_features = prepared_features[start:end]
+                chunk_s_inputs = s_inputs_list[start:end]
+                chunk_token_counts = token_counts[start:end]
+                chunk_max_tokens = max(chunk_token_counts)
+                chunk_pad_token_trunk = len(set(chunk_token_counts)) > 1
+
+                if chunk_pad_token_trunk:
+                    trunk_feature_dict = _stack_tree(
+                        [
+                            _pad_token_trunk_tree(
+                                _trunk_feature_dict(feature_dict),
+                                n_token=n_token_i,
+                                max_tokens=chunk_max_tokens,
+                            )
+                            for feature_dict, n_token_i in zip(
+                                chunk_features, chunk_token_counts
+                            )
+                        ]
+                    )
+                    s_inputs_batch = torch.stack(
+                        [
+                            _pad_tensor_token_axes(
+                                s_inputs,
+                                token_axes=(0,),
+                                max_tokens=chunk_max_tokens,
+                            )
+                            for s_inputs in chunk_s_inputs
+                        ],
+                        dim=0,
+                    )
+                    pair_mask = _make_pair_mask(
+                        token_counts=chunk_token_counts,
+                        max_tokens=chunk_max_tokens,
+                        device=s_inputs_batch.device,
+                        dtype=s_inputs_batch.dtype,
+                    )
+                else:
+                    trunk_feature_dict = _stack_tree(
+                        [
+                            _trunk_feature_dict(feature_dict)
+                            for feature_dict in chunk_features
+                        ]
+                    )
+                    s_inputs_batch = torch.stack(chunk_s_inputs, dim=0)
+                    pair_mask = None
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                trunk_start = time.perf_counter()
+                s_batch, z_batch = self.model.get_pairformer_output_from_s_inputs(
+                    input_feature_dict=trunk_feature_dict,
+                    s_inputs=s_inputs_batch,
+                    N_cycle=self.model.N_cycle,
+                    inplace_safe=inplace_safe,
+                    chunk_size=chunk_size,
+                    pair_mask=pair_mask,
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                chunk_sec_per_item = (time.perf_counter() - trunk_start) / (
+                    end - start
+                )
+
+                for chunk_idx, n_token_i in enumerate(chunk_token_counts):
+                    s_i = s_batch[chunk_idx]
+                    z_i = z_batch[chunk_idx]
+                    if chunk_pad_token_trunk:
+                        s_i = s_i[:n_token_i]
+                        z_i = z_i[:n_token_i, :n_token_i]
+                    s_outputs.append(s_i)
+                    z_outputs.append(z_i)
+                    trunk_sec_per_items.append(chunk_sec_per_item)
 
             use_batched_diffusion = _batched_token_diffusion_enabled(
                 self.configs, len(data_items)
@@ -380,18 +406,8 @@ class InferenceRunner(object):
                     self.model.sample_diffusion_batch_token_transformer(
                         input_feature_dicts=prepared_features,
                         s_inputs_list=s_inputs_list,
-                        s_list=[
-                            s_batch[idx, : token_counts[idx]]
-                            if pad_token_trunk
-                            else s_batch[idx]
-                            for idx in range(len(data_items))
-                        ],
-                        z_list=[
-                            z_batch[idx, : token_counts[idx], : token_counts[idx]]
-                            if pad_token_trunk
-                            else z_batch[idx]
-                            for idx in range(len(data_items))
-                        ],
+                        s_list=s_outputs,
+                        z_list=z_outputs,
                         chunk_size=chunk_size,
                         inplace_safe=inplace_safe,
                     )
@@ -414,23 +430,18 @@ class InferenceRunner(object):
             for batch_idx, (feature_dict, n_token_i) in enumerate(
                 zip(prepared_features, token_counts)
             ):
-                s_i = s_batch[batch_idx]
-                z_i = z_batch[batch_idx]
-                if pad_token_trunk:
-                    s_i = s_i[:n_token_i]
-                    z_i = z_i[:n_token_i, :n_token_i]
                 pred_dict, log_dict, time_tracker = (
                     self.model.finish_inference_from_pairformer(
                         input_feature_dict=feature_dict,
                         s_inputs=s_inputs_list[batch_idx],
-                        s=s_i,
-                        z=z_i,
+                        s=s_outputs[batch_idx],
+                        z=z_outputs[batch_idx],
                         label_dict=None,
                         N_cycle=self.model.N_cycle,
                         mode="inference",
                         inplace_safe=inplace_safe,
                         chunk_size=chunk_size,
-                        pairformer_sec=trunk_sec_per_item,
+                        pairformer_sec=trunk_sec_per_items[batch_idx],
                         precomputed_coordinate=(
                             batched_coordinates[batch_idx]
                             if batched_coordinates is not None
@@ -722,6 +733,31 @@ def _env_enabled_by_default(name: str) -> bool:
     if value is None:
         return True
     return value.strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _env_int(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    return int(value)
+
+
+def _token_trunk_batch_size(batch_size: int, pad_token_trunk: bool) -> int:
+    """Optional pairformer chunk size inside a larger diffusion batch.
+
+    Mixed-length campaigns have a real tradeoff: the pairformer trunk wants
+    tight length buckets to avoid padding, while the diffusion tail wants larger
+    batches to amortize launches over more records.  Leaving the env var unset
+    preserves the historical one-trunk-per-runner-batch behavior.  Setting, for
+    example, ``PROTENIX_TOKEN_TRUNK_BATCH_SIZE=16`` with ``--batch_size 32``
+    runs two masked B16 trunks, then one B32 diffusion tail.
+    """
+    if not pad_token_trunk:
+        return batch_size
+    trunk_batch_size = _env_int("PROTENIX_TOKEN_TRUNK_BATCH_SIZE")
+    if trunk_batch_size is None or trunk_batch_size <= 0:
+        return batch_size
+    return min(batch_size, trunk_batch_size)
 
 
 def _guidance_enabled(configs: Any) -> bool:
