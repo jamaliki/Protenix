@@ -1,9 +1,29 @@
+import os
+from types import SimpleNamespace
+
 import torch
 
 from protenix.model.protenix import (
     _flatten_record_sample_axes,
     _flatten_record_sample_mask,
 )
+from runner.inference import _batched_token_diffusion_enabled
+
+
+def _configs(n_sample: int, guidance: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(
+        sample_diffusion=SimpleNamespace(
+            N_sample=n_sample,
+            guidance=SimpleNamespace(enable=guidance),
+        )
+    )
+
+
+def _set_env(name: str, value: str | None) -> None:
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
 
 
 def test_flatten_record_sample_axes_broadcasts_singleton_sample_lane():
@@ -43,3 +63,27 @@ def test_flatten_record_sample_mask_matches_activation_order():
         ]
     )
     assert torch.equal(flattened, expected)
+
+
+def test_low_sample_diffusion_batch_gate_stays_guarded():
+    old_enabled = os.environ.get("PROTENIX_BATCH_DIFFUSION_TRANSFORMER")
+    old_max_samples = os.environ.get("PROTENIX_BATCH_DIFFUSION_MAX_SAMPLES")
+    try:
+        _set_env("PROTENIX_BATCH_DIFFUSION_TRANSFORMER", None)
+        _set_env("PROTENIX_BATCH_DIFFUSION_MAX_SAMPLES", None)
+
+        assert _batched_token_diffusion_enabled(_configs(5), batch_size=2)
+        assert not _batched_token_diffusion_enabled(_configs(6), batch_size=2)
+        assert not _batched_token_diffusion_enabled(_configs(5), batch_size=1)
+        assert not _batched_token_diffusion_enabled(
+            _configs(5, guidance=True), batch_size=2
+        )
+
+        _set_env("PROTENIX_BATCH_DIFFUSION_MAX_SAMPLES", "6")
+        assert _batched_token_diffusion_enabled(_configs(6), batch_size=2)
+
+        _set_env("PROTENIX_BATCH_DIFFUSION_TRANSFORMER", "0")
+        assert not _batched_token_diffusion_enabled(_configs(5), batch_size=2)
+    finally:
+        _set_env("PROTENIX_BATCH_DIFFUSION_TRANSFORMER", old_enabled)
+        _set_env("PROTENIX_BATCH_DIFFUSION_MAX_SAMPLES", old_max_samples)
