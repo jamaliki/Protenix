@@ -302,6 +302,8 @@ def get_default_runner(
     use_seeds_in_json: bool = False,
     need_atom_confidence: bool = False,
     inference_batch_size: int = 1,
+    inference_batch_mode: str = "exact",
+    inference_batch_max_padding_fraction: float = 0.25,
     kalign_binary_path: Optional[str] = None,
     use_tfg_guidance: bool = False,
 ) -> InferenceRunner:
@@ -325,6 +327,8 @@ def get_default_runner(
         use_rna_msa (bool): Whether to use RNA MSA.
         use_seeds_in_json (bool): Whether to use seeds defined in the JSON file.
         inference_batch_size (int): Number of exact-shape inputs per model forward.
+        inference_batch_mode (str): "exact" or opt-in "padded" batching.
+        inference_batch_max_padding_fraction (float): Max pair-cell padding waste.
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Whether to use TFG guidance.
 
@@ -376,6 +380,10 @@ def get_default_runner(
     configs.use_seeds_in_json = use_seeds_in_json
     configs.need_atom_confidence = need_atom_confidence
     configs.inference_batch_size = max(1, int(inference_batch_size))
+    configs.inference_batch_mode = str(inference_batch_mode).lower()
+    configs.inference_batch_max_padding_fraction = float(
+        inference_batch_max_padding_fraction
+    )
     if kalign_binary_path is not None:
         # The path provided by the user is expected to exist by default
         configs.data.template.kalign_binary_path = kalign_binary_path
@@ -426,7 +434,10 @@ def get_default_runner(
         f"enable_diffusion_shared_vars_cache: {configs.enable_diffusion_shared_vars_cache}, "
         f"enable_efficient_fusion: {configs.enable_efficient_fusion}, "
         f"enable_tf32: {configs.enable_tf32}, "
-        f"inference_batch_size: {configs.inference_batch_size}"
+        f"inference_batch_size: {configs.inference_batch_size}, "
+        f"inference_batch_mode: {configs.inference_batch_mode}, "
+        f"inference_batch_max_padding_fraction: "
+        f"{configs.inference_batch_max_padding_fraction}"
     )
     download_inference_cache(configs)
     return InferenceRunner(configs)
@@ -453,6 +464,8 @@ def inference_jsons(
     use_seeds_in_json: bool = False,
     need_atom_confidence: bool = False,
     inference_batch_size: int = 1,
+    inference_batch_mode: str = "exact",
+    inference_batch_max_padding_fraction: float = 0.25,
     kalign_binary_path: Optional[str] = None,
     use_tfg_guidance: bool = False,
     hmmsearch_binary_path: Optional[str] = None,
@@ -489,6 +502,8 @@ def inference_jsons(
         use_rna_msa (bool): Whether to use RNA MSA.
         use_seeds_in_json (bool): Whether to use seeds from JSON.
         inference_batch_size (int): Number of exact-shape inputs per model forward.
+        inference_batch_mode (str): "exact" or opt-in "padded" batching.
+        inference_batch_max_padding_fraction (float): Max pair-cell padding waste.
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Use TFG guidance.
         hmmsearch_binary_path (Optional[str]): Path to hmmsearch binary.
@@ -538,6 +553,8 @@ def inference_jsons(
         use_seeds_in_json=use_seeds_in_json,
         need_atom_confidence=need_atom_confidence,
         inference_batch_size=inference_batch_size,
+        inference_batch_mode=inference_batch_mode,
+        inference_batch_max_padding_fraction=inference_batch_max_padding_fraction,
         kalign_binary_path=kalign_binary_path,
         use_tfg_guidance=use_tfg_guidance,
     )
@@ -700,9 +717,22 @@ def protenix_cli() -> None:
     type=int,
     default=1,
     help=(
-        "Number of exact-shape input records to run in one model forward. "
-        "Inputs with different tensor shapes are automatically kept separate."
+        "Number of input records to run in one model forward. Exact-shape "
+        "batching is used by default; use --batch_mode padded to allow "
+        "nearby token/atom counts in the same forward."
     ),
+)
+@click.option(
+    "--batch_mode",
+    type=click.Choice(["exact", "padded"], case_sensitive=False),
+    default="exact",
+    help="Batching mode. 'padded' is opt-in and guarded by padding waste.",
+)
+@click.option(
+    "--batch_max_padding_fraction",
+    type=float,
+    default=0.25,
+    help="Max padded pair-cell fraction allowed for --batch_mode padded.",
 )
 @click.option(
     "--kalign_binary_path",
@@ -798,6 +828,8 @@ def predict(
     use_seeds_in_json: bool,
     need_atom_confidence: bool,
     batch_size: int,
+    batch_mode: str,
+    batch_max_padding_fraction: float,
     kalign_binary_path: Optional[str] = None,
     use_tfg_guidance: bool = False,
     hmmsearch_binary_path: Optional[str] = None,
@@ -835,7 +867,9 @@ def predict(
         use_rna_msa (bool): Use RNA MSA.
         use_seeds_in_json (bool): Use seeds from JSON.
         need_atom_confidence (bool): Compute atom-level confidence scores.
-        batch_size (int): Number of exact-shape inputs per model forward.
+        batch_size (int): Number of inputs per model forward.
+        batch_mode (str): "exact" or opt-in "padded" batching.
+        batch_max_padding_fraction (float): Max pair-cell padding waste.
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Use TFG guidance.
         hmmsearch_binary_path (Optional[str]): Path to hmmsearch binary.
@@ -957,6 +991,8 @@ def predict(
         use_seeds_in_json=use_seeds_in_json,
         need_atom_confidence=need_atom_confidence,
         inference_batch_size=batch_size,
+        inference_batch_mode=batch_mode,
+        inference_batch_max_padding_fraction=batch_max_padding_fraction,
         kalign_binary_path=kalign_binary_path,
         use_tfg_guidance=use_tfg_guidance,
         hmmsearch_binary_path=hmmsearch_binary_path,

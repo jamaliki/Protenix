@@ -266,7 +266,108 @@ def _inference_batch_size(configs: Any) -> int:
     return max(1, value)
 
 
-def _tensor_tree_signature(value: Any) -> Any:
+def _inference_batch_mode(configs: Any) -> str:
+    mode = str(configs.get("inference_batch_mode", "exact")).lower()
+    if mode not in {"exact", "padded"}:
+        logger.warning("Unknown inference_batch_mode=%r; using exact batching", mode)
+        return "exact"
+    return mode
+
+
+def _inference_batch_max_padding_fraction(configs: Any) -> float:
+    try:
+        value = float(configs.get("inference_batch_max_padding_fraction", 0.25))
+    except Exception:
+        value = 0.25
+    return min(1.0, max(0.0, value))
+
+
+_TOKEN_AXIS0_FEATURES = {
+    "asym_id",
+    "deletion_mean",
+    "entity_id",
+    "frame_atom_index",
+    "has_frame",
+    "profile",
+    "residue_index",
+    "restype",
+    "sym_id",
+    "token_index",
+}
+_ATOM_AXIS0_FEATURES = {
+    "atom_to_tokatom_idx",
+    "atom_to_token_idx",
+    "distogram_rep_atom_mask",
+    "entity_mol_id",
+    "is_dna",
+    "is_ligand",
+    "is_protein",
+    "is_rna",
+    "modified_res_mask",
+    "mol_atom_index",
+    "mol_id",
+    "pae_rep_atom_mask",
+    "plddt_m_rep_atom_mask",
+    "ref_atom_name_chars",
+    "ref_charge",
+    "ref_element",
+    "ref_mask",
+    "ref_pos",
+    "ref_space_uid",
+}
+_TOKEN_PAIR_FEATURES = {
+    "token_bonds",
+    "constraint_feature.contact",
+    "constraint_feature.contact_atom",
+    "constraint_feature.pocket",
+    "constraint_feature.substructure",
+}
+
+
+def _feature_path(path: tuple[Any, ...]) -> str:
+    if len(path) >= 2 and path[0] == "input_feature_dict":
+        return ".".join(str(part) for part in path[1:])
+    return ""
+
+
+def _pad_axes_for_path(path: tuple[Any, ...], tensor: torch.Tensor) -> tuple[int, ...]:
+    """Return variable axes that may be padded for an inference feature.
+
+    The key point is to be explicit: token/atom axes are physical sequence
+    dimensions, while channel/class/template axes must stay fixed. Unknown
+    tensors are still batchable when their shapes already match exactly.
+    """
+    feature = _feature_path(path)
+    if tensor.ndim == 0:
+        return ()
+    if feature in _TOKEN_AXIS0_FEATURES:
+        return (0,)
+    if feature in _ATOM_AXIS0_FEATURES:
+        return (0,)
+    if feature in _TOKEN_PAIR_FEATURES:
+        return (0, 1)
+    if feature == "bond_mask":
+        return (0, 1)
+    if feature in {"deletion_value", "has_deletion", "msa"}:
+        # Token columns may be padded. MSA row counts are intentionally kept
+        # fixed for this first public path because row-padding semantics are
+        # less obvious than token/atom masking.
+        return (1,)
+    if feature == "template_aatype":
+        return (1,)
+    if feature in {"template_atom_mask", "template_atom_positions"}:
+        return (1,)
+    if feature in {
+        "template_backbone_frame_mask",
+        "template_distogram",
+        "template_pseudo_beta_mask",
+        "template_unit_vector",
+    }:
+        return (1, 2)
+    return ()
+
+
+def _tensor_tree_signature(value: Any, path: tuple[Any, ...] = ()) -> Any:
     """Shape/dtype signature used to batch only exactly compatible inputs.
 
     Padding variable-length proteins is not generally equivalent for this model:
@@ -280,18 +381,83 @@ def _tensor_tree_signature(value: Any) -> Any:
     if isinstance(value, MappingABC):
         return (
             "dict",
-            tuple((key, _tensor_tree_signature(value[key])) for key in sorted(value)),
+            tuple(
+                (key, _tensor_tree_signature(value[key], (*path, key)))
+                for key in sorted(value)
+            ),
         )
     if isinstance(value, (list, tuple)):
         return (
             type(value).__name__,
-            tuple(_tensor_tree_signature(item) for item in value),
+            tuple(
+                _tensor_tree_signature(item, (*path, index))
+                for index, item in enumerate(value)
+            ),
+        )
+    return ("value", type(value).__name__, repr(value))
+
+
+def _padded_tensor_tree_signature(value: Any, path: tuple[Any, ...] = ()) -> Any:
+    if isinstance(value, torch.Tensor):
+        pad_axes = set(_pad_axes_for_path(path, value))
+        shape = tuple(
+            None if axis in pad_axes else size
+            for axis, size in enumerate(value.shape)
+        )
+        return ("tensor", value.ndim, shape, str(value.dtype))
+    if isinstance(value, MappingABC):
+        return (
+            "dict",
+            tuple(
+                (key, _padded_tensor_tree_signature(value[key], (*path, key)))
+                for key in sorted(value)
+            ),
+        )
+    if isinstance(value, (list, tuple)):
+        return (
+            type(value).__name__,
+            tuple(
+                _padded_tensor_tree_signature(item, (*path, index))
+                for index, item in enumerate(value)
+            ),
         )
     return ("value", type(value).__name__, repr(value))
 
 
 def _input_feature_signature(data: Mapping[str, Any]) -> Any:
     return _tensor_tree_signature(data["input_feature_dict"])
+
+
+def _padded_input_feature_signature(data: Mapping[str, Any]) -> Any:
+    return _padded_tensor_tree_signature(
+        {"input_feature_dict": data["input_feature_dict"]}
+    )
+
+
+def _batch_signature(data: Mapping[str, Any], mode: str) -> Any:
+    if mode == "padded":
+        return _padded_input_feature_signature(data)
+    return _input_feature_signature(data)
+
+
+def _feature_token_count(data: Mapping[str, Any]) -> int:
+    return int(data["N_token"].item())
+
+
+def _feature_atom_count(data: Mapping[str, Any]) -> int:
+    return int(data["N_atom"].item())
+
+
+def _batch_padding_fraction(items: list[tuple[dict[str, Any], Any]]) -> float:
+    if len(items) <= 1:
+        return 0.0
+    token_counts = [_feature_token_count(data) for data, _atom_array in items]
+    max_tokens = max(token_counts)
+    if max_tokens <= 0:
+        return 0.0
+    useful_pair_cells = sum(tokens * tokens for tokens in token_counts)
+    padded_pair_cells = len(items) * max_tokens * max_tokens
+    return 1.0 - (useful_pair_cells / padded_pair_cells)
 
 
 def _stack_tree(items: list[Any]) -> Any:
@@ -314,11 +480,66 @@ def _stack_tree(items: list[Any]) -> Any:
     return first
 
 
-def _stack_prediction_inputs(items: list[tuple[dict[str, Any], Any]]) -> dict[str, Any]:
-    return {
-        "input_feature_dict": _stack_tree(
-            [data["input_feature_dict"] for data, _atom_array in items]
+def _pad_tensor_to_shape(
+    tensor: torch.Tensor,
+    target_shape: tuple[int, ...],
+    path: tuple[Any, ...],
+) -> torch.Tensor:
+    if tuple(tensor.shape) == target_shape:
+        return tensor
+    pad_axes = set(_pad_axes_for_path(path, tensor))
+    for axis, (size, target) in enumerate(zip(tensor.shape, target_shape)):
+        if size != target and axis not in pad_axes:
+            raise ValueError(
+                f"Cannot pad feature {'.'.join(map(str, path))}: "
+                f"axis {axis} is fixed ({size} != {target})"
+            )
+    out = tensor.new_zeros(target_shape)
+    out[tuple(slice(0, size) for size in tensor.shape)] = tensor
+    return out
+
+
+def _pad_stack_tree(items: list[Any], path: tuple[Any, ...] = ()) -> Any:
+    """Stack a feature tree, padding only the axes declared by feature key."""
+    first = items[0]
+    if isinstance(first, torch.Tensor):
+        target_shape = tuple(
+            max(item.shape[axis] for item in items) for axis in range(first.ndim)
         )
+        return torch.stack(
+            [_pad_tensor_to_shape(item, target_shape, path) for item in items],
+            dim=0,
+        )
+    if isinstance(first, MappingABC):
+        return {
+            key: _pad_stack_tree([item[key] for item in items], (*path, key))
+            for key in first
+        }
+    if isinstance(first, list):
+        return [
+            _pad_stack_tree([item[index] for item in items], (*path, index))
+            for index in range(len(first))
+        ]
+    if isinstance(first, tuple):
+        return tuple(
+            _pad_stack_tree([item[index] for item in items], (*path, index))
+            for index in range(len(first))
+        )
+    return first
+
+
+def _stack_prediction_inputs(
+    items: list[tuple[dict[str, Any], Any]],
+    *,
+    mode: str,
+) -> dict[str, Any]:
+    feature_items = [data["input_feature_dict"] for data, _atom_array in items]
+    if mode == "padded":
+        feature_dict = _pad_stack_tree(feature_items, ("input_feature_dict",))
+    else:
+        feature_dict = _stack_tree(feature_items)
+    return {
+        "input_feature_dict": feature_dict,
     }
 
 
@@ -391,13 +612,102 @@ def _split_batched_prediction(
     ]
 
 
+def _slice_tensor_axis(value: torch.Tensor, axis: int, length: int) -> torch.Tensor:
+    if value.ndim == 0:
+        return value
+    axis = axis if axis >= 0 else value.ndim + axis
+    if axis < 0 or axis >= value.ndim or value.shape[axis] <= length:
+        return value
+    slices = [slice(None)] * value.ndim
+    slices[axis] = slice(0, length)
+    return value[tuple(slices)]
+
+
+def _trim_prediction_tensor(
+    key: str,
+    value: torch.Tensor,
+    *,
+    n_token: int,
+    n_atom: int,
+) -> torch.Tensor:
+    """Remove padded token/atom tails from common prediction tensors."""
+    if key in {
+        "coordinate",
+        "atom_coordinate",
+        "atom_plddt",
+        "atom_to_token_idx",
+        "atom_is_polymer",
+        "plddt",
+        "resolved",
+    }:
+        # Atom-shaped tensors are either [N_sample, N_atom, ...] or [N_atom].
+        atom_axis = -2 if value.ndim >= 2 and value.shape[-1] != n_atom else -1
+        return _slice_tensor_axis(value, atom_axis, n_atom)
+    if key in {
+        "pae",
+        "pde",
+        "contact_probs",
+        "token_pair_pae",
+        "token_pair_pde",
+    }:
+        # Token-pair tensors are [N, N], [N_sample, N, N], or logits with a
+        # final bin channel [N_sample, N, N, C].
+        if value.ndim >= 4:
+            value = _slice_tensor_axis(value, -3, n_token)
+            return _slice_tensor_axis(value, -2, n_token)
+        if value.ndim >= 2:
+            value = _slice_tensor_axis(value, -2, n_token)
+            return _slice_tensor_axis(value, -1, n_token)
+    if key in {"token_has_frame", "token_asym_id"}:
+        return _slice_tensor_axis(value, -1, n_token)
+    return value
+
+
+def _trim_prediction_value(
+    key: str,
+    value: Any,
+    *,
+    n_token: int,
+    n_atom: int,
+) -> Any:
+    if isinstance(value, torch.Tensor):
+        return _trim_prediction_tensor(key, value, n_token=n_token, n_atom=n_atom)
+    if isinstance(value, MappingABC):
+        return {
+            sub_key: _trim_prediction_value(
+                sub_key, sub_value, n_token=n_token, n_atom=n_atom
+            )
+            for sub_key, sub_value in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _trim_prediction_value(key, item, n_token=n_token, n_atom=n_atom)
+            for item in value
+        ]
+    return value
+
+
+def _trim_prediction_for_data(
+    prediction: Mapping[str, Any],
+    data: Mapping[str, Any],
+) -> dict[str, Any]:
+    n_token = _feature_token_count(data)
+    n_atom = _feature_atom_count(data)
+    return {
+        key: _trim_prediction_value(key, value, n_token=n_token, n_atom=n_atom)
+        for key, value in prediction.items()
+    }
+
+
 def _write_inference_error(
     runner: InferenceRunner,
     sample_name: str,
     error_message: str,
 ) -> None:
     logger.error(error_message)
-    with open(opjoin(runner.error_dir, f"{sample_name}.txt"), "a", encoding="utf-8") as f:
+    with open(
+        opjoin(runner.error_dir, f"{sample_name}.txt"), "a", encoding="utf-8"
+    ) as f:
         f.write(error_message)
 
 
@@ -420,18 +730,35 @@ def _dump_prediction(
     )
 
 
-def _describe_batch(items: list[tuple[dict[str, Any], Any]], seed: int) -> None:
+def _describe_batch(
+    items: list[tuple[dict[str, Any], Any]],
+    seed: int,
+    *,
+    mode: str,
+) -> None:
     first_data = items[0][0]
     names = [data["sample_name"] for data, _atom_array in items]
+    token_counts = [_feature_token_count(data) for data, _atom_array in items]
+    atom_counts = [_feature_atom_count(data) for data, _atom_array in items]
     logger.info(
-        "[Rank %s] Predicting %d same-shape input(s) [seed:%s]: "
-        "N_token %s, N_atom %s, N_msa %s, names=%s",
+        "[Rank %s] Predicting %d %s input(s) [seed:%s]: "
+        "N_token %s, N_atom %s, N_msa %s, padding_fraction %.3f, names=%s",
         DIST_WRAPPER.rank,
         len(items),
+        "padded" if mode == "padded" and len(items) > 1 else "same-shape",
         seed,
-        int(first_data["N_token"].item()),
-        int(first_data["N_atom"].item()),
+        (
+            f"{min(token_counts)}-{max(token_counts)}"
+            if min(token_counts) != max(token_counts)
+            else str(token_counts[0])
+        ),
+        (
+            f"{min(atom_counts)}-{max(atom_counts)}"
+            if min(atom_counts) != max(atom_counts)
+            else str(atom_counts[0])
+        ),
         int(first_data["N_msa"].item()),
+        _batch_padding_fraction(items) if mode == "padded" else 0.0,
         ",".join(names[:4]) + ("..." if len(names) > 4 else ""),
     )
 
@@ -441,10 +768,15 @@ def _run_prediction_batch(
     configs: Any,
     items: list[tuple[dict[str, Any], Any]],
 ) -> Mapping[str, Any]:
-    first_data = items[0][0]
-    n_token = int(first_data["N_token"].item())
+    mode = _inference_batch_mode(configs)
+    n_token = max(_feature_token_count(data) for data, _atom_array in items)
     runner.update_model_configs(update_inference_configs(configs, n_token))
-    batch_data = first_data if len(items) == 1 else _stack_prediction_inputs(items)
+    first_data = items[0][0]
+    batch_data = (
+        first_data
+        if len(items) == 1
+        else _stack_prediction_inputs(items, mode=mode)
+    )
     return runner.predict(batch_data)
 
 
@@ -480,15 +812,22 @@ def _fallback_to_singletons(
 def _prediction_items(
     prediction: Mapping[str, Any],
     configs: Any,
-    batch_size: int,
+    items: list[tuple[dict[str, Any], Any]],
 ) -> list[Mapping[str, Any]]:
+    batch_size = len(items)
     if batch_size == 1:
         return [prediction]
-    return _split_batched_prediction(
+    predictions = _split_batched_prediction(
         prediction,
         batch_size=batch_size,
         default_n_sample=int(configs.sample_diffusion.N_sample),
     )
+    if _inference_batch_mode(configs) == "padded":
+        return [
+            _trim_prediction_for_data(prediction_i, data)
+            for prediction_i, (data, _atom_array) in zip(predictions, items)
+        ]
+    return predictions
 
 
 def _predict_and_dump_items(
@@ -503,7 +842,8 @@ def _predict_and_dump_items(
         return
 
     batch_size = len(items)
-    _describe_batch(items, seed)
+    mode = _inference_batch_mode(configs)
+    _describe_batch(items, seed, mode=mode)
     start = time.time()
     try:
         prediction = _run_prediction_batch(runner, configs, items)
@@ -511,7 +851,7 @@ def _predict_and_dump_items(
         _fallback_to_singletons(runner, configs, items, seed, num_data, exc)
         return
 
-    predictions = _prediction_items(prediction, configs, batch_size)
+    predictions = _prediction_items(prediction, configs, items)
     for prediction_i, (data, atom_array) in zip(predictions, items):
         _dump_prediction(runner, data, atom_array, seed, prediction_i)
         logger.info(
@@ -737,6 +1077,8 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
         seed_everything(seed=seed, deterministic=configs.deterministic)
         t1_start = time.time()
         batch_size = _inference_batch_size(configs)
+        batch_mode = _inference_batch_mode(configs)
+        max_padding_fraction = _inference_batch_max_padding_fraction(configs)
         pending: dict[Any, list[tuple[dict[str, Any], Any]]] = {}
 
         def flush_signature(signature: Any) -> None:
@@ -767,8 +1109,18 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                         f"N_asym {data['N_asym'].item()}, N_token {data['N_token'].item()}, "
                         f"N_atom {data['N_atom'].item()}, N_msa {data['N_msa'].item()}"
                     )
-                    signature = _input_feature_signature(data)
-                    pending.setdefault(signature, []).append((data, atom_array))
+                    signature = _batch_signature(data, batch_mode)
+                    item = (data, atom_array)
+                    bucket = pending.setdefault(signature, [])
+                    if (
+                        batch_mode == "padded"
+                        and bucket
+                        and _batch_padding_fraction([*bucket, item])
+                        > max_padding_fraction
+                    ):
+                        flush_signature(signature)
+                        bucket = pending.setdefault(signature, [])
+                    bucket.append(item)
                     if len(pending[signature]) >= batch_size:
                         flush_signature(signature)
                 except Exception as e:

@@ -28,11 +28,15 @@ inference_configs = {
     "input_json_path": RequiredValue(str),
     "load_checkpoint_dir": os.path.join(PROTENIX_ROOT_DIR, "checkpoint"),
     "num_workers": 0,
-    # Number of same-shape JSON inputs to run in one model forward during
-    # inference.  The public runner keeps this at 1 by default; larger values
-    # are used only when all tensor feature shapes match exactly, so ragged
-    # padding cannot leak into model outputs.
+    # Number of JSON inputs to run in one model forward during inference.
+    # By default the runner only batches exactly matching tensor trees.
     "inference_batch_size": 1,
+    # "exact" is the safe default. "padded" is an opt-in throughput mode for
+    # design panels with nearby, but not identical, token/atom counts. It pads
+    # only known token/atom axes and falls back to smaller buckets when the
+    # padding waste would be too high.
+    "inference_batch_mode": "exact",
+    "inference_batch_max_padding_fraction": 0.25,
     "use_msa": True,
     "enable_tf32": True,
     "enable_efficient_fusion": True,
