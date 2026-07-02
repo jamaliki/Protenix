@@ -671,6 +671,8 @@ class TriangleAttention(nn.Module):
         chunk_size: Optional[int] = None,
         triangle_attention: str = "torch",
         inplace_safe: bool = False,
+        residual: Optional[torch.Tensor] = None,
+        residual_inplace: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -688,6 +690,8 @@ class TriangleAttention(nn.Module):
         if not self.starting:
             x = x.transpose(-2, -3)
             mask = mask.transpose(-1, -2)
+            if residual is not None:
+                residual = residual.transpose(-2, -3)
 
         # [*, I, J, C_in]
         x = self.layer_norm(x)
@@ -721,12 +725,20 @@ class TriangleAttention(nn.Module):
                 triangle_attention=triangle_attention,
                 inplace_safe=inplace_safe,
             )
+            if residual is not None:
+                if residual_inplace:
+                    residual += x
+                    x = residual
+                else:
+                    x = residual + x
         else:
             x = self.mha(
                 q_x=x,
                 kv_x=x,
                 biases=biases,
                 triangle_attention=triangle_attention,
+                residual=residual,
+                residual_inplace=residual_inplace,
             )
 
         if not self.starting:

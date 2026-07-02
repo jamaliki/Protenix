@@ -26,6 +26,9 @@ from scipy.stats import truncnorm
 from protenix.model.modules.fused_elementwise_triton import (
     triton_sigmoid_mul_heads_first,
 )
+from protenix.model.triangular.output_epilogue_triton import (
+    triton_gate_linear_residual_heads_first,
+)
 from protenix.model.triangular.qkv_layout_triton import triton_qkv_to_cueq_heads_first
 from protenix.model.utils import (
     chunk_layer,
@@ -437,7 +440,26 @@ class Attention(nn.Module):
 
         return o
 
-    def _wrap_up_heads_first(self, o: torch.Tensor, q_x: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _add_residual(
+        o: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        residual_inplace: bool,
+    ) -> torch.Tensor:
+        if residual is None:
+            return o
+        if residual_inplace:
+            residual += o
+            return residual
+        return residual + o
+
+    def _wrap_up_heads_first(
+        self,
+        o: torch.Tensor,
+        q_x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        residual_inplace: bool = False,
+    ) -> torch.Tensor:
         """Output epilogue for cuequivariance's ``[..., H, Q, C]`` layout.
 
         The generic path transposes cuequivariance output to ``[..., Q, H, C]``,
@@ -450,9 +472,24 @@ class Attention(nn.Module):
         """
         if self.linear_g is not None:
             gate = self.linear_g(q_x)
+            if residual is not None and self.linear_o.bias is None:
+                fused = triton_gate_linear_residual_heads_first(
+                    gate,
+                    o,
+                    self.linear_o.weight,
+                    residual,
+                    inplace=residual_inplace,
+                )
+                if fused is not None:
+                    return fused
+
             gated = triton_sigmoid_mul_heads_first(gate, o)
             if gated is not None:
-                return self.linear_o(gated)
+                return self._add_residual(
+                    self.linear_o(gated),
+                    residual,
+                    residual_inplace,
+                )
 
             o = o.transpose(-2, -3)
             g = self.sigmoid(gate)
@@ -462,7 +499,7 @@ class Attention(nn.Module):
             o = o.transpose(-2, -3)
 
         o = flatten_final_dims(o, 2)
-        return self.linear_o(o)
+        return self._add_residual(self.linear_o(o), residual, residual_inplace)
 
     def forward(
         self,
@@ -470,6 +507,8 @@ class Attention(nn.Module):
         kv_x: torch.Tensor,
         biases: Optional[List[torch.Tensor]] = None,
         triangle_attention: str = "torch",
+        residual: Optional[torch.Tensor] = None,
+        residual_inplace: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -551,12 +590,18 @@ class Attention(nn.Module):
                 # Squeeze only that overload; real B>1 sequence batches must
                 # be preserved for independent multi-target inference.
                 o = o.squeeze(0)
-            return self._wrap_up_heads_first(o, q_x)
+            return self._wrap_up_heads_first(
+                o,
+                q_x,
+                residual=residual,
+                residual_inplace=residual_inplace,
+            )
         else:
             o = _attention(q, k, v, biases)
             o = o.transpose(-2, -3)
 
         o = self._wrap_up(o, q_x)
+        o = self._add_residual(o, residual, residual_inplace)
 
         return o
 

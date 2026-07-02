@@ -135,6 +135,7 @@ class PairformerBlock(nn.Module):
                 [..., N_token, c_s] | None
                 [..., N_token, N_token, c_z]
         """
+        tri_att_residual_identity = not self.training and chunk_size is None
         if inplace_safe:
             z = self.tri_mul_out(
                 z,
@@ -150,21 +151,47 @@ class PairformerBlock(nn.Module):
                 _add_with_inplace=True,
                 triangle_multiplicative=triangle_multiplicative,
             )
-            z += self.tri_att_start(
-                z,
-                mask=pair_mask,
-                triangle_attention=triangle_attention,
-                inplace_safe=inplace_safe,
-                chunk_size=chunk_size,
-            )
+            if tri_att_residual_identity:
+                # In inference the row-wise dropout is the identity, so the
+                # triangle-attention epilogue can write ``z + update`` directly
+                # into ``z``.  The attention module still owns the Triton guard;
+                # fallback is the same in-place residual add as the old path.
+                z = self.tri_att_start(
+                    z,
+                    mask=pair_mask,
+                    triangle_attention=triangle_attention,
+                    inplace_safe=inplace_safe,
+                    chunk_size=chunk_size,
+                    residual=z,
+                    residual_inplace=True,
+                )
+            else:
+                z += self.tri_att_start(
+                    z,
+                    mask=pair_mask,
+                    triangle_attention=triangle_attention,
+                    inplace_safe=inplace_safe,
+                    chunk_size=chunk_size,
+                )
             z = z.transpose(-2, -3).contiguous()
-            z += self.tri_att_end(
-                z,
-                mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
-                triangle_attention=triangle_attention,
-                inplace_safe=inplace_safe,
-                chunk_size=chunk_size,
-            )
+            if tri_att_residual_identity:
+                z = self.tri_att_end(
+                    z,
+                    mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
+                    triangle_attention=triangle_attention,
+                    inplace_safe=inplace_safe,
+                    chunk_size=chunk_size,
+                    residual=z,
+                    residual_inplace=True,
+                )
+            else:
+                z += self.tri_att_end(
+                    z,
+                    mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
+                    triangle_attention=triangle_attention,
+                    inplace_safe=inplace_safe,
+                    chunk_size=chunk_size,
+                )
             z = z.transpose(-2, -3).contiguous()
             z += self.pair_transition(z)
         else:
@@ -186,31 +213,51 @@ class PairformerBlock(nn.Module):
             )
             z = dropout_add_rowwise(z, tmu_update, self.p_drop, self.training)
             del tmu_update
-            z = dropout_add_rowwise(
-                z,
-                self.tri_att_start(
+            if tri_att_residual_identity:
+                z = self.tri_att_start(
                     z,
                     mask=pair_mask,
                     triangle_attention=triangle_attention,
                     inplace_safe=inplace_safe,
                     chunk_size=chunk_size,
-                ),
-                self.p_drop,
-                self.training,
-            )
+                    residual=z,
+                )
+            else:
+                z = dropout_add_rowwise(
+                    z,
+                    self.tri_att_start(
+                        z,
+                        mask=pair_mask,
+                        triangle_attention=triangle_attention,
+                        inplace_safe=inplace_safe,
+                        chunk_size=chunk_size,
+                    ),
+                    self.p_drop,
+                    self.training,
+                )
             z = z.transpose(-2, -3).contiguous()
-            z = dropout_add_rowwise(
-                z,
-                self.tri_att_end(
+            if tri_att_residual_identity:
+                z = self.tri_att_end(
                     z,
                     mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
                     triangle_attention=triangle_attention,
                     inplace_safe=inplace_safe,
                     chunk_size=chunk_size,
-                ),
-                self.p_drop,
-                self.training,
-            )
+                    residual=z,
+                )
+            else:
+                z = dropout_add_rowwise(
+                    z,
+                    self.tri_att_end(
+                        z,
+                        mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
+                        triangle_attention=triangle_attention,
+                        inplace_safe=inplace_safe,
+                        chunk_size=chunk_size,
+                    ),
+                    self.p_drop,
+                    self.training,
+                )
             z = z.transpose(-2, -3).contiguous()
 
             z = z + self.pair_transition(z)

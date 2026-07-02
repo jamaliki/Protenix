@@ -33,15 +33,11 @@ from protenix.model.modules.fused_elementwise_triton import (
     triton_sigmoid_mul_heads_first,
 )
 from protenix.model.triangular.layers import cuequivariance_triangular_attn
+from protenix.model.triangular.output_epilogue_triton import (
+    triton_gate_linear_residual_heads_first,
+)
 from protenix.model.triangular.triangular import TriangleAttention
 from protenix.model.utils import permute_final_dims
-
-try:
-    import triton
-    import triton.language as tl
-except ImportError:  # pragma: no cover - optional dependency.
-    triton = None
-    tl = None
 
 
 def str_bool(value: str | bool) -> bool:
@@ -68,63 +64,7 @@ def cuda_autocast(dtype_name: str):
             yield
 
 
-if triton is not None and tl is not None:
-
-    @triton.jit
-    def _gate_linear_residual_kernel(
-        gate_ptr,
-        heads_ptr,
-        weight_ptr,
-        residual_ptr,
-        out_ptr,
-        total_rows: tl.constexpr,
-        tokens: tl.constexpr,
-        n_heads: tl.constexpr,
-        head_dim: tl.constexpr,
-        in_features: tl.constexpr,
-        out_features: tl.constexpr,
-        block_m: tl.constexpr,
-        block_n: tl.constexpr,
-        block_k: tl.constexpr,
-    ):
-        rows = tl.program_id(0) * block_m + tl.arange(0, block_m)
-        cols = tl.program_id(1) * block_n + tl.arange(0, block_n)
-
-        j = rows % tokens
-        tmp = rows // tokens
-        i = tmp % tokens
-        batch = tmp // tokens
-
-        acc = tl.zeros((block_m, block_n), dtype=tl.float32)
-        for k0 in range(0, in_features, block_k):
-            ks = k0 + tl.arange(0, block_k)
-            head = ks // head_dim
-            d = ks % head_dim
-
-            gate_offsets = rows[:, None] * in_features + ks[None, :]
-            heads_offsets = (
-                ((((batch[:, None] * tokens + i[:, None]) * n_heads + head[None, :])
-                  * tokens + j[:, None])
-                 * head_dim + d[None, :])
-            )
-            weight_offsets = cols[None, :] * in_features + ks[:, None]
-
-            valid_a = (rows[:, None] < total_rows) & (ks[None, :] < in_features)
-            gate = tl.load(gate_ptr + gate_offsets, mask=valid_a, other=0.0)
-            heads = tl.load(heads_ptr + heads_offsets, mask=valid_a, other=0.0)
-            a = (tl.sigmoid(gate.to(tl.float32)) * heads).to(tl.bfloat16)
-
-            valid_w = (cols[None, :] < out_features) & (ks[:, None] < in_features)
-            weight = tl.load(weight_ptr + weight_offsets, mask=valid_w, other=0.0)
-            acc += tl.dot(a, weight)
-
-        out_offsets = rows[:, None] * out_features + cols[None, :]
-        valid_out = (rows[:, None] < total_rows) & (cols[None, :] < out_features)
-        residual = tl.load(residual_ptr + out_offsets, mask=valid_out, other=0.0)
-        tl.store(out_ptr + out_offsets, acc + residual, mask=valid_out)
-
-
-def fused_gate_linear_residual(
+def candidate_gate_linear_residual(
     gate: torch.Tensor,
     heads_first: torch.Tensor,
     weight: torch.Tensor,
@@ -135,38 +75,19 @@ def fused_gate_linear_residual(
     block_k: int,
     num_warps: int,
 ) -> torch.Tensor:
-    if triton is None or tl is None:
-        raise RuntimeError("Triton is required")
-    if gate.dim() != 4 or heads_first.dim() != 5:
-        raise ValueError("expected gate [B,T,T,C] and heads [B,T,H,T,D]")
-    if not gate.is_contiguous() or not heads_first.is_contiguous():
-        raise ValueError("gate and heads_first must be contiguous")
-    if not residual.is_contiguous() or not weight.is_contiguous():
-        raise ValueError("residual and weight must be contiguous")
-
-    batch, tokens, _, in_features = gate.shape
-    _, _, n_heads, _, head_dim = heads_first.shape
-    out_features = weight.shape[0]
-    total_rows = batch * tokens * tokens
-    out = torch.empty_like(residual)
-    grid = (triton.cdiv(total_rows, block_m), triton.cdiv(out_features, block_n))
-    _gate_linear_residual_kernel[grid](
+    out = triton_gate_linear_residual_heads_first(
         gate,
         heads_first,
         weight,
         residual,
-        out,
-        total_rows,
-        tokens,
-        n_heads,
-        head_dim,
-        in_features,
-        out_features,
-        block_m,
-        block_n,
-        block_k,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
         num_warps=num_warps,
+        require_env=False,
     )
+    if out is None:
+        raise RuntimeError("production Triton epilogue helper rejected fixture")
     return out
 
 
@@ -348,7 +269,7 @@ def main() -> None:
         for block_m, block_n, block_k, warps in parse_configs(args.configs):
             out, ms = cuda_time(
                 lambda bm=block_m, bn=block_n, bk=block_k, nw=warps: (
-                    fused_gate_linear_residual(
+                    candidate_gate_linear_residual(
                         fixture["gate"],
                         fixture["heads"],
                         fixture["weight"],
