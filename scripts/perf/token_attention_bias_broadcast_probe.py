@@ -12,8 +12,10 @@ The production path currently repeats the smaller projected bias to
 ``[B * S, H, N, N]`` and then calls SDPA on flattened q/k/v.  This script asks a
 decisive question before writing a custom kernel: can PyTorch/cuDNN consume the
 natural rank-5 broadcast form quickly enough, or does it fall back to a slow
-path?  A fast rank-5 result would justify a small model change; a slow result
-justifies treating this as a custom attention-kernel boundary.
+path?  A fast rank-5 result would justify a small model change, but only if the
+Protenix attention wrapper also avoids its conservative rank-5 FP32 upcast.  A
+slow rank-5 result justifies treating this as a custom attention-kernel
+boundary.
 """
 
 from __future__ import annotations
@@ -69,6 +71,29 @@ def _compare(candidate: torch.Tensor, reference: torch.Tensor) -> dict[str, floa
         "max_abs": float(diff.max().item()),
         "mean_abs": float(diff.mean().item()),
     }
+
+
+def _to_fp32_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    """Mimic Protenix's current conservative rank-5 attention policy.
+
+    ``protenix.model.modules.primitives._attention`` upcasts any q/k/v with
+    rank >= 5 to FP32.  That is good for atom local attention, where the helper
+    sees a trunk axis and small 32x128 windows, but it may be unnecessarily
+    expensive for full token attention with a real sample axis.  Keep this case
+    in the benchmark so a fast BF16 rank-5 SDPA result is not mistaken for a
+    production-ready model change.
+    """
+    return F.scaled_dot_product_attention(
+        q.float(),
+        k.float(),
+        v.float(),
+        attn_mask=bias.float(),
+    ).to(dtype=q.dtype)
 
 
 def _record_case(
@@ -210,6 +235,15 @@ def main() -> None:
         _record_case(
             "rank5_broadcast_bias",
             lambda: F.scaled_dot_product_attention(q5, k5, v5, attn_mask=bias[:, None]),
+            reference=reference,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+    )
+    cases.append(
+        _record_case(
+            "rank5_broadcast_bias_protenix_current_fp32_policy",
+            lambda: _to_fp32_sdpa(q5, k5, v5, bias[:, None]),
             reference=reference,
             warmup=args.warmup,
             iters=args.iters,

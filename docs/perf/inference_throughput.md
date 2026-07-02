@@ -391,10 +391,13 @@ is much cheaper than re-projecting `z`, but it is still HBM traffic every
 diffusion block.  `scripts/perf/token_attention_bias_broadcast_probe.py`
 therefore compares the current flattened SDPA call against natural rank-5
 `[record, sample, heads, tokens, head_dim]` SDPA with stride-0 or broadcasted
-sample-invariant bias.  If rank-5 BF16/cuDNN is fast, this becomes a small
-model change.  If it falls back to a slow path, the right next boundary is a
-custom token-attention kernel that indexes bias by `record = flat_batch //
-N_sample` without materializing repeated bias rows.
+sample-invariant bias.  It also times a rank-5 FP32-upcast case because
+Protenix's current generic attention helper conservatively upcasts rank-5 q/k/v
+for atom local-attention safety.  If rank-5 BF16/cuDNN is fast, the model change
+must also relax that policy only for full token attention.  If rank-5 itself
+falls back to a slow path, the right next boundary is a custom token-attention
+kernel that indexes bias by `record = flat_batch // N_sample` without
+materializing repeated bias rows.
 
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`
