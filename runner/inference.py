@@ -1104,12 +1104,21 @@ def _fallback_to_singletons(
         torch.cuda.empty_cache()
         return
 
+    failure_traceback = traceback.format_exc()
     logger.warning(
         "Batched prediction of %d compatible inputs failed; falling back "
-        "to singleton inference. Error: %s",
+        "to singleton inference. Error: %s\n%s",
         len(items),
         exc,
+        failure_traceback,
     )
+    if os.getenv("PROTENIX_RAISE_ON_BATCH_FALLBACK", "").strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }:
+        raise exc
     torch.cuda.empty_cache()
     for item in items:
         _predict_and_dump_items(runner, configs, [item], seed, num_data, batch_mode)
