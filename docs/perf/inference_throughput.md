@@ -329,6 +329,34 @@ and the batched atom encoder/decoder (`4.22s` combined).  Further throughput
 work should target those boundaries rather than the now-small conditioning
 path.
 
+Low-sample ragged diffusion follow-up: branch
+`codex/ragged-multisample-diffusion` extends the mixed-token diffusion batching
+boundary from `N_sample=1` to the practical campaign range `N_sample=2-5`.
+The key shape rule is that `(record, sample)` is flattened only for token
+activations and masks, preserving the rank-4 BF16/cuDNN attention path; the
+sample-invariant pair tensor `z` stays at record grain and only the smaller
+projected attention bias is repeated across sample lanes.  This avoids both
+the old per-record diffusion tail and the wasteful `N_sample` repetition of
+pair-bias layernorm/projection work.  The path is guarded by
+`PROTENIX_BATCH_DIFFUSION_MAX_SAMPLES` (default `5`) so large single-design
+sampling jobs do not accidentally multiply memory by the protein batch.
+
+Status: running, not promoted.  A shape smoke is queued as job `95868`
+(`N_sample=2`, `N_step=1`, `N_cycle=1`) and the representative paired gate is
+queued as job `95869` with `afterok:95868`.  The gate uses the same 32 mixed
+40-220-token proteins as job `95624`, `N_sample=5`, `N_step=200`,
+`--batch_size 16`, confidence enabled, no MSA/template, and compares
+`PROTENIX_BATCH_DIFFUSION_MAX_SAMPLES=1` versus `5` with
+`PROTENIX_BROADCAST_DIFFUSION_S=1` in both cases.  Earlier queued jobs `95841`
+and `95848` were canceled before running because their spooled scripts did not
+enable the fair broadcast-conditioning baseline.  Parse the completed gate with:
+
+```bash
+python scripts/perf/parse_batch_gate_log.py \
+  runs/ragged_ns5_pair_b16_n200_20260702_194627 \
+  --samples-per-input 5
+```
+
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`
 (`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/fusion_flags_pair_b16_n200_20260702_170343`)
