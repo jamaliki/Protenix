@@ -1,11 +1,24 @@
 #!/usr/bin/env python3
-"""Find where padded pairformer tokens leak into valid outputs.
+"""Diagnose why padded pairformer tokens change valid outputs.
 
 Same-shape batching is now correct for independent sequences, but production
 queues often contain nearby rather than identical lengths.  Padding is only
 safe if the valid region of a padded run matches a standalone short run.  This
 diagnostic replays one PairformerBlock stage by stage and compares the valid
-slice after each stage, so mask fixes can target the first leaking operation.
+slice after each stage.
+
+Two comparisons matter:
+
+* ``*_valid_region`` compares a short physical tensor with the same values
+  embedded in a larger zero-padded tensor.  A nonzero value here means the
+  operation is not invariant to physical token length.
+* ``*_invalid_region_sensitivity`` compares two padded tensors with identical
+  valid values but different invalid/padded values.  A nonzero value here would
+  be a real mask leak.
+
+This distinction is important for GPU work: padding can be numerically unsafe
+even when the masks are correct, because changing the physical problem size can
+select different matmul/attention reduction schedules.
 """
 
 from __future__ import annotations
@@ -77,15 +90,28 @@ def record(
     name: str,
     short_s: torch.Tensor,
     short_z: torch.Tensor,
-    full_s: torch.Tensor,
-    full_z: torch.Tensor,
+    zero_s: torch.Tensor,
+    zero_z: torch.Tensor,
+    noisy_s: torch.Tensor,
+    noisy_z: torch.Tensor,
     short_tokens: int,
 ) -> None:
     rows.append(
         {
             "stage": name,
-            "s_valid_region": compare(full_s[:short_tokens], short_s),
-            "z_valid_region": compare(full_z[:short_tokens, :short_tokens], short_z),
+            "s_valid_region": compare(zero_s[:short_tokens], short_s),
+            "z_valid_region": compare(
+                zero_z[:short_tokens, :short_tokens],
+                short_z,
+            ),
+            "s_invalid_region_sensitivity": compare(
+                noisy_s[:short_tokens],
+                zero_s[:short_tokens],
+            ),
+            "z_invalid_region_sensitivity": compare(
+                noisy_z[:short_tokens, :short_tokens],
+                zero_z[:short_tokens, :short_tokens],
+            ),
         }
     )
 
@@ -203,18 +229,59 @@ def main() -> None:
     z_full[:short, :short] = z_short
     mask_full[:short, :short] = 1
 
+    # Same valid values, same mask, but deliberately dirty padded rows/columns.
+    # If these values affect the valid crop, the problem is a mask leak.  If
+    # only the zero-padded tensor differs from the short tensor, the problem is
+    # physical-length-dependent floating-point scheduling.
+    noisy_generator = torch.Generator(device=device).manual_seed(args.seed + 211)
+    s_noisy = torch.randn(
+        full,
+        args.c_s,
+        device=device,
+        dtype=dtype,
+        generator=noisy_generator,
+    )
+    z_noisy = torch.randn(
+        full,
+        full,
+        args.c_z,
+        device=device,
+        dtype=dtype,
+        generator=noisy_generator,
+    )
+    s_noisy[:short] = s_short
+    z_noisy[:short, :short] = z_short
+
     amp = cuda_autocast(args.compute_dtype)
     with torch.inference_mode(), amp:
         short_rows = run_stages(block, s_short, z_short, mask_short, args)
         full_rows = run_stages(block, s_full, z_full, mask_full, args)
+        noisy_rows = run_stages(block, s_noisy, z_noisy, mask_full, args)
         torch.cuda.synchronize()
 
     comparisons: list[dict[str, object]] = []
-    for (short_name, short_s, short_z), (full_name, full_s, full_z) in zip(
-        short_rows, full_rows
+    for (
+        (short_name, short_s, short_z),
+        (full_name, full_s, full_z),
+        (noisy_name, noisy_s, noisy_z),
+    ) in zip(
+        short_rows,
+        full_rows,
+        noisy_rows,
     ):
         assert short_name == full_name
-        record(comparisons, short_name, short_s, short_z, full_s, full_z, short)
+        assert short_name == noisy_name
+        record(
+            comparisons,
+            short_name,
+            short_s,
+            short_z,
+            full_s,
+            full_z,
+            noisy_s,
+            noisy_z,
+            short,
+        )
 
     print(
         json.dumps(

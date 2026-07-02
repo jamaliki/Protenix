@@ -177,6 +177,12 @@ Naively padding nearby but unequal token lengths into one pairformer batch is
 not promoted.  A corrected padding diagnostic snapshots every stage because the
 pairformer uses in-place kernels during inference; without those snapshots, an
 earlier row can be mutated by a later stage and point to the wrong boundary.
+`scripts/perf/pairformer_padding_breakdown.py` reports two separate quantities:
+`*_valid_region` compares a true short tensor with the same valid crop embedded
+in a larger zero-padded tensor, while `*_invalid_region_sensitivity` compares
+zero-padded and random-invalid padded tensors with the same mask.  The former
+finds physical-length-dependent numerical drift; the latter would find a real
+mask leak.
 With the fixed diagnostic, one padded 245-token block inside a 384-token tensor
 is almost exact in FP32, but the valid-region difference grows through a full
 stack.  On a 48-block random pairformer stack:
@@ -204,14 +210,23 @@ lanes were masked or zeroed:
 | token attention | 245-token physical tensor vs 384-token padded tensor | FP32 SDPA | about 9e-05 | length-dependent SDPA schedule |
 | token attention | 245-token physical tensor vs 384-token padded tensor | BF16 SDPA | 0.000488 | small first-boundary drift |
 
+The first broken invariant is therefore not "masked values leak"; it is
+"valid-crop output is invariant to physical token length".  The first nonzero
+boundary is the first triangle multiplication, whose reduction over the
+third/residue dimension changes from `N=245` to `N=384` even though the extra
+terms are masked to zero.  Triangle attention and token attention can add the
+same class of drift because their softmax/matmul kernels also choose schedules
+from the physical key length.  Pair and single transitions are not the root
+cause; they consume already-different activations and amplify them through
+LayerNorm, SiLU/gates, residual updates, and the 48-block trunk.
+
 So zeroing or masking harder is not the fix; the masks already block padded
 content.  The problem is that cuDNN SDPA, CUEQ, and related matmul reductions are
-not bitwise invariant to padded physical length.  The 48 residual pairformer
-blocks then amplify those small differences into material output drift.  Padded
-mixed-shape batching should therefore be treated as an explicit numerical-change
-feature that needs end-to-end structure/designability validation, not as a safe
-default throughput optimization.  The runner keeps exact tensor-tree batching and
-leaves shape-heterogeneous records in separate buckets.
+not bitwise invariant to padded physical length.  Padded mixed-shape batching
+should therefore be treated as an explicit numerical-change feature that needs
+end-to-end structure/designability validation, not as a safe default throughput
+optimization.  The runner keeps exact tensor-tree batching and leaves
+shape-heterogeneous records in separate buckets.
 
 ## Reproducing the benchmark
 
