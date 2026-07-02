@@ -198,6 +198,21 @@ def baseline_subranges(
     return out, {name: start.elapsed_time(end) for name, start, end in events}
 
 
+def warmup_baseline(
+    fixture: dict[str, torch.Tensor],
+    iters: int,
+) -> torch.Tensor:
+    # Compile Triton epilogues, initialize cuBLAS/cuBLASLt handles, and populate
+    # any autocast weight caches before the single-pass subrange events below.
+    # Otherwise the roofline fields report setup cost rather than steady-state
+    # kernel work.
+    with torch.inference_mode():
+        for _ in range(iters):
+            out = baseline_output(**fixture)
+        torch.cuda.synchronize()
+    return out
+
+
 def call_candidate(candidate: CandidateFn, fixture: dict[str, torch.Tensor]) -> torch.Tensor:
     return candidate(
         fixture["b"], fixture["weight"], fixture["gate"], fixture["residual"]
@@ -377,6 +392,7 @@ def main() -> None:
 
     with cuda_autocast(args.compute_dtype):
         fixture = make_fixture(block, args)
+        warmup_baseline(fixture, args.warmup)
         reference, subranges = baseline_subranges(**fixture)
         _, baseline_ms = cuda_time(
             lambda: baseline_output(**fixture),
