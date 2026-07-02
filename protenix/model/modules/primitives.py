@@ -317,10 +317,19 @@ class Transition(nn.Module):
         n (int): factor by which c_in is multiplied to obtain hidden dimension.
     """
 
-    def __init__(self, c_in: int, n: int) -> None:
+    def __init__(
+        self,
+        c_in: int,
+        n: int,
+        *,
+        inference_elementwise_fusion: bool = False,
+        input_projection_fusion: bool = False,
+    ) -> None:
         super(Transition, self).__init__()
         self.n = n
         self.c_in = c_in
+        self.inference_elementwise_fusion = inference_elementwise_fusion
+        self.input_projection_fusion = input_projection_fusion
         self.layernorm1 = LayerNorm(c_in)
         self.linear_no_bias_a = LinearNoBias(
             in_features=c_in, out_features=n * c_in, initializer="relu"
@@ -335,9 +344,11 @@ class Transition(nn.Module):
         self._input_projection_weight = None
 
     def _can_fuse_input_projection(self, x: torch.Tensor) -> bool:
-        if not transition_input_projection_fusion_enabled():
+        if not (
+            self.input_projection_fusion or transition_input_projection_fusion_enabled()
+        ):
             return False
-        if not triton_fused_elementwise_enabled():
+        if not (self.inference_elementwise_fusion or triton_fused_elementwise_enabled()):
             return False
         if not triton_fused_elementwise_available():
             return False
@@ -375,7 +386,11 @@ class Transition(nn.Module):
         if not self._can_fuse_input_projection(x):
             return None
         projected = F.linear(x, self._input_projection_params())
-        return triton_silu_mul_split(projected, self.n * self.c_in)
+        return triton_silu_mul_split(
+            projected,
+            self.n * self.c_in,
+            require_global_flag=not self.inference_elementwise_fusion,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -414,7 +429,11 @@ class Transition(nn.Module):
                 if b is None:
                     a = self.linear_no_bias_a(y)
                     b = self.linear_no_bias_b(y)
-                    fused_b = triton_silu_mul_inplace_y(a, b)
+                    fused_b = triton_silu_mul_inplace_y(
+                        a,
+                        b,
+                        require_global_flag=not self.inference_elementwise_fusion,
+                    )
                     if fused_b is None:
                         a = F.silu(a, True)
                         b *= a

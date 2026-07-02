@@ -86,6 +86,10 @@ def triton_fused_elementwise_available() -> bool:
 def _can_use_triton(*tensors: torch.Tensor) -> bool:
     if not triton_fused_elementwise_enabled():
         return False
+    return _can_use_triton_without_global_flag(*tensors)
+
+
+def _can_use_triton_without_global_flag(*tensors: torch.Tensor) -> bool:
     if not triton_fused_elementwise_available():
         return False
     if torch.is_grad_enabled():
@@ -394,6 +398,8 @@ def triton_silu_mul(x: torch.Tensor, y: torch.Tensor) -> Optional[torch.Tensor]:
 def triton_silu_mul_inplace_y(
     x: torch.Tensor,
     y: torch.Tensor,
+    *,
+    require_global_flag: bool = True,
 ) -> Optional[torch.Tensor]:
     """Overwrite ``y`` with ``silu(x) * y`` when the inference fast path is safe.
 
@@ -403,7 +409,10 @@ def triton_silu_mul_inplace_y(
     memory model while reducing two memory-bound ATen launches to one Triton
     launch.
     """
-    if not _can_use_triton(x, y):
+    if require_global_flag:
+        if not _can_use_triton(x, y):
+            return None
+    elif not _can_use_triton_without_global_flag(x, y):
         return None
     total = y.numel()
     if total <= _MAX_TRITON_VECTOR_ELEMENTS:
@@ -432,8 +441,10 @@ def triton_silu_mul_inplace_y(
 def triton_silu_mul_split(
     x: torch.Tensor,
     split_size: int,
+    *,
+    require_global_flag: bool = True,
 ) -> Optional[torch.Tensor]:
-    if not triton_fused_elementwise_enabled():
+    if require_global_flag and not triton_fused_elementwise_enabled():
         return None
     if not triton_fused_elementwise_available():
         return None

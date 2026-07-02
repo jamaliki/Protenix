@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # pylint: disable=C0114
+import os
 from functools import partial
 from typing import Any, Optional
 
@@ -37,6 +38,19 @@ from protenix.model.utils import (
     pad_at_dim,
     sample_msa_feature_dict_random_without_replacement,
 )
+
+
+_FALSE_ENV_VALUES = {"0", "false", "off", "no"}
+
+
+def pairformer_transition_elementwise_enabled() -> bool:
+    value = os.getenv("PROTENIX_PAIRFORMER_TRANSITION_ELEMENTWISE", "1")
+    return value.lower() not in _FALSE_ENV_VALUES
+
+
+def pairformer_transition_input_projection_enabled() -> bool:
+    value = os.getenv("PROTENIX_PAIRFORMER_TRANSITION_INPUT_PROJECTION", "0")
+    return value.lower() not in _FALSE_ENV_VALUES
 
 
 class PairformerBlock(nn.Module):
@@ -92,7 +106,18 @@ class PairformerBlock(nn.Module):
         )
         self.dropout_row = DropoutRowwise(dropout)
         self.p_drop = dropout
-        self.pair_transition = Transition(c_in=c_z, n=num_intermediate_factor)
+        self.pair_transition = Transition(
+            c_in=c_z,
+            n=num_intermediate_factor,
+            # The global Triton elementwise flag was rejected in the full
+            # mixed-sequence gate because it also touches diffusion and
+            # confidence.  The pair-transition hot path is different: it holds
+            # two large projections and immediately computes SiLU(a) * b.  This
+            # instance-level flag lets only that measured boundary use the
+            # one-pass Triton kernel while preserving the rest of inference.
+            inference_elementwise_fusion=pairformer_transition_elementwise_enabled(),
+            input_projection_fusion=pairformer_transition_input_projection_enabled(),
+        )
         self.c_s = c_s
         if self.c_s > 0:
             self.attention_pair_bias = AttentionPairBias(
