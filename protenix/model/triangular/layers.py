@@ -362,9 +362,33 @@ class Attention(nn.Module):
         self, q_x: torch.Tensor, kv_x: torch.Tensor, apply_scale: bool = True
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # [*, Q/K/V, H * C_hidden]
-        q = self.linear_q(q_x)
-        k = self.linear_k(kv_x)
-        v = self.linear_v(kv_x)
+        if (
+            q_x is kv_x
+            and self.linear_q.bias is None
+            and self.linear_k.bias is None
+            and self.linear_v.bias is None
+            and self.linear_q.precision is None
+            and self.linear_k.precision is None
+            and self.linear_v.precision is None
+        ):
+            # Triangle attention is self-attention: q, k, and v are three
+            # projections of the same normalized pair tensor.  A single wider
+            # GEMM keeps the math identical but saves two launches and two
+            # rereads of a very large [B, N, N, C] activation.
+            d = q_x.dtype
+            weights = [self.linear_q.weight, self.linear_k.weight, self.linear_v.weight]
+            if d is torch.bfloat16:
+                with torch.amp.autocast("cuda", enabled=False):
+                    qkv = nn.functional.linear(
+                        q_x, torch.cat([weight.to(dtype=d) for weight in weights])
+                    )
+            else:
+                qkv = nn.functional.linear(q_x, torch.cat(weights))
+            q, k, v = qkv.chunk(3, dim=-1)
+        else:
+            q = self.linear_q(q_x)
+            k = self.linear_k(kv_x)
+            v = self.linear_v(kv_x)
 
         # [*, Q/K, H, C_hidden]
         q = q.view(q.shape[:-1] + (self.no_heads, -1))
