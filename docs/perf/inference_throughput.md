@@ -798,6 +798,26 @@ layout/gate kernels we already exposed:
 | LayerNorm | 1 | 0.81 | material, memory-heavy |
 | small GEMMs | 4 | 0.56 | not the bottleneck |
 
+The q/k/v layout producer itself was retuned after the README usage guide was
+merged (`main` commit `9d11636`).  A one-H100 isolated screen compared Triton
+block sizes `128-8192` at B32/B64/B96, `N_token=245`, BF16, `no_heads=4`,
+`head_dim=32`.  Block size `256` was consistently best and preserved exact
+parity against the original view/transpose/contiguous layout, but the absolute
+gain over the current `1024` default was small:
+
+| batch | best block | best mean ms | current mean ms | isolated gain |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 256 | 1.022 | 1.066 | 1.042x |
+| 64 | 256 | 2.027 | 2.103 | 1.037x |
+| 96 | 256 | 3.000 | 3.122 | 1.041x |
+
+That saves only about `0.04-0.12` ms per q/k/v layout launch, so the expected
+full-inference movement is below noise once this launch is embedded in two
+triangle attentions per pairformer block and the diffusion/confidence/output
+path.  Do not add a user-facing knob or change the default for this alone; it
+is a useful implementation detail only if a future fused-attention boundary
+reuses the same producer.
+
 This profile motivated an opt-in fused triangle-attention prototype on branch
 `codex/protenix-fused-triangle-attention-prototype`.  The prototype reads the
 fused qkv projection, applies the triangular key bias/mask, multiplies by the
@@ -841,6 +861,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Custom Triton transition output GEMM+gate/residual | best tile 2.00 ms versus 1.51 ms for cuBLAS plus fused gate/residual | the output epilogue is still attractive, but only if implemented as a vendor-quality CuTe/CUTLASS epilogue |
 | Naive fused Triton triangle attention | correct at N64, but B16/N245 slowed from 4.24-4.26 ms to 6.22-7.78 ms | the right boundary still needs a vendor-quality CUEQ/CuTe schedule |
 | CUEQ triangle-multiplication ONDEMAND tuning | total B64 block +0.34%, below noise | the shipped/default schedule is close enough for this shape |
+| CUEQ q/k/v layout block-size retuning | block `256` beat the current `1024` by 3.7-4.2% in isolation, but only saves `0.04-0.12` ms per layout launch | do not promote tiny tile retunes without a full-gate signal |
 | Default BF16 full-token attention after the promoted stack | isolated trunk-attention hotspot improved, but full exact-shape gates moved only +0.16% at B64 and +0.27% at B96 | do not promote dtype-policy changes unless the representative throughput gate moves, not just the local kernel |
 | Inference DataLoader workers for exact-shape batches | B8 had a small screen win, but B32 hit tensor-sharing failures unless switched to slower file-system sharing; clean B32 no-worker batching was better | do not add host-pipeline complexity unless it survives the actual many-input gate |
 | CUDA graph capture of the denoiser | slower in this setup | graph overhead/constraints can outweigh launch savings |
