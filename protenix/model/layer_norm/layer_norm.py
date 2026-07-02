@@ -38,6 +38,8 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from protenix.model.layer_norm.layer_norm_triton import triton_layer_norm
+
 
 current_dir = os.path.dirname(__file__)
 build_directory = current_dir if os.access(current_dir, os.W_OK | os.X_OK) else None
@@ -253,6 +255,15 @@ class FusedLayerNorm(torch.nn.Module):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if fast_layer_norm_cuda_v2 is None:
+            triton_output = triton_layer_norm(
+                input,
+                self.normalized_shape,
+                self.weight,
+                self.bias,
+                self.eps,
+            )
+            if triton_output is not None:
+                return triton_output
             dtype = input.dtype
             weight = None if self.weight is None else self.weight.to(dtype=dtype)
             bias = None if self.bias is None else self.bias.to(dtype=dtype)
