@@ -114,6 +114,8 @@ def sdpa_bias_forward(
     k_aug[..., :head_dim] = k
     q_aug[..., head_dim] = 1.0
     k_aug[..., head_dim] = triangle_bias / scale
+    v_aug = torch.zeros_like(q_aug)
+    v_aug[..., :head_dim] = v
 
     attn_mask = None
     if not full_mask:
@@ -122,11 +124,12 @@ def sdpa_bias_forward(
     o = F.scaled_dot_product_attention(
         q_aug,
         k_aug,
-        v,
+        v_aug,
         attn_mask=attn_mask,
         dropout_p=0.0,
         scale=scale,
     )
+    o = o[..., :head_dim]
     o = o.reshape(batch, rows, heads, cols, head_dim)
     return module.mha._wrap_up_heads_first(o, x)
 
