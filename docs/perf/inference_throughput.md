@@ -560,6 +560,15 @@ movement is dominated by noisier confidence/pairformer differences.  Keep
 attention/bias kernel beats the flattened BF16 boundary on the transformer
 itself.
 
+Launch-level follow-up: job `96110`
+(`runs/flat_bf16_batch_profile_20260702_221601_c8a532d`) profiles the best
+robust flattened BF16 setting with `N_sample=5`, `N_step=20`, `--batch_size 16`,
+and a PyTorch CUDA trace.  It was submitted to `gpu-canary` after the gate and
+is expected to write `rank0_batch_trace.json`, `rank0_batch_top_cuda.txt`, and
+`trace_aggregate.json`.  Use that trace to decide whether the next real kernel
+target is diffusion-transformer attention, pairformer/CUEQ layout traffic, or
+confidence-head work.
+
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`
 (`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/fusion_flags_pair_b16_n200_20260702_170343`)
