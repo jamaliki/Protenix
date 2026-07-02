@@ -98,7 +98,15 @@ def run_stages(
     args: argparse.Namespace,
 ) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
     rows: list[tuple[str, torch.Tensor, torch.Tensor]] = []
-    rows.append(("input", s, z))
+
+    def snapshot(name: str) -> None:
+        # Several pairformer paths run with ``inplace_safe=True`` and may reuse
+        # the same storage across stages.  Store real snapshots, not tensor
+        # aliases, otherwise a later in-place update can make an earlier row
+        # look divergent and point us at the wrong masking boundary.
+        rows.append((name, s.detach().clone(), z.detach().clone()))
+
+    snapshot("input")
 
     z = block.tri_mul_out(
         z,
@@ -107,7 +115,7 @@ def run_stages(
         _add_with_inplace=True,
         triangle_multiplicative=args.triangle_multiplicative,
     )
-    rows.append(("tri_mul_out", s, z))
+    snapshot("tri_mul_out")
 
     z = block.tri_mul_in(
         z,
@@ -116,7 +124,7 @@ def run_stages(
         _add_with_inplace=True,
         triangle_multiplicative=args.triangle_multiplicative,
     )
-    rows.append(("tri_mul_in", s, z))
+    snapshot("tri_mul_in")
 
     z = z + block.tri_att_start(
         z,
@@ -124,11 +132,11 @@ def run_stages(
         triangle_attention=args.triangle_attention,
         inplace_safe=True,
     )
-    rows.append(("tri_att_start", s, z))
+    snapshot("tri_att_start")
 
     z = z.transpose(-2, -3).contiguous()
     pair_mask = pair_mask.transpose(-1, -2)
-    rows.append(("transpose_after_start", s, z))
+    snapshot("transpose_after_start")
 
     z = z + block.tri_att_end(
         z,
@@ -136,21 +144,21 @@ def run_stages(
         triangle_attention=args.triangle_attention,
         inplace_safe=True,
     )
-    rows.append(("tri_att_end", s, z))
+    snapshot("tri_att_end")
 
     z = z.transpose(-2, -3).contiguous()
     pair_mask = pair_mask.transpose(-1, -2)
-    rows.append(("transpose_after_end", s, z))
+    snapshot("transpose_after_end")
 
     z = z + block.pair_transition(z)
-    rows.append(("pair_transition", s, z))
+    snapshot("pair_transition")
 
     token_mask = torch.diagonal(pair_mask, dim1=-2, dim2=-1)
     s = s + block.attention_pair_bias(a=s, s=None, z=z, token_mask=token_mask)
-    rows.append(("token_attention", s, z))
+    snapshot("token_attention")
 
     s = s + block.single_transition(s)
-    rows.append(("single_transition", s, z))
+    snapshot("single_transition")
     return rows
 
 
