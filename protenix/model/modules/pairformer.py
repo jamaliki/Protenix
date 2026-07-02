@@ -215,7 +215,11 @@ class PairformerBlock(nn.Module):
 
             z = z + self.pair_transition(z)
         if self.c_s > 0:
-            token_mask = torch.diagonal(pair_mask, dim1=-2, dim2=-1)
+            token_mask = (
+                None
+                if pair_mask is None
+                else torch.diagonal(pair_mask, dim1=-2, dim2=-1)
+            )
             s = s + self.attention_pair_bias(
                 a=s,
                 s=None,
