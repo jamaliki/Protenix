@@ -139,7 +139,7 @@ if triton_fused_elementwise_available():
         block_size: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        offsets = pid * block_size + tl.arange(0, block_size)
+        offsets = (pid * block_size + tl.arange(0, block_size)).to(tl.int64)
         mask = offsets < n_elements
         x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
@@ -156,7 +156,7 @@ if triton_fused_elementwise_available():
         block_size: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        offsets = pid * block_size + tl.arange(0, block_size)
+        offsets = (pid * block_size + tl.arange(0, block_size)).to(tl.int64)
         mask = offsets < n_elements
         x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
@@ -174,7 +174,7 @@ if triton_fused_elementwise_available():
         block_size: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        offsets = pid * block_size + tl.arange(0, block_size)
+        offsets = (pid * block_size + tl.arange(0, block_size)).to(tl.int64)
         mask = offsets < n_elements
         x_offsets = offsets % n_x_elements
         x = tl.load(x_ptr + x_offsets, mask=mask, other=0.0).to(tl.float32)
@@ -194,7 +194,7 @@ if triton_fused_elementwise_available():
         block_size: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        offsets = pid * block_size + tl.arange(0, block_size)
+        offsets = (pid * block_size + tl.arange(0, block_size)).to(tl.int64)
         mask = offsets < n_elements
         x_offsets = offsets % n_x_elements
         if z_broadcast:
@@ -216,7 +216,7 @@ if triton_fused_elementwise_available():
         block_size: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        offsets = pid * block_size + tl.arange(0, block_size)
+        offsets = (pid * block_size + tl.arange(0, block_size)).to(tl.int64)
         mask = offsets < n_elements
         x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
@@ -232,7 +232,7 @@ if triton_fused_elementwise_available():
         block_size: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        offsets = pid * block_size + tl.arange(0, block_size)
+        offsets = (pid * block_size + tl.arange(0, block_size)).to(tl.int64)
         mask = offsets < n_elements
         cols = offsets % split_size
         rows = offsets // split_size
@@ -258,7 +258,7 @@ if triton_fused_elementwise_available():
         block_size: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        offsets = pid * block_size + tl.arange(0, block_size)
+        offsets = (pid * block_size + tl.arange(0, block_size)).to(tl.int64)
         valid = offsets < n_elements
 
         hc = offsets % heads_channels

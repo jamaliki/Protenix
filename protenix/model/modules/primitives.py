@@ -33,6 +33,9 @@ from protenix.model.utils import (
 from protenix.model.modules.fused_elementwise_triton import (
     fused_sigmoid_mul,
     fused_sigmoid_mul_add,
+    triton_fused_elementwise_available,
+    triton_fused_elementwise_enabled,
+    triton_silu_mul_split,
 )
 
 
@@ -75,6 +78,15 @@ def _local_attention_gate_fusion_requested() -> bool:
 
 def attention_force_fp32() -> bool:
     return os.getenv("PROTENIX_ATTENTION_FORCE_FP32", "1").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
+def transition_input_projection_fusion_enabled() -> bool:
+    return os.getenv("PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION", "0").lower() not in {
         "0",
         "false",
         "off",
@@ -310,6 +322,44 @@ class Transition(nn.Module):
         self.linear_no_bias = LinearNoBias(
             in_features=n * c_in, out_features=c_in, initializer="zeros"
         )
+        self._input_projection_cache_key = None
+        self._input_projection_weight = None
+
+    def _can_fuse_input_projection(self, x: torch.Tensor) -> bool:
+        if not transition_input_projection_fusion_enabled():
+            return False
+        if not triton_fused_elementwise_enabled():
+            return False
+        if not triton_fused_elementwise_available():
+            return False
+        if torch.is_grad_enabled():
+            return False
+        if not x.is_cuda:
+            return False
+        hidden = self.n * self.c_in
+        return (
+            self.linear_no_bias_a.weight.shape == (hidden, self.c_in)
+            and self.linear_no_bias_b.weight.shape == (hidden, self.c_in)
+        )
+
+    def _input_projection_params(self) -> torch.Tensor:
+        weights = (self.linear_no_bias_a.weight, self.linear_no_bias_b.weight)
+        cache_key = tuple((weight.data_ptr(), weight._version) for weight in weights)
+        if cache_key != self._input_projection_cache_key:
+            # The transition MLP computes SiLU(x @ Wa.T) * (x @ Wb.T).  In
+            # large pairformer batches, x is the giant tensor.  A single wider
+            # GEMM avoids one reread of x; the split-aware Triton consumer then
+            # reads the two contiguous halves without materializing a strided
+            # split view.
+            self._input_projection_weight = torch.cat(weights, dim=0).contiguous()
+            self._input_projection_cache_key = cache_key
+        return self._input_projection_weight
+
+    def _fused_input_projection(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        if not self._can_fuse_input_projection(x):
+            return None
+        projected = F.linear(x, self._input_projection_params())
+        return triton_silu_mul_split(projected, self.n * self.c_in)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -344,12 +394,14 @@ class Transition(nn.Module):
             start = 0
             for chunk in chunks:
                 y = self.layernorm1(chunk)
-                a = self.linear_no_bias_a(y)
-                a = F.silu(a, True)
-                b = self.linear_no_bias_b(y)
+                b = self._fused_input_projection(y)
+                if b is None:
+                    a = self.linear_no_bias_a(y)
+                    a = F.silu(a, True)
+                    b = self.linear_no_bias_b(y)
+                    b *= a
+                    del a
                 del y
-                b *= a
-                del a
                 b = self.linear_no_bias(b)
                 if outputs is None:
                     # Most inference shapes, including B64/N245 pairformer,
