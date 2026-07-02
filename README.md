@@ -78,51 +78,120 @@ For detailed instructions on installation, data preprocessing, inference, and tr
 
 ### ⚡ H100 Inference Throughput Optimisation
 
-This repository includes an opt-in H100 inference-throughput path for workloads
-that generate many samples per input, or many independent inputs with a small
-sample count per input, while keeping the normal confidence outputs enabled.
-The optimisation stack combines larger unchunked sample/batch execution,
-BF16/autocast choices in the profiled diffusion paths, guarded Triton kernels
-for atom local attention and memory-bound elementwise gates, GPU-side random
-augmentation, and streamed confidence-summary computation to avoid keeping all
-pairwise confidence logits live at once.
+This branch contains H100-oriented inference optimisations for two high-throughput
+workloads. The goal is higher **per-GPU throughput** while keeping the normal
+confidence outputs enabled.
 
-On a representative one-H100 `7r6r` benchmark with `N_sample=2560`,
-`N_step=200`, and confidence enabled, the optimized configuration measured about
-`9.18-9.21` samples/sec per GPU, compared with `0.528` samples/sec for the
-default `N_sample=5` setting. The exact gain depends on GPU, input shape, driver
-stack, and memory headroom; the fast path is therefore exposed through explicit
-environment flags rather than enabled silently for every user.
+| workload | best entry point | main speedup mechanism |
+| --- | --- | --- |
+| Many independent designs, usually `N_sample=1-5` | Put all designs in one JSON file or one input directory and use `--batch_size 32` | Stack same-shape inputs into one model forward instead of launching one forward per JSON file |
+| Many samples for one design, e.g. `N_sample=1280-2560` | Use a large `-e/--sample` value with the fast-path environment flags below | Avoid sample-chunking overhead and use BF16/Triton/streamed-confidence paths |
 
-For protein-design style throughput with many independent `N_sample=1` inputs,
-the public inference CLI can batch exact-shape inputs in one model forward:
+#### Fast path for many independent designs
+
+This is the recommended path for protein-design campaigns that generate many
+small independent structure-prediction jobs. Do **not** run a shell loop over
+one JSON at a time. Put the files in a directory, or combine records into one
+top-level JSON list, and let the runner batch compatible records:
 
 ```bash
-protenix pred -i many_same_shape_inputs.json -o ./output --batch_size 32
+export PROTENIX_BF16_DIFFUSION_CORE=1
+export PROTENIX_TRITON_FUSED_ELEMENTWISE=1
+export PROTENIX_TRITON_FUSED_ATTENTION_RESIDUAL=1
+export PROTENIX_TRITON_FUSED_TRANSITION_RESIDUAL=1
+export PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION=1
+
+protenix pred \
+  -i ./campaign_jsons \
+  -o ./output \
+  -s 101 \
+  -c 10 \
+  -p 200 \
+  -e 1 \
+  -d bf16 \
+  --trimul_kernel cuequivariance \
+  --triatt_kernel cuequivariance \
+  --enable_cache true \
+  --enable_fusion true \
+  --enable_tf32 true \
+  --batch_size 32
 ```
 
-Only inputs whose feature tensors match exactly are stacked; different shapes
-are automatically kept in separate buckets rather than padded. When `-i` points
-to a directory of JSON files, the runner now merges the records into a transient
-campaign JSON before inference, so one-record-per-design campaigns can still
-fill exact-shape GPU batches while loading the model only once. In a paired
-directory-campaign gate on one H100, 32 one-record `7r6r` JSON files improved
-from `342.7s` to `121.5s` end to end (`2.82x`). With the same shape supplied as
-one combined JSON, exact-shape batching improved post-initialization runner
-time from `361.8s` to `69.3s` (`5.2x`). The same profiling loop found the trunk
-pairformer triangle-attention epilogue and CUEQ QKV layout conversion as useful
-memory boundaries. The guarded Triton epilogue fuses sigmoid gating,
-head-layout conversion, and flattening after the CUEQ attention kernel, while
-the QKV layout producer writes CUEQ's required `[..., I, H, J, D]` q/k/v tensors
-directly after the fused projection. Together these remove high-batch HBM
-traffic without replacing the vendor GEMM or CUEQ attention kernels. A separate
-guarded transition input-projection fusion remains opt-in for memory/batch-size
-experiments; when that wide projection is unsafe at larger batches, an in-place
-Triton fallback still fuses the memory-bound `SiLU(a) * b` transition activation
-without adding another giant temporary.
+How to get the full benefit:
 
-For the recommended flags, reproduction commands, profiling scripts, and the
-negative results that shaped the implementation, see
+- Use `--batch_size 32` as the default on H100. For 245-token `7r6r`-like
+  inputs, `32-64` is the practical knee; larger batches used much more memory
+  with little extra throughput.
+- Batch records with the same tensor shapes. The runner only stacks records
+  whose featurized tensor trees match exactly. Different shapes are processed in
+  separate buckets rather than padded, because padding the triangular trunk is
+  not guaranteed to be a semantic no-op. Token count, atom count, MSA depth, and
+  template/RNA settings can all affect the post-featurization shape.
+- Directory input is now campaign-aware. If `-i` points to a directory of
+  one-record JSON files, the runner merges compatible records into a transient
+  campaign JSON before inference, so the model can fill exact-shape batches
+  while still producing normal per-design outputs.
+- Reruns are safe: generated preprocessing siblings such as
+  `foo-update-msa.json` are ignored when the source `foo.json` is present.
+  This prevents a second directory run from silently inferring both files.
+- Keep `cuequivariance` triangle kernels, BF16 dtype, cache, fusion, and TF32
+  enabled unless you are debugging numerical or dependency issues.
+- Triton-backed CUEQ QKV layout conversion and triangle-attention epilogue
+  fusion are enabled by default when Triton is installed. If Triton is missing,
+  the code falls back safely but the throughput will be lower.
+
+Measured gates on one H100 with repeated `7r6r` inputs, `N_step=200`, confidence
+enabled, and normal CIF/JSON dumping:
+
+| input layout | previous behavior | optimized behavior | speedup |
+| --- | ---: | ---: | ---: |
+| 32 one-record JSON files in a directory | 342.7 s, 0.093 seq/s | 121.5 s, 0.263 seq/s | 2.82x end to end |
+| One combined JSON with 32 same-shape records | 361.8 s runner time | 69.3 s runner time | 5.2x after initialization |
+
+#### Fast path for many samples from one design
+
+For inference-time scaling on one input, use a large sample count and the
+large-sample fast-path flags:
+
+```bash
+export PROTENIX_GPU_RANDOM_AUGMENT=1
+export PROTENIX_BF16_DIFFUSION_CORE=1
+export PROTENIX_ATTENTION_FORCE_FP32=0
+export PROTENIX_TRITON_LOCAL_ATTN=1
+export PROTENIX_TRITON_LOCAL_ATTN_NUM_WARPS=1
+export PROTENIX_TRITON_LOCAL_ATTN_OUTPUT_BF16=1
+export PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS=1
+export PROTENIX_TRITON_FUSED_ELEMENTWISE=1
+export PROTENIX_TRITON_FUSED_TRANSITION_RESIDUAL=1
+export PROTENIX_BF16_ATOM_ATTENTION=1
+export PROTENIX_SUMMARY_SAMPLE_CHUNK_SIZE=32
+export PROTENIX_STREAM_CONFIDENCE_SUMMARY=1
+export PROTENIX_CONFIDENCE_LOGIT_CHUNK_SIZE=32
+export PROTENIX_BROADCAST_DIFFUSION_S=1
+
+protenix pred \
+  -i examples/input.json \
+  -o ./output_many_samples \
+  -s 101 \
+  -c 10 \
+  -p 200 \
+  -e 1280 \
+  -d bf16 \
+  --trimul_kernel cuequivariance \
+  --triatt_kernel cuequivariance \
+  --enable_cache true \
+  --enable_fusion true \
+  --enable_tf32 true
+```
+
+On the representative one-H100 `7r6r` benchmark, the optimized large-sample
+configuration measured about `9.18-9.21` samples/sec per GPU at
+`N_sample=2560`, compared with `0.528` samples/sec for the original default
+`N_sample=5` setting. If memory is tight, start with `-e 1280` before trying
+`-e 2560`.
+
+For full reproduction commands, profiling scripts, implementation details, and
+negative results that shaped these defaults, see
 [docs/perf/inference_throughput.md](docs/perf/inference_throughput.md). The
 benchmark and hotspot tools live under [scripts/perf](scripts/perf/).
 
