@@ -458,23 +458,55 @@ implementation correctly tested the transformer module with that shape, but the
 full diffusion batching path accidentally passed `[record, token, channel]`,
 which would broadcast against the sample axis incorrectly.
 
-Candidate gate status: queued from isolated checkout
+Candidate gate status: fixed, validation pending.  The isolated checkout is
 `/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_sampleaxis_40e51f8`.
 The first queued pair, jobs `95935`/`95936`, was canceled before running because
 the script accidentally enabled the large-sample Triton elementwise/residual
-flags that job `95635` had already rejected for mixed B16 campaigns.  The first
-canary replacement, job `95940`, then failed before model execution because a
-fresh checkout tried to JIT-build the fast layernorm extension without
-`CUDA_HOME`.  Corrected canary jobs `95948`/`95949` set `CUDA_HOME` to the CUDA
-toolkit bundled inside `env-boltz2`, plus `CC`, `CXX`, `LD_LIBRARY_PATH`, and a
-run-local `TORCH_EXTENSIONS_DIR`.
+flags that job `95635` had already rejected for mixed B16 campaigns.  Job
+`95940` and then `95948` failed before useful model execution because a fresh
+checkout tried to JIT-build the fast layernorm extension against an incomplete
+CUDA runtime.  Commit `17f6fcd` added a safe torch-layernorm fallback and commit
+`eafffad` added `PROTENIX_DISABLE_FAST_LAYER_NORM=1` so canaries can run even
+when the extension build is unavailable.
 
-Smoke job `95948`
-(`runs/sample_axis_canary_cudafix_b16s5_n200_20260702_205708`, `N_sample=2`,
-`N_step=1`) runs the real model path with both sample-axis flags enabled.
-Representative paired job `95949` (`afterok:95948`) uses the same 32 mixed
-40-220-token proteins with `N_sample=5`, `N_step=200`, `--batch_size 16`,
-confidence enabled, no MSA/template, and compares four cases on one canary H100:
+The next fallback canary pair, jobs `96025`/`96026`, deliberately used
+`PROTENIX_DISABLE_FAST_LAYER_NORM=1` and a run-local extension directory.
+`96025` reached the real mixed-token path, but the batched forward failed and
+fell back to singleton inference:
+
+```text
+Predicting 2 padded-token-trunk (auto) input(s): N_token 136-172, token_pad_eff 89.5%
+Batched prediction ... failed; falling back to singleton inference.
+Error: The size of tensor a (2) must match the size of tensor b (16)
+```
+
+The job still exited successfully because fallback is the production safety
+path, so representative gate `96026` was canceled before it could measure
+singleton fallback noise.  Commit `75ee498` made fallback failures auditable by
+logging the full traceback and allowing `PROTENIX_RAISE_ON_BATCH_FALLBACK=1`.
+The loud rerun `96040` localized the error to rank-5 diffusion-transformer SDPA.
+A raw H100 SDPA probe (`96049`,
+`runs/sdpa_rank5_shape_probe_20260702_214049`) showed that the intended shape
+`q=[B, sample, head, token, dim]` with
+`bias=[B, 1, head, token, token]` is accepted by PyTorch 2.11/cuDNN, so this
+was not an inherent SDPA limitation.
+
+Root cause: the model integration added an extra singleton to the conditioning
+tensor.  Batched diffusion conditioning already returns
+`s_batch=[record, 1, token, channel]`; the sample-axis branch passed
+`s_batch[:, None, :, :]`, creating `[record, 1, 1, token, channel]`.  AdaLN
+broadcast that into a spurious extra record axis, so SDPA saw the sample
+dimension where the attention-head dimension should be.  Commit `6cf7a2e`
+passes `s_batch` directly and documents the shape invariant.  Remote CPU/import
+tests in `env-boltz2` pass for `tests.test_campaign_json_batching`,
+`tests.test_ragged_multisample_diffusion`, and `tests.test_diffusion_transformer`.
+The corrected GPU smoke is queued as job `96056`
+(`runs/sample_axis_shape_fix_smoke_20260702_214336`) and must pass before any
+`N_sample=5` sample-axis timing can be trusted.
+
+Once the smoke passes, the representative paired gate should use the same 32
+mixed 40-220-token proteins with `N_sample=5`, `N_step=200`, `--batch_size 16`,
+confidence enabled, no MSA/template, and compare four cases on one H100:
 
 1. `old_low_sample_boundary`: `PROTENIX_BATCH_DIFFUSION_MAX_SAMPLES=1`,
    default full-attention FP32 policy.
