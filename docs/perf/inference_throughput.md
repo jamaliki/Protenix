@@ -524,7 +524,7 @@ not carry another default-off branch with no throughput signal.
 ### 3c. CuTe target from launch-level NCU, not guesswork
 
 Nsight Compute is installed on Tokyo in
-`/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/env-nsight/bin/ncu`.  The
+`/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/env-nsight/ncu`.  The
 first focused reports were captured on `gpu-canary-0` with the representative
 trunk shape `N_sample=1280`, `N_token=245`, `c_a=768`, BF16, and broadcast
 conditioning:
@@ -881,6 +881,38 @@ improved each triangle-multiplication module by about 3%, but only moved total
 B64 block time from 65.79 ms to 65.57 ms (+0.34%).  That is below promotion
 threshold and not worth depending on a per-shape external tuning cache.
 
+The pairformer orientation boundary was screened after the exact-shape campaign
+path was promoted.  The existing block implements ending-node triangle attention
+by physically transposing the full pair tensor before and after the ending
+attention call:
+
+```python
+z = z.transpose(-2, -3).contiguous()
+z += tri_att_end(z, ...)
+z = z.transpose(-2, -3).contiguous()
+```
+
+At B32/B64 those two explicit copies are measurable but small, about 3.35% of a
+full pairformer block:
+
+| batch | block ms | explicit transpose ms | transpose share | triangle attention share | pair transition share |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 39.87 | 1.34 | 3.36% | 44.5% | 21.1% |
+| 64 | 78.92 | 2.64 | 3.35% | 44.6% | 21.3% |
+
+A logical-ending prototype used `TriangleAttention(starting=False)` and added
+the returned non-contiguous ending update into the original contiguous `z`,
+removing the two explicit pair-tensor copies.  It was bitwise exact for one
+block at B32/B64/B96, but the full-block speedup was only `1.0076-1.0089x`.
+This is below the promotion threshold and confirms that the remaining "meat" is
+inside CUEQ attention, triangle multiplication, and transition GEMM epilogues,
+not the outer orientation copies.
+
+Run directories:
+
+- `pairformer_orientation_screen_20260702_123911`, Slurm job `95054`
+- `pairformer_logical_ending_screen_20260702_124119`, Slurm job `95058`
+
 ## Negative results worth remembering
 
 These failed because the real workload, not the isolated kernel, is the gate:
@@ -902,6 +934,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Naive fused Triton triangle attention | correct at N64, but B16/N245 slowed from 4.24-4.26 ms to 6.22-7.78 ms | the right boundary still needs a vendor-quality CUEQ/CuTe schedule |
 | CUEQ triangle-multiplication ONDEMAND tuning | total B64 block +0.34%, below noise | the shipped/default schedule is close enough for this shape |
 | CUEQ q/k/v layout block-size retuning | block `256` beat the current `1024` by 3.7-4.2% in isolation, but only saves `0.04-0.12` ms per layout launch | do not promote tiny tile retunes without a full-gate signal |
+| Logical ending-node triangle attention without explicit pair transposes | bitwise exact one-block screen but only `1.0076-1.0089x` at B32/B64/B96 | explicit pair-tensor orientation copies are measurable but not the dominant pairformer boundary |
 | Default BF16 full-token attention after the promoted stack | isolated trunk-attention hotspot improved, but full exact-shape gates moved only +0.16% at B64 and +0.27% at B96 | do not promote dtype-policy changes unless the representative throughput gate moves, not just the local kernel |
 | Inference DataLoader workers for exact-shape batches | B8 had a small screen win, but B32 hit tensor-sharing failures unless switched to slower file-system sharing; clean B32 no-worker batching was better | do not add host-pipeline complexity unless it survives the actual many-input gate |
 | CUDA graph capture of the denoiser | slower in this setup | graph overhead/constraints can outweigh launch savings |
