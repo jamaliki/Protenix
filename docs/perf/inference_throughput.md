@@ -357,6 +357,21 @@ python scripts/perf/parse_batch_gate_log.py \
   --samples-per-input 5
 ```
 
+While waiting for that gate, code inspection exposed a fusion-boundary issue in
+the optional Triton atom-local-attention path for `N_sample>1`.  Batched atom
+attention has activations shaped `[record, sample, ...]`, but the cached pair
+bias is sample-invariant and therefore shaped `[record, 1, heads, trunks, 32,
+128]`.  The old Triton wrapper tried to expand that bias to `[record, sample,
+...]` and then flatten it as a view.  PyTorch cannot represent that particular
+broadcast flatten without a copy, so the guard rejected the Triton kernel and
+fell back to the rank-5 PyTorch local-attention path.  Commit `506a418` keeps
+the compact bias and passes a `bias_sample_repeat` stride rule into the Triton
+kernel instead.  This is a kernel-boundary fix, not a promoted throughput claim
+yet: isolated hotspot job `95881`
+(`runs/local_attn_bcast_b16s5_20260702_200825`) measures the exact `B=16`,
+`N_sample=5`, broadcast-bias atom-attention shape before deciding whether the
+Triton atom-attention flags belong in the low-sample campaign stack.
+
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`
 (`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/fusion_flags_pair_b16_n200_20260702_170343`)
