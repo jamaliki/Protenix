@@ -182,17 +182,21 @@ def profile_cuda_ops(
 
     rows = []
     for event in profiler.key_averages():
-        cuda_total = float(getattr(event, "cuda_time_total", 0.0) or 0.0)
-        if cuda_total <= 0:
+        device_total = getattr(event, "device_time_total", None)
+        if device_total is None:
+            device_total = getattr(event, "cuda_time_total", 0.0)
+        device_total = float(device_total or 0.0)
+        if device_total <= 0:
             continue
+        self_device_total = getattr(event, "self_device_time_total", None)
+        if self_device_total is None:
+            self_device_total = getattr(event, "self_cuda_time_total", 0.0)
         rows.append(
             {
                 "key": event.key,
                 "count": int(getattr(event, "count", 0) or 0),
-                "cuda_time_total_us": cuda_total,
-                "self_cuda_time_total_us": float(
-                    getattr(event, "self_cuda_time_total", 0.0) or 0.0
-                ),
+                "cuda_time_total_us": device_total,
+                "self_cuda_time_total_us": float(self_device_total or 0.0),
                 "cpu_time_total_us": float(
                     getattr(event, "cpu_time_total", 0.0) or 0.0
                 ),
