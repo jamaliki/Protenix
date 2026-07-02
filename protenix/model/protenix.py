@@ -1268,7 +1268,14 @@ class Protenix(nn.Module):
                 # attention on tensor-core BF16 SDPA instead of the generic
                 # rank-5 FP32 safeguard used for atom local attention.
                 a_transformer = _expand_sample_axis(a_batch, N_sample)
-                s_transformer = s_batch[:, None, :, :]
+                # ``s_batch`` already carries a singleton sample axis from
+                # DiffusionConditioning: [record, 1, token, channel].  Adding
+                # another ``None`` here would produce
+                # [record, 1, 1, token, channel].  PyTorch broadcasting would
+                # then introduce a spurious extra record axis inside AdaLN, and
+                # SDPA would see the sample dimension where the head dimension
+                # should be.
+                s_transformer = s_batch
                 token_mask_transformer = token_mask[:, None, :]
             else:
                 a_transformer = _flatten_record_sample_axes(a_batch, N_sample)
