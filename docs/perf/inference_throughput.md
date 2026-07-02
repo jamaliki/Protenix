@@ -809,6 +809,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Custom Triton transition output GEMM+gate/residual | best tile 2.00 ms versus 1.51 ms for cuBLAS plus fused gate/residual | the output epilogue is still attractive, but only if implemented as a vendor-quality CuTe/CUTLASS epilogue |
 | Naive fused Triton triangle attention | correct at N64, but B16/N245 slowed from 4.24-4.26 ms to 6.22-7.78 ms | the right boundary still needs a vendor-quality CUEQ/CuTe schedule |
 | CUEQ triangle-multiplication ONDEMAND tuning | total B64 block +0.34%, below noise | the shipped/default schedule is close enough for this shape |
+| Default BF16 full-token attention after the promoted stack | isolated trunk-attention hotspot improved, but full exact-shape gates moved only +0.16% at B64 and +0.27% at B96 | do not promote dtype-policy changes unless the representative throughput gate moves, not just the local kernel |
 | Inference DataLoader workers for exact-shape batches | B8 had a small screen win, but B32 hit tensor-sharing failures unless switched to slower file-system sharing; clean B32 no-worker batching was better | do not add host-pipeline complexity unless it survives the actual many-input gate |
 | CUDA graph capture of the denoiser | slower in this setup | graph overhead/constraints can outweigh launch savings |
 
