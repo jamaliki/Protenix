@@ -382,6 +382,20 @@ sample-invariant.  Hotspot job `95891`
 (`runs/local_attn_masked_bcast_b16s5_20260702_201338`) times the more
 representative masked local-attention boundary.
 
+The analogous token-attention question is whether we can avoid explicitly
+repeating the projected pair bias across diffusion samples.  The current
+ragged `N_sample>1` path flattens q/k/v to `[record * sample, heads, tokens,
+head_dim]`, keeps pair-bias projection at record grain, then repeats the
+smaller `[record, heads, tokens, tokens]` bias over sample lanes.  That repeat
+is much cheaper than re-projecting `z`, but it is still HBM traffic every
+diffusion block.  `scripts/perf/token_attention_bias_broadcast_probe.py`
+therefore compares the current flattened SDPA call against natural rank-5
+`[record, sample, heads, tokens, head_dim]` SDPA with stride-0 or broadcasted
+sample-invariant bias.  If rank-5 BF16/cuDNN is fast, this becomes a small
+model change.  If it falls back to a slow path, the right next boundary is a
+custom token-attention kernel that indexes bias by `record = flat_batch //
+N_sample` without materializing repeated bias rows.
+
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`
 (`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/fusion_flags_pair_b16_n200_20260702_170343`)
