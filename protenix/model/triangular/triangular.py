@@ -492,9 +492,7 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
         # Therefore, we include a check here: if c != c_z, we fall back to using plain PyTorch.
         # This situation may occur in our template module.
         if triangle_multiplicative == "cuequivariance" and (self.c_z == self.c_hidden):
-            if _input_inplace_safe and _add_with_inplace:
-                z_in = z.clone()
-            z = kernel_triangular_mult(
+            update = kernel_triangular_mult(
                 z[None],
                 direction="outgoing" if self._outgoing else "incoming",
                 mask=z.new_ones(z.shape[:-1])[None] if mask is None else mask,
@@ -513,9 +511,13 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
                 eps=1e-5,  # In BF16, we use the default eps of 1e-5.
             )[0]
             if _input_inplace_safe and _add_with_inplace:
-                return z + z_in
-            else:
-                return z
+                # cuequivariance's triangle update is out-of-place for the
+                # profiled inference path: it reads ``z`` but does not mutate
+                # it.  That lets us preserve the residual without cloning the
+                # full pair tensor first.  At B64/N245 the avoided clone is
+                # almost 1 GiB of HBM traffic per triangle-mul call.
+                update.add_(z)
+            return update
         elif (triangle_multiplicative == "torch") or (self.c_z != self.c_hidden):
             if inplace_safe:
                 x = self._inference_forward(
