@@ -17,6 +17,14 @@ from contextlib import contextmanager, nullcontext
 
 import torch
 
+from protenix.model.modules.fused_elementwise_triton import (
+    triton_fused_elementwise_available,
+    triton_triangle_attention_epilogue_enabled,
+)
+from protenix.model.triangular.qkv_layout_triton import (
+    triton_cueq_qkv_layout_available,
+    triton_cueq_qkv_layout_enabled,
+)
 from protenix.model.triangular.triangular import TriangleAttention
 
 
@@ -104,7 +112,11 @@ def profile_cuda_ops(fn, warmup: int, row_limit: int):
 
     rows = []
     for event in profiler.key_averages():
-        cuda_total = float(getattr(event, "cuda_time_total", 0.0) or 0.0)
+        cuda_total = float(
+            getattr(event, "cuda_time_total", 0.0)
+            or getattr(event, "device_time_total", 0.0)
+            or 0.0
+        )
         if cuda_total <= 0:
             continue
         rows.append(
@@ -113,7 +125,9 @@ def profile_cuda_ops(fn, warmup: int, row_limit: int):
                 "count": int(getattr(event, "count", 0) or 0),
                 "cuda_time_total_us": cuda_total,
                 "self_cuda_time_total_us": float(
-                    getattr(event, "self_cuda_time_total", 0.0) or 0.0
+                    getattr(event, "self_cuda_time_total", 0.0)
+                    or getattr(event, "self_device_time_total", 0.0)
+                    or 0.0
                 ),
                 "cpu_time_total_us": float(
                     getattr(event, "cpu_time_total", 0.0) or 0.0
@@ -158,6 +172,15 @@ def estimate_flops(args: argparse.Namespace) -> dict[str, float]:
         "triangle_bias_tflop": triangle_bias / 1e12,
         "attention_core_tflop": attention_core / 1e12,
         "rough_total_tflop": total / 1e12,
+    }
+
+
+def feature_flags() -> dict[str, bool]:
+    return {
+        "triton_fused_elementwise_available": triton_fused_elementwise_available(),
+        "triangle_attention_epilogue_enabled": triton_triangle_attention_epilogue_enabled(),
+        "cueq_qkv_layout_available": triton_cueq_qkv_layout_available(),
+        "cueq_qkv_layout_enabled": triton_cueq_qkv_layout_enabled(),
     }
 
 
@@ -210,6 +233,7 @@ def main() -> None:
                     "out_all_finite": bool(torch.isfinite(out).all().item()),
                     "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
                     "peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
+                    "feature_flags": feature_flags(),
                     "timestamp": time.time(),
                     "torch": {"version": torch.__version__, "cuda": torch.version.cuda},
                 },
@@ -231,6 +255,7 @@ def main() -> None:
         "rough_effective_tflops": flop_estimates["rough_total_tflop"] / (forward_ms / 1000.0),
         "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
         "peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
+        "feature_flags": feature_flags(),
         "torch": {"version": torch.__version__, "cuda": torch.version.cuda},
     }
     if args.profile:
