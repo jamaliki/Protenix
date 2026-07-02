@@ -724,6 +724,13 @@ def _env_enabled_by_default(name: str) -> bool:
     return value.strip().lower() not in {"0", "false", "off", "no"}
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return int(value)
+
+
 def _guidance_enabled(configs: Any) -> bool:
     try:
         guidance = configs.sample_diffusion.to_dict().get("guidance")
@@ -742,7 +749,13 @@ def _batched_token_diffusion_enabled(configs: Any, batch_size: int) -> bool:
         return False
     if not _env_enabled_by_default("PROTENIX_BATCH_DIFFUSION_TRANSFORMER"):
         return False
-    if int(configs.sample_diffusion.N_sample) != 1:
+    n_sample = int(configs.sample_diffusion.N_sample)
+    if n_sample < 1:
+        return False
+    # This ragged path is for low-sample design campaigns.  Very large
+    # N_sample jobs already use the single-design fast path; mixing them with a
+    # protein batch would multiply token/atom work and memory too aggressively.
+    if n_sample > _env_int("PROTENIX_BATCH_DIFFUSION_MAX_SAMPLES", 5):
         return False
     if _guidance_enabled(configs):
         return False

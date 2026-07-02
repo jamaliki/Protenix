@@ -174,6 +174,44 @@ def _make_atom_mask(
     return atom_mask
 
 
+def _expand_sample_axis(tensor: torch.Tensor, n_sample: int) -> torch.Tensor:
+    """Expand a ``[B, 1, ...]`` diffusion tensor over low sample counts.
+
+    In the inference sampler every record uses the same scalar noise level at a
+    denoising step.  Conditioning tensors are therefore sample-invariant.  Keep
+    them as one lane while building them, then broadcast here before the token
+    transformer needs one row per ``(record, sample)``.  This is a view when the
+    sample axis is singleton, so it avoids recomputing and storing identical
+    conditioning activations.
+    """
+    if tensor.shape[1] == n_sample:
+        return tensor
+    assert tensor.shape[1] == 1
+    return tensor.expand(tensor.shape[0], n_sample, *tensor.shape[2:])
+
+
+def _flatten_record_sample_axes(tensor: torch.Tensor, n_sample: int) -> torch.Tensor:
+    """Flatten ``[B, N_sample, ...]`` to ``[B * N_sample, ...]``.
+
+    The token diffusion transformer can operate on arbitrary leading batch
+    items, but the attention helper deliberately switches to a conservative
+    FP32 path when q/k/v have two leading axes.  Flattening record and sample
+    keeps the fast rank-4 BF16/cuDNN path while still sharing one launch across
+    all proteins and samples.
+    """
+    tensor = _expand_sample_axis(tensor, n_sample)
+    return tensor.reshape(tensor.shape[0] * n_sample, *tensor.shape[2:])
+
+
+def _flatten_record_sample_mask(
+    mask: torch.Tensor,
+    n_sample: int,
+) -> torch.Tensor:
+    return mask[:, None, :].expand(mask.shape[0], n_sample, mask.shape[1]).reshape(
+        mask.shape[0] * n_sample, mask.shape[1]
+    )
+
+
 def update_input_feature_dict(input_feature_dict: dict[str, Any]) -> dict[str, Any]:
     """
     Lines 1-3 of Algorithm 5 compute d_lm, v_lm, and pad_info utilized in the AtomAttentionEncoder.
@@ -802,8 +840,6 @@ class Protenix(nn.Module):
             raise RuntimeError("batched token diffusion is inference-only")
 
         N_sample = int(self.configs.sample_diffusion["N_sample"])
-        if N_sample != 1:
-            raise RuntimeError("batched token diffusion currently requires N_sample=1")
 
         guidance_cfg = self.configs.sample_diffusion.to_dict().get("guidance")
         if guidance_cfg is not None and guidance_cfg.get("enable", False):
@@ -960,7 +996,7 @@ class Protenix(nn.Module):
         x_list = [
             noise_schedule[0]
             * torch.randn(
-                (1, feature_dict["atom_to_token_idx"].size(-1), 3),
+                (N_sample, feature_dict["atom_to_token_idx"].size(-1), 3),
                 device=device,
                 dtype=dtype,
             )
@@ -984,14 +1020,16 @@ class Protenix(nn.Module):
 
             for batch_idx, feature_dict in enumerate(input_feature_dicts):
                 x_l = (
-                    centre_random_augmentation(x_input_coords=x_list[batch_idx], N_sample=1)
+                    centre_random_augmentation(
+                        x_input_coords=x_list[batch_idx], N_sample=1
+                    )
                     .squeeze(dim=-3)
                     .to(dtype)
                 )
                 x_noisy = x_l + noise_scale * torch.randn(
                     size=x_l.shape, device=device, dtype=dtype
                 )
-                t_hat = t_hat_scalar.reshape(1).to(dtype)
+                t_hat = t_hat_scalar.reshape(1).expand(N_sample).to(dtype)
 
                 # EDM input scaling is cheap, but keep the same named timing
                 # range as DiffusionModule.forward so profile summaries compare.
@@ -1011,7 +1049,12 @@ class Protenix(nn.Module):
                     "protenix/batched_diffusion_conditioning"
                 ):
                     s_single_padded, z_pair_padded = dm.diffusion_conditioning(
-                        t_hat_noise_level=torch.stack(t_hats, dim=0),
+                        # All samples in a denoising step share the same noise
+                        # scalar.  Compute conditioning once per record and
+                        # broadcast it later, mirroring DiffusionModule.forward.
+                        t_hat_noise_level=torch.stack(
+                            [t_hat[:1] for t_hat in t_hats], dim=0
+                        ),
                         relp_feature=conditioning_batch["relp"],
                         s_inputs=conditioning_batch["s_inputs"],
                         s_trunk=conditioning_batch["s_trunk"],
@@ -1039,7 +1082,7 @@ class Protenix(nn.Module):
                         "protenix/batched_token_diffusion_conditioning"
                     ):
                         s_single, z_pair = dm.diffusion_conditioning(
-                            t_hat_noise_level=t_hats[batch_idx],
+                            t_hat_noise_level=t_hats[batch_idx][:1],
                             relp_feature=feature_dict["relp"],
                             s_inputs=s_inputs_list[batch_idx],
                             s_trunk=s_list[batch_idx],
@@ -1093,7 +1136,7 @@ class Protenix(nn.Module):
                         a_token = a_token + dm.linear_no_bias_s(
                             dm.layernorm_s(s_singles[batch_idx])
                         )
-                    a_tokens.append(a_token.squeeze(dim=-3))
+                    a_tokens.append(a_token)
                     decoder_inputs.append(
                         (
                             batch_idx,
@@ -1162,18 +1205,20 @@ class Protenix(nn.Module):
                     a_token_batch = a_token_batch + dm.linear_no_bias_s(
                         dm.layernorm_s(s_single_batch)
                     )
-                a_batch = a_token_batch.squeeze(dim=-3)
-                s_batch = s_single_batch.to(dtype=transformer_dtype).squeeze(dim=-3)
+                a_batch = a_token_batch
+                s_batch = s_single_batch.to(dtype=transformer_dtype)
             else:
                 transformer_dtype = dm._diffusion_core_dtype(a_tokens[0].dtype)
-                s_batch = _stack_padded_token_vectors(
-                    [
-                        s_i.to(dtype=transformer_dtype).squeeze(dim=-3)
-                        for s_i in s_singles
-                    ],
-                    max_tokens,
+                s_batch = _stack_padded_axis(
+                    [s_i.to(dtype=transformer_dtype) for s_i in s_singles],
+                    axis=-2,
+                    max_size=max_tokens,
                 )
-                a_batch = _stack_padded_token_vectors(a_tokens, max_tokens)
+                a_batch = _stack_padded_axis(
+                    a_tokens,
+                    axis=-2,
+                    max_size=max_tokens,
+                )
 
             token_mask = _make_token_mask(token_counts, max_tokens, device)
             if z_pair_padded is not None:
@@ -1206,25 +1251,37 @@ class Protenix(nn.Module):
                     channel_first=self.enable_efficient_fusion,
                 )
 
+            a_transformer = _flatten_record_sample_axes(a_batch, N_sample)
+            s_transformer = _flatten_record_sample_axes(s_batch, N_sample)
+            z_transformer = (
+                z_batch[:, None]
+                .expand(z_batch.shape[0], N_sample, *z_batch.shape[1:])
+                .reshape(z_batch.shape[0] * N_sample, *z_batch.shape[1:])
+            )
+            token_mask_transformer = _flatten_record_sample_mask(token_mask, N_sample)
+
             with dm._profile_block("transformer"), torch.profiler.record_function(
                 "protenix/batched_token_diffusion_transformer"
             ):
                 with dm._diffusion_core_autocast():
-                    a_batch = dm.diffusion_transformer(
-                        a=a_batch,
-                        s=s_batch,
-                        z=z_batch,
+                    a_transformer = dm.diffusion_transformer(
+                        a=a_transformer,
+                        s=s_transformer,
+                        z=z_transformer,
                         inplace_safe=inplace_safe,
                         chunk_size=chunk_size,
                         enable_efficient_fusion=self.enable_efficient_fusion,
-                        token_mask=token_mask,
+                        token_mask=token_mask_transformer,
                     )
-            if a_batch.dtype != torch.float32:
-                a_batch = a_batch.to(dtype=torch.float32)
+            if a_transformer.dtype != torch.float32:
+                a_transformer = a_transformer.to(dtype=torch.float32)
+            a_batch = a_transformer.reshape(
+                len(input_feature_dicts), N_sample, max_tokens, a_transformer.shape[-1]
+            )
 
             if batch_atom_transformer:
                 assert atom_batch is not None
-                a_decode_batch = dm.layernorm_a(a_batch).unsqueeze(dim=-3)
+                a_decode_batch = dm.layernorm_a(a_batch)
                 with dm._profile_block("atom_decoder"), torch.profiler.record_function(
                     "protenix/batched_atom_attention_decoder"
                 ):
@@ -1260,7 +1317,7 @@ class Protenix(nn.Module):
                 ) in enumerate(decoder_inputs):
                     n_token = token_counts[batch_idx]
                     a_token = dm.layernorm_a(
-                        a_batch[out_idx, :n_token].unsqueeze(dim=-3)
+                        a_batch[out_idx, :, :n_token]
                     )
 
                     with dm._profile_block(
