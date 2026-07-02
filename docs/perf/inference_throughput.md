@@ -57,12 +57,14 @@ export PROTENIX_TRITON_FUSED_ATTENTION_RESIDUAL=1
 export PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION=1
 ```
 
-They are not included in the headline throughput table yet.  The atom-attention
-boundary fusion is a clean isolated win and reduces peak allocated memory, but
-the paired full `N_sample=1280`, `N_step=200` gate improved forward throughput
-by only 0.15%, which is below the promotion threshold.  Keep these flags as
-experimental until a repeated `N_sample=1280/2560` gate shows a robust samples/s
-gain.
+They are not included in the headline large-`N_sample` throughput table yet.
+The atom-attention boundary fusion is a clean isolated win and reduces peak
+allocated memory, but the paired full `N_sample=1280`, `N_step=200` gate
+improved forward throughput by only 0.15%, which is below the promotion
+threshold.  `PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION=1` is validated for the
+many-sequence/few-sample path described below; its pairformer use is
+shape-guarded so larger batches fall back when the fused temporary would be too
+large.
 
 ## Reproducing the benchmark
 
@@ -140,6 +142,43 @@ sample dimension `1` while the activation tensor has sample dimension
 
 This is the right kind of fusion: the fused operation is simple, memory-bound,
 and avoids intermediate reads/writes without replacing a high-quality GEMM.
+
+#### Pairformer transition input fusion for many-sequence batches
+
+The many-independent-sequence workload (`batch=B`, `N_sample=1`) exposes a
+different transition boundary in the trunk pairformer.  Pairformer
+`Transition` applies LayerNorm, computes two projections from the same giant
+`[B * N_token * N_token, C]` activation, and then forms
+`SiLU(a) * b`.  With `PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION=1` and
+`PROTENIX_TRITON_FUSED_ELEMENTWISE=1`, the eval path can use one wider
+projection followed by the split-aware Triton `SiLU(first_half) * second_half`
+consumer.
+
+The implementation is intentionally shape-guarded by
+`PROTENIX_FUSED_TRANSITION_INPUT_MAX_ELEMENTS` (default `4000000000`).  The
+fused producer writes a temporary with `2 * hidden` channels; at B64/N245 this
+is large but profitable, while an unguarded B96 run failed because the
+concatenated activation was too large.  Larger batches therefore fall back to
+the original two-GEMM path instead of trading stability for a small isolated
+win.
+
+The split-aware Triton kernel also uses 64-bit element offsets.  At B64/N245
+the output has about 1.97B elements and the concatenated input is addressed past
+3.9B elements, so 32-bit pointer arithmetic silently overflows and produces
+NaNs.
+
+Representative H100 screens:
+
+| screen | baseline | candidate | result |
+| --- | ---: | ---: | --- |
+| B64 pairformer block | 70.92 ms | 68.39 ms | 1.037x, finite |
+| B64 full gate | 0.801 seq/s | 0.809 seq/s | +0.9%, peak 46.5 GiB |
+| B96 full gate | 0.817 seq/s | 0.819 seq/s | +0.2%, guarded fallback on giant pair transition |
+
+The B64 block comparison is not bitwise-identical because changing the GEMM
+shape changes BF16 rounding (`z` max abs about 0.03125, `s` max abs about
+0.0625), but the full gates produced finite coordinates and confidence
+summaries.
 
 ### 3. Specialize atom local attention
 
@@ -527,6 +566,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Fused self-attention `q/k/v/g` projection | exact parity but trunk block slowed from about 14.1 ms to 14.9 ms | fewer launches are not enough if the wider GEMM/cache/layout is worse |
 | Fused transition `a1/a2` projection without split-aware consumer | transition slowed from about 5.3 ms to 7.0 ms | fusing the producer can break the consumer by creating non-contiguous halves |
 | Custom Triton transition input GEMM+SiLU | synthetic +12%, but real transition input path slowed from 3.09 ms to 3.54 ms | custom GEMM screens must use real module weights/autocast; cuBLAS efficiency is the bottleneck to match |
+| Unguarded pairformer transition input fusion at B96 | failed before producing model output | the concatenated pair-transition activation is too large; keep the shape guard |
 | Custom Triton transition output GEMM+gate/residual | best tile 2.00 ms versus 1.51 ms for cuBLAS plus fused gate/residual | the output epilogue is still attractive, but only if implemented as a vendor-quality CuTe/CUTLASS epilogue |
 | CUDA graph capture of the denoiser | slower in this setup | graph overhead/constraints can outweigh launch savings |
 
@@ -545,7 +585,8 @@ Production code touched by the throughput stack:
 - `protenix/model/modules/diffusion.py`: BF16/autocast controls, component
   timing, and sample-broadcast diffusion conditioning.
 - `protenix/model/modules/primitives.py`: SDPA fallback policy, optional
-  Triton local attention, and fused elementwise gate calls.
+  Triton local attention, fused elementwise gate calls, and shape-guarded
+  pairformer `Transition` input-projection fusion.
 - `protenix/model/modules/transformer.py`: local-attention bias fusion and
   attention/transition residual fusion hooks plus guarded transition
   input-projection fusion.
@@ -554,9 +595,9 @@ Production code touched by the throughput stack:
 - `protenix/model/modules/local_attention_bias_triton.py`: fused LayerNorm +
   projection + layout for atom local-attention bias.
 - `protenix/model/modules/fused_elementwise_triton.py`: small inference-only
-  Triton gate kernels with PyTorch fallbacks, including the split-aware
-  `silu(first_half) * second_half` consumer for concatenated transition
-  projections.
+  Triton gate kernels with PyTorch fallbacks, including the 64-bit-indexed
+  split-aware `silu(first_half) * second_half` consumer for concatenated
+  transition projections.
 - `protenix/model/modules/confidence.py` and `protenix/model/protenix.py`:
   confidence-logit chunk iteration and streaming summary consumption.
 

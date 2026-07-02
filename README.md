@@ -79,8 +79,9 @@ For detailed instructions on installation, data preprocessing, inference, and tr
 ### ⚡ H100 Inference Throughput Optimisation
 
 This repository includes an opt-in H100 inference-throughput path for workloads
-that generate many samples per input while keeping the normal confidence outputs
-enabled. The optimisation stack combines larger unchunked sample batches,
+that generate many samples per input, or many independent inputs with a small
+sample count per input, while keeping the normal confidence outputs enabled.
+The optimisation stack combines larger unchunked sample/batch execution,
 BF16/autocast choices in the profiled diffusion paths, guarded Triton kernels
 for atom local attention and memory-bound elementwise gates, GPU-side random
 augmentation, and streamed confidence-summary computation to avoid keeping all
@@ -92,6 +93,12 @@ On a representative one-H100 `7r6r` benchmark with `N_sample=2560`,
 default `N_sample=5` setting. The exact gain depends on GPU, input shape, driver
 stack, and memory headroom; the fast path is therefore exposed through explicit
 environment flags rather than enabled silently for every user.
+
+For protein-design style throughput with many independent `N_sample=1` inputs,
+the same profiling loop found the trunk pairformer transition as a useful
+memory boundary. A guarded transition input-projection fusion improves B64 and
+falls back for larger batches where the fused temporary would be too large; on
+the same one-H100 `7r6r` benchmark, B96 measured about `0.819` sequences/sec.
 
 For the recommended flags, reproduction commands, profiling scripts, and the
 negative results that shaped the implementation, see
