@@ -585,6 +585,22 @@ before custom-matmul overheads.  That is a real target, but not a 2x target:
 the implementation has to be vendor-quality, or the lost GEMM efficiency will
 erase the saved HBM traffic.
 
+CuTe/CUTLASS extension toolchain status on Tokyo:
+
+| item | value |
+| --- | --- |
+| Python/runtime env | `/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/env-boltz2` |
+| CUDA toolkit / `nvcc` | `/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/kaveh` |
+| CUTLASS/CuTe headers | `/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/env-cutlass/include` |
+| Nsight Compute | `/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/env-nsight/ncu` |
+
+The toolchain was smoke-tested in
+`cute_toolchain_smoke_20260702_124554`, Slurm job `95060`: a PyTorch CUDA
+extension compiled for `sm_90`, included `<cute/tensor.hpp>` and
+`<cutlass/cutlass.h>`, linked against the CUDA 13 runtime, launched on an H100,
+and returned the expected result.  Future native-kernel screens should use this
+environment rather than installing another compiler stack.
+
 #### Round 142-147: first custom-kernel boundary attempts
 
 The transition-output epilogue was the first CUTLASS target because it looked
