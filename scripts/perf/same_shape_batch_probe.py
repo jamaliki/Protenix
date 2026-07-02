@@ -127,6 +127,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-diffusion-chunk-size", type=optional_int, default=None)
     parser.add_argument("--seed", type=int, default=101)
     parser.add_argument("--dump-dir", default="/tmp/protenix_same_shape_batch_probe")
+    parser.add_argument(
+        "--mode",
+        choices=["both", "loop", "batch"],
+        default="both",
+        help="Run the serial loop, the batched call, or both.",
+    )
     return parser.parse_args()
 
 
@@ -177,28 +183,45 @@ def main() -> None:
         seed_everything(args.seed + 9000 + index, deterministic=False)
         timed_predict(runner, make_single())
 
-    torch.cuda.reset_peak_memory_stats()
-    loop_predictions = []
-    loop_start = time.perf_counter()
-    loop_secs = []
-    loop_model_timings = []
-    for index in range(args.batch_size):
-        seed_everything(args.seed + index, deterministic=False)
-        prediction, seconds, model_timing = timed_predict(runner, make_single())
-        loop_predictions.append(finite_summary(prediction))
-        loop_secs.append(seconds)
-        loop_model_timings.append(model_timing)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    loop_wall = time.perf_counter() - loop_start
-    loop_memory = cuda_memory()
+    loop_result = None
+    if args.mode in {"both", "loop"}:
+        torch.cuda.reset_peak_memory_stats()
+        loop_predictions = []
+        loop_start = time.perf_counter()
+        loop_secs = []
+        loop_model_timings = []
+        for index in range(args.batch_size):
+            seed_everything(args.seed + index, deterministic=False)
+            prediction, seconds, model_timing = timed_predict(runner, make_single())
+            loop_predictions.append(finite_summary(prediction))
+            loop_secs.append(seconds)
+            loop_model_timings.append(model_timing)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        loop_wall = time.perf_counter() - loop_start
+        loop_result = {
+            "wall_sec": loop_wall,
+            "item_secs": loop_secs,
+            "model_timings": loop_model_timings,
+            "sequences_per_sec": args.batch_size / loop_wall,
+            "predictions": loop_predictions,
+            **cuda_memory(),
+        }
 
-    torch.cuda.reset_peak_memory_stats()
-    seed_everything(args.seed, deterministic=False)
-    batch_prediction, batch_sec, batch_model_timing = timed_predict(
-        runner, make_batch()
-    )
-    batch_memory = cuda_memory()
+    batch_result = None
+    if args.mode in {"both", "batch"}:
+        torch.cuda.reset_peak_memory_stats()
+        seed_everything(args.seed, deterministic=False)
+        batch_prediction, batch_sec, batch_model_timing = timed_predict(
+            runner, make_batch()
+        )
+        batch_result = {
+            "wall_sec": batch_sec,
+            "model_timing": batch_model_timing,
+            "sequences_per_sec": args.batch_size / batch_sec,
+            "prediction": finite_summary(batch_prediction),
+            **cuda_memory(),
+        }
 
     row = {
         "args": vars(args),
@@ -209,22 +232,13 @@ def main() -> None:
             "n_msa": int(data["N_msa"].item()),
         },
         "feature_times": feature_times,
-        "loop": {
-            "wall_sec": loop_wall,
-            "item_secs": loop_secs,
-            "model_timings": loop_model_timings,
-            "sequences_per_sec": args.batch_size / loop_wall,
-            "predictions": loop_predictions,
-            **loop_memory,
-        },
-        "batched": {
-            "wall_sec": batch_sec,
-            "model_timing": batch_model_timing,
-            "sequences_per_sec": args.batch_size / batch_sec,
-            "prediction": finite_summary(batch_prediction),
-            **batch_memory,
-        },
-        "speedup": loop_wall / batch_sec,
+        "loop": loop_result,
+        "batched": batch_result,
+        "speedup": (
+            loop_result["wall_sec"] / batch_result["wall_sec"]
+            if loop_result is not None and batch_result is not None
+            else None
+        ),
         "torch": {
             "version": torch.__version__,
             "cuda": torch.version.cuda,
