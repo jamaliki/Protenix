@@ -30,6 +30,10 @@ from protenix.model.triangular.triangular import (
     TriangleMultiplicationIncoming,
     TriangleMultiplicationOutgoing,
 )
+from protenix.model.triangular.ending_attention_triton import (
+    triton_transpose_add_128_,
+    triton_transpose_layer_norm_128,
+)
 from protenix.model.utils import (
     checkpoint_blocks,
     expand_at_dim,
@@ -157,15 +161,21 @@ class PairformerBlock(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
-            z = z.transpose(-2, -3).contiguous()
-            z += self.tri_att_end(
-                z,
-                mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
-                triangle_attention=triangle_attention,
-                inplace_safe=inplace_safe,
-                chunk_size=chunk_size,
-            )
-            z = z.transpose(-2, -3).contiguous()
+            fused_end = False
+            if chunk_size is None and triangle_attention == "cuequivariance":
+                fused_end = self._try_fused_ending_attention_update(
+                    z, pair_mask, triangle_attention
+                )
+            if not fused_end:
+                z = z.transpose(-2, -3).contiguous()
+                z += self.tri_att_end(
+                    z,
+                    mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
+                    triangle_attention=triangle_attention,
+                    inplace_safe=inplace_safe,
+                    chunk_size=chunk_size,
+                )
+                z = z.transpose(-2, -3).contiguous()
             z += self.pair_transition(z)
         else:
             tmu_update = self.tri_mul_out(
@@ -228,6 +238,42 @@ class PairformerBlock(nn.Module):
             )
             s = s + self.single_transition(s)
         return s, z
+
+    def _try_fused_ending_attention_update(
+        self,
+        z: torch.Tensor,
+        pair_mask: Optional[torch.Tensor],
+        triangle_attention: str,
+    ) -> bool:
+        """Fuse ending-attention layout prep when the safe narrow guards pass.
+
+        Ending triangle attention is the same attention as starting attention,
+        but over the opposite pair axis.  The default path therefore writes a
+        full transposed copy of ``z``, layer-normalizes that copy, runs CUEQ,
+        adds the residual in transposed layout, then writes a second full
+        transposed copy to restore normal pair layout.
+
+        For the H100 inference path this helper screens a smaller boundary:
+        one Triton kernel computes ``LayerNorm(z)`` while writing the
+        transposed physical layout CUEQ wants, and a second kernel streams the
+        transposed update back into the original ``z``.  The CUEQ kernel itself
+        is unchanged; only avoidable HBM layout traffic around it is removed.
+        """
+        z_norm_t = triton_transpose_layer_norm_128(
+            z,
+            self.tri_att_end.layer_norm.weight,
+            self.tri_att_end.layer_norm.bias,
+            eps=self.tri_att_end.layer_norm.eps,
+        )
+        if z_norm_t is None:
+            return False
+
+        update_t = self.tri_att_end.forward_after_layer_norm(
+            z_norm_t,
+            mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
+            triangle_attention=triangle_attention,
+        )
+        return triton_transpose_add_128_(z, update_t)
 
 
 class PairformerStack(nn.Module):

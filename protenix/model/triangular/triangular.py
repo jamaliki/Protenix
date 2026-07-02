@@ -656,6 +656,31 @@ class TriangleAttention(nn.Module):
             _out=x if inplace_safe else None,
         )
 
+    def forward_after_layer_norm(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        triangle_attention: str = "torch",
+    ) -> torch.Tensor:
+        """Run triangle attention when ``x`` has already been layer-normalized.
+
+        This is a narrow inference hook for fused layout-prep experiments.  The
+        regular ``forward`` path owns LayerNorm and all semantic transposes.
+        Here the caller has already produced the physical layout CUEQ should
+        consume, so this method only builds the triangle bias and runs MHA.
+        """
+        if mask is None:
+            mask = x.new_ones(x.shape[:-1])
+
+        mask_bias = (self.inf * (mask - 1))[..., :, None, None, :]
+        triangle_bias = permute_final_dims(self.linear(x), (2, 0, 1)).unsqueeze(-4)
+        return self.mha(
+            q_x=x,
+            kv_x=x,
+            biases=[mask_bias, triangle_bias],
+            triangle_attention=triangle_attention,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
