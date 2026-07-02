@@ -247,7 +247,15 @@ class AttentionPairBias(nn.Module):
             # physical atom length.  Batched ragged proteins additionally have
             # fake atoms inside the shared max length.  Add a key bias in the
             # same trunked layout so valid queries cannot read those fake keys.
-            expanded_mask = _expand_mask_to_prefix(key_mask, q.shape[:-2])
+            #
+            # Important for low-sample campaign batching: q/k/v are shaped
+            # [record, sample, ...], but both atom masks and cached pair bias
+            # are sample-invariant.  Build the key bias with the existing bias
+            # prefix, usually [record, 1], instead of q's [record, sample].
+            # Otherwise a cheap mask add would materialize S copies of the
+            # local-attention bias and prevent the Triton kernel from reusing
+            # one record-level bias row across all diffusion samples.
+            expanded_mask = _expand_mask_to_prefix(key_mask, bias.shape[:-4])
             _q_mask, key_mask_trunked, _ = rearrange_qk_to_dense_trunk(
                 q=expanded_mask,
                 k=expanded_mask,
