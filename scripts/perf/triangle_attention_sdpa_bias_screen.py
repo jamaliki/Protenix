@@ -21,6 +21,7 @@ from contextlib import contextmanager, nullcontext
 
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from protenix.model.triangular.triangular import TriangleAttention
 from protenix.model.utils import permute_final_dims
@@ -121,14 +122,17 @@ def sdpa_bias_forward(
     if not full_mask:
         attn_mask = mask.reshape(batch * rows, 1, 1, cols).bool()
 
-    o = F.scaled_dot_product_attention(
-        q_aug,
-        k_aug,
-        v_aug,
-        attn_mask=attn_mask,
-        dropout_p=0.0,
-        scale=scale,
-    )
+    with sdpa_kernel(
+        [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+    ):
+        o = F.scaled_dot_product_attention(
+            q_aug,
+            k_aug,
+            v_aug,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            scale=scale,
+        )
     o = o[..., :head_dim]
     o = o.reshape(batch, rows, heads, cols, head_dim)
     return module.mha._wrap_up_heads_first(o, x)
