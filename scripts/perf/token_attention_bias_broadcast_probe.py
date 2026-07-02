@@ -96,6 +96,51 @@ def _to_fp32_sdpa(
     ).to(dtype=q.dtype)
 
 
+def _make_token_mask(args: argparse.Namespace, device: torch.device) -> torch.Tensor:
+    """Build a sorted-batch padding mask similar to mixed-length campaigns."""
+    min_fraction = max(0.0, min(1.0, args.valid_fraction))
+    if min_fraction >= 1.0:
+        return torch.ones(args.batch, args.tokens, device=device, dtype=torch.bool)
+    lengths = torch.linspace(
+        max(1, int(round(args.tokens * min_fraction))),
+        args.tokens,
+        steps=args.batch,
+        device=device,
+    ).round().to(dtype=torch.long)
+    positions = torch.arange(args.tokens, device=device)
+    return positions[None, :] < lengths[:, None]
+
+
+def _flat_attn_mask(
+    bias: torch.Tensor,
+    token_mask: torch.Tensor,
+    args: argparse.Namespace,
+) -> torch.Tensor:
+    """Current flattened path: materialize one mask row per record-sample."""
+    bias_flat = bias[:, None].expand(
+        args.batch, args.samples, args.heads, args.tokens, args.tokens
+    ).reshape(args.batch * args.samples, args.heads, args.tokens, args.tokens)
+    if bool(token_mask.all().item()):
+        return bias_flat
+    key_mask = token_mask[:, None, :].expand(
+        args.batch, args.samples, args.tokens
+    ).reshape(args.batch * args.samples, args.tokens)
+    key_bias = (key_mask.to(dtype=bias.dtype) - 1) * 1e4
+    return bias_flat + key_bias[:, None, None, :]
+
+
+def _rank5_attn_mask(
+    bias: torch.Tensor,
+    token_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Rank-5 path: keep pair and padding bias sample-invariant."""
+    bias5 = bias[:, None]
+    if bool(token_mask.all().item()):
+        return bias5
+    key_bias = (token_mask.to(dtype=bias.dtype) - 1) * 1e4
+    return bias5 + key_bias[:, None, None, None, :]
+
+
 def _record_case(
     name: str,
     fn: Callable[[], torch.Tensor],
@@ -137,6 +182,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--valid-fraction",
+        type=float,
+        default=1.0,
+        help=(
+            "Minimum valid-token fraction in the sorted record batch. "
+            "Use e.g. 0.8 to include a sample-invariant padding key mask."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -173,13 +227,19 @@ def main() -> None:
     bias_expanded5 = bias[:, None].expand(
         args.batch, args.samples, args.heads, args.tokens, args.tokens
     )
+    token_mask = _make_token_mask(args, device)
+    bias_flat_with_mask = _flat_attn_mask(bias, token_mask, args)
+    bias_rank5_with_mask = _rank5_attn_mask(bias, token_mask)
+    bias_expanded5_with_mask = bias_rank5_with_mask.expand(
+        args.batch, args.samples, args.heads, args.tokens, args.tokens
+    )
 
     cases: list[dict[str, Any]] = []
 
     reference_row = _record_case(
         "flat_prepeated_bias",
         lambda: F.scaled_dot_product_attention(
-            q_flat, k_flat, v_flat, attn_mask=bias_flat
+            q_flat, k_flat, v_flat, attn_mask=bias_flat_with_mask
         ).reshape(*shape),
         reference=None,
         warmup=args.warmup,
@@ -189,7 +249,7 @@ def main() -> None:
     reference = None
     if reference_row["ok"]:
         reference = F.scaled_dot_product_attention(
-            q_flat, k_flat, v_flat, attn_mask=bias_flat
+            q_flat, k_flat, v_flat, attn_mask=bias_flat_with_mask
         ).reshape(*shape)
         _sync()
 
@@ -200,20 +260,7 @@ def main() -> None:
                 q_flat,
                 k_flat,
                 v_flat,
-                attn_mask=bias[:, None]
-                .expand(
-                    args.batch,
-                    args.samples,
-                    args.heads,
-                    args.tokens,
-                    args.tokens,
-                )
-                .reshape(
-                    args.batch * args.samples,
-                    args.heads,
-                    args.tokens,
-                    args.tokens,
-                ),
+                attn_mask=_flat_attn_mask(bias, token_mask, args),
             ).reshape(*shape),
             reference=reference,
             warmup=args.warmup,
@@ -224,7 +271,7 @@ def main() -> None:
         _record_case(
             "rank5_expanded_stride0_bias",
             lambda: F.scaled_dot_product_attention(
-                q5, k5, v5, attn_mask=bias_expanded5
+                q5, k5, v5, attn_mask=bias_expanded5_with_mask
             ),
             reference=reference,
             warmup=args.warmup,
@@ -234,7 +281,9 @@ def main() -> None:
     cases.append(
         _record_case(
             "rank5_broadcast_bias",
-            lambda: F.scaled_dot_product_attention(q5, k5, v5, attn_mask=bias[:, None]),
+            lambda: F.scaled_dot_product_attention(
+                q5, k5, v5, attn_mask=bias_rank5_with_mask
+            ),
             reference=reference,
             warmup=args.warmup,
             iters=args.iters,
@@ -243,7 +292,7 @@ def main() -> None:
     cases.append(
         _record_case(
             "rank5_broadcast_bias_protenix_current_fp32_policy",
-            lambda: _to_fp32_sdpa(q5, k5, v5, bias[:, None]),
+            lambda: _to_fp32_sdpa(q5, k5, v5, bias_rank5_with_mask),
             reference=reference,
             warmup=args.warmup,
             iters=args.iters,
@@ -259,6 +308,12 @@ def main() -> None:
         "bias_flat_shape": list(bias_flat.shape),
         "bias_flat_is_contiguous": bool(bias_flat.is_contiguous()),
         "bias_expanded5_stride": list(bias_expanded5.stride()),
+        "token_mask_shape": list(token_mask.shape),
+        "token_mask_valid_fraction": float(token_mask.float().mean().item()),
+        "attn_mask_flat_shape": list(bias_flat_with_mask.shape),
+        "attn_mask_rank5_shape": list(bias_rank5_with_mask.shape),
+        "attn_mask_rank5_stride": list(bias_rank5_with_mask.stride()),
+        "attn_mask_expanded5_stride": list(bias_expanded5_with_mask.stride()),
         "cases": cases,
         "timestamp": time.time(),
     }
