@@ -93,7 +93,7 @@ Pick the path that matches your workload:
 
 | workload | best way to run it | what provides the speedup |
 | --- | --- | --- |
-| Many independent designs, usually `N_sample=1-5` | Put JSONs in one input directory, or combine records into one top-level JSON list, and use `--batch_size 32` | Same-shape records use full-model batches; ragged atom shapes and nearby different token lengths share the pairformer trunk |
+| Many independent designs, usually `N_sample=1-5` | Put JSONs in one input directory, or combine records into one top-level JSON list.  Use `--batch_size 16` for mixed lengths, or `32-64` for tightly bucketed/same-shape 245-token-like cases | Same-shape records use full-model batches; ragged atom shapes and nearby different token lengths share the pairformer trunk plus the diffusion token, atom, and conditioning work |
 | Many samples for one design, e.g. `N_sample=1280-2560` | Use one input with a large `-e/--sample` value and the large-sample flags below | Diffusion, atom attention, elementwise gates, and confidence summary avoid repeated work and excess HBM traffic |
 
 #### Recommended path: many independent designs
@@ -122,12 +122,15 @@ protenix pred \
   --enable_cache true \
   --enable_fusion true \
   --enable_tf32 true \
-  --batch_size 32
+  --batch_size 16
 ```
 
-Use `--batch_size 32` as the H100 default.  For 245-token `7r6r`-like inputs,
-`32-64` is the practical knee: larger batches consume much more memory but add
-little throughput.  If you hit OOM, try `--batch_size 16` or `8`.
+Use `--batch_size 16` as the mixed-length H100 default.  On the profiled
+40-220-token campaign it was faster than `8` and `32` because it gives the
+diffusion kernels enough work without padding the pairformer trunk too much.
+For tightly bucketed or same-shape 245-token `7r6r`-like inputs, `32-64` is the
+practical knee: larger batches consume much more memory but add little
+throughput.  If you hit OOM, try `--batch_size 8`.
 
 The default `--batch_mode auto` is deliberately conservative but usable for real
 sequence-design campaigns.  If all featurized tensor shapes match, the whole
@@ -179,7 +182,7 @@ Measured one-H100 gates with repeated `7r6r` inputs, `N_sample=1`,
 | 32 one-record JSON files in a directory | 342.7 s, 0.093 seq/s | 121.5 s, 0.263 seq/s | 2.82x end to end |
 | One combined JSON with 32 same-shape records | 361.8 s runner time | 69.3 s runner time | 5.2x after initialization |
 | 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
-| 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 52.3 s summed predict, 61.0 s job time, 0.640 warm records/s with batched diffusion token+atom path | 3.70x predict, 3.86x warm throughput |
+| 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.9 s summed predict, 0.943 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.70x predict, 5.69x throughput |
 
 Quick sanity check: a good campaign run should log messages like
 `Predicting 32 same-shape (auto) input(s)` or
@@ -246,8 +249,8 @@ configuration measured about `9.18-9.21` samples/sec per GPU at
   length-sorted compatible trunk batches over more Python processes; `auto` will
   still use the faster full-model batch when atom shapes happen to match exactly.
 - Do not chase very large `--batch_size` values.  For low-sample campaigns the
-  pairformer trunk becomes the bottleneck, so memory rises faster than
-  throughput beyond the `32-64` range on the profiled 245-token case.
+  pairformer trunk becomes the bottleneck.  Mixed-length campaigns should start
+  at `16`; tightly bucketed 245-token-like campaigns can try `32-64`.
 - Keep confidence enabled when comparing against the numbers above.  Disabling
   confidence changes the workload and makes the throughput numbers
   non-comparable.

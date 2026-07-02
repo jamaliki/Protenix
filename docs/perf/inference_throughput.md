@@ -305,6 +305,30 @@ original mixed-token profile at job `95439`, warm throughput improved from
 `PROTENIX_BATCH_ATOM_TRANSFORMER=0` leaves the older
 `token-trunk+diffusion-transformer-batch` path available for bisects.
 
+Mixed-token batched diffusion-conditioning gate: commit `bf00b4a`, paired job
+`95624`
+(`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/cond_batch_pair_b16_n200_20260702_165714`)
+ran the same 32-protein, 40-220-token, `N_sample=1`, `N_step=200` workload at
+`--batch_size 16`.  The only difference was
+`PROTENIX_BATCH_DIFFUSION_CONDITIONING=0` versus `1`; token-transformer and atom
+batching stayed enabled in both cases.
+
+| setting | predict sec sum | records/s by predict | pairformer | diffusion | conditioning | atom encoder | diffusion transformer | atom decoder |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| conditioning batching off | 37.17 | 0.861 | 14.72 | 20.39 | 3.28 | 2.45 | 8.82 | 1.89 |
+| conditioning batching on | 33.93 | 0.943 | 14.67 | 17.22 | 0.33 | 2.32 | 8.84 | 1.91 |
+
+The conditioning term moved by `9.9x` (`3.28s -> 0.33s`) and the representative
+predict section moved by `1.10x` over the immediately preceding promoted path.
+Relative to the original mixed-token profile at job `95439`, summed predict
+time is now `193.22s -> 33.93s` (`5.70x`) and throughput is
+`0.166 -> 0.943 records/s` (`5.69x`).  This gate also explains the current
+optimization frontier: after conditioning batching, the remaining material
+terms are the pairformer trunk (`14.67s`), the diffusion transformer (`8.84s`),
+and the batched atom encoder/decoder (`4.22s` combined).  Further throughput
+work should target those boundaries rather than the now-small conditioning
+path.
+
 A follow-up branch tried to merge source JSONs before MSA/template preprocessing
 so preprocessing would run once for the transient campaign file instead of once
 per source file.  That cleaned up generated JSON siblings but did not materially
@@ -1319,8 +1343,8 @@ Production code touched by the throughput stack:
   CUEQ attention kernel unchanged while removing hidden contiguous-copy traffic.
 - `protenix/model/modules/confidence.py` and `protenix/model/protenix.py`:
   confidence-logit chunk iteration, streaming summary consumption, and the
-  mixed-token diffusion sampler that pads/masks token and atom transformer
-  activations across records.
+  mixed-token diffusion sampler that pads/masks conditioning, token-transformer,
+  and atom-transformer activations across records.
 - `runner/campaign_inputs.py`, `runner/inference.py`,
   `runner/batch_inference.py`, and `configs/configs_inference.py`: public
   campaign inference batching.  The CLI length-sorts raw campaign records before
