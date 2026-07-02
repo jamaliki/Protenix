@@ -84,6 +84,60 @@ class TestDiffusionTransformer(unittest.TestCase):
         target_shape = (*bs_dims, N, c_a)
         self.assertEqual(out.shape, out.reshape(target_shape).shape)
 
+    def test_sample_invariant_pair_bias_matches_repeated_z(self) -> None:
+        torch.manual_seed(7)
+        n_heads = 2
+        c_a = 8
+        c_s = 6
+        c_z = 4
+        n_records = 2
+        n_sample = 3
+        n_token = 5
+
+        model = self.get_model(
+            c_a=c_a, c_s=c_s, c_z=c_z, n_blocks=1, n_heads=n_heads
+        )
+        model.eval()
+
+        a = torch.randn(n_records, n_sample, n_token, c_a, device=self.device)
+        s = torch.randn(n_records, n_sample, n_token, c_s, device=self.device)
+        z = torch.randn(n_records, n_token, n_token, c_z, device=self.device)
+        a_flat = a.reshape(n_records * n_sample, n_token, c_a)
+        s_flat = s.reshape(n_records * n_sample, n_token, c_s)
+
+        with torch.no_grad():
+            for efficient in (False, True):
+                if efficient:
+                    z_shared = z.permute(0, 3, 1, 2).contiguous()
+                    z_repeated = (
+                        z_shared[:, None]
+                        .expand(n_records, n_sample, c_z, n_token, n_token)
+                        .reshape(n_records * n_sample, c_z, n_token, n_token)
+                    )
+                else:
+                    z_shared = z
+                    z_repeated = (
+                        z[:, None]
+                        .expand(n_records, n_sample, n_token, n_token, c_z)
+                        .reshape(n_records * n_sample, n_token, n_token, c_z)
+                    )
+
+                out_repeated = model(
+                    a=a_flat,
+                    s=s_flat,
+                    z=z_repeated,
+                    enable_efficient_fusion=efficient,
+                )
+                out_shared = model(
+                    a=a_flat,
+                    s=s_flat,
+                    z=z_shared,
+                    enable_efficient_fusion=efficient,
+                    z_sample_count=n_sample,
+                )
+
+                torch.testing.assert_close(out_shared, out_repeated)
+
     def tearDown(self):
         elapsed_time = time.time() - self._start_time
         print(f"Test {self.id()} took {elapsed_time:.6f}s")

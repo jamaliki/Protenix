@@ -1253,11 +1253,6 @@ class Protenix(nn.Module):
 
             a_transformer = _flatten_record_sample_axes(a_batch, N_sample)
             s_transformer = _flatten_record_sample_axes(s_batch, N_sample)
-            z_transformer = (
-                z_batch[:, None]
-                .expand(z_batch.shape[0], N_sample, *z_batch.shape[1:])
-                .reshape(z_batch.shape[0] * N_sample, *z_batch.shape[1:])
-            )
             token_mask_transformer = _flatten_record_sample_mask(token_mask, N_sample)
 
             with dm._profile_block("transformer"), torch.profiler.record_function(
@@ -1267,11 +1262,16 @@ class Protenix(nn.Module):
                     a_transformer = dm.diffusion_transformer(
                         a=a_transformer,
                         s=s_transformer,
-                        z=z_transformer,
+                        # ``z`` is identical for every diffusion sample of a
+                        # record.  Keep it at record grain so each block
+                        # projects pair bias once per protein, then repeats
+                        # the smaller head bias over flattened sample lanes.
+                        z=z_batch,
                         inplace_safe=inplace_safe,
                         chunk_size=chunk_size,
                         enable_efficient_fusion=self.enable_efficient_fusion,
                         token_mask=token_mask_transformer,
+                        z_sample_count=N_sample,
                     )
             if a_transformer.dtype != torch.float32:
                 a_transformer = a_transformer.to(dtype=torch.float32)
