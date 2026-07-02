@@ -251,13 +251,6 @@ class AttentionPairBias(nn.Module):
             bias = permute_final_dims(
                 bias, [2, 0, 1]
             )  # [..., n_heads, N_token, N_token]
-            if not self.training and not torch.is_grad_enabled() and bias.is_cuda:
-                # ``permute_final_dims`` is only a view: for pairformer B64 it
-                # leaves the key dimension strided by the head count.  cuDNN
-                # SDPA is much faster with a contiguous [B, H, Q, K] bias, and
-                # the one explicit copy is cheaper than making attention read
-                # the strided view throughout the kernel.
-                bias = bias.contiguous()
 
         if token_mask is not None:
             # Pairformer padding uses pair_mask[i, j] = token_mask[i] *
