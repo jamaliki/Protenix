@@ -111,13 +111,21 @@ bucket:
   per record, stacks `s_inputs` and token-trunk features, runs one pairformer
   trunk call, then finishes diffusion and confidence per original atom-shaped
   record.
+- If token counts differ, the CLI first length-sorts the raw JSON records, then
+  pads only token-trunk tensors inside each batch.  A real `pair_mask` is passed
+  through template, MSA, and pairformer blocks, and the valid `s`/`z` crop is
+  handed back to the atom-shaped diffusion/confidence tail.
 
-This fixes the common same-length mutation campaign problem without padding fake
-atoms through atom attention or confidence reductions.  Ragged proteins are not
-padded into a shared full-model batch because padding is not a proven semantic
-no-op for the triangular trunk.  Directory inputs are handled as one campaign:
-all preprocessed JSON records are merged into a short-lived file before
-inference so many one-record JSONs can still fill batches.
+This fixes same-length mutation campaigns without padding fake atoms through
+atom attention or confidence reductions, and it also supports the common
+different-length design campaign case.  Padded-token trunk batching is a
+controlled numerical-change feature, not a bitwise singleton reproduction path:
+the masks block padded content, but BF16/TF32 reductions can still differ
+slightly because kernels see a different physical token length.  Use
+`--batch_mode exact --batch_size 1` for bitwise singleton debugging.  Directory
+inputs are handled as one campaign: all preprocessed JSON records are merged
+into a short-lived, length-sorted file before inference so many one-record JSONs
+can still fill batches.
 
 Public CLI gates on one H100, repeated `7r6r` inputs, `N_sample=1`,
 `N_step=200`, confidence enabled, and normal CIF/JSON dumping:
@@ -138,10 +146,10 @@ design.  That used to defeat batching because the runner called
 `infer_predict()` once per file.  The directory path now resolves the whole
 directory as one campaign, keeps JSONs with incompatible `modelSeeds` in
 separate transient merged files, and lets the auto batcher decide whether each
-bucket can use full-model exact batching or same-token trunk batching.  Generated
-preprocessing siblings such as `foo-update-msa.json` are ignored when the source
-`foo.json` is present, so a rerun does not silently infer both the source and
-generated JSON.
+bucket can use full-model exact batching, same-token trunk batching, or
+padded-token trunk batching.  Generated preprocessing siblings such as
+`foo-update-msa.json` are ignored when the source `foo.json` is present, so a
+rerun does not silently infer both the source and generated JSON.
 
 Paired directory-campaign gate, one H100, job `94948`, run directory
 `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/campaign_json_batching_gate_20260702_112333_fair2`:
@@ -173,6 +181,32 @@ functional gates, not speed claims: they are dominated by first-run compilation
 and model initialization.  Representative throughput gates should use larger
 same-token campaigns and warmed timing windows.
 
+Different-token trunk batching gate: commit `0ca0852`, job `95432`
+(`runs/var_token_length_sort_gate_20260702_152656`) used 64 shuffled
+single-chain proteins spanning 40-220 tokens, `--batch_size 8`, `N_sample=1`,
+and a short `N_step=1` scout workload.  The CLI wrote a transient length-sorted
+campaign JSON before featurization:
+
+```text
+Merged and length-sorted 1 JSON file(s) for campaign inference into ...
+Predicting 8 padded-token-trunk (auto) input(s) [seed:101]: N_token 184-196, token_pad_eff 96.9%, ...
+```
+
+The baseline input-order run at commit `4fe5e01`, job `95428`
+(`runs/var_token_order_screen_20260702_152043`), mixed lengths such as
+`N_token 40-220` inside one batch.  Automatic length sorting produced the same
+tight token ranges as a manually sorted input file and improved batch-section
+throughput on this scout gate:
+
+| run | batch token ranges | batch-section sec | records/s | warm predict records/s |
+| --- | --- | ---: | ---: | ---: |
+| shuffled input order | `40-208`, `40-220`, ..., `52-196` | 32.94 | 1.94 | 3.10 |
+| automatic length sort | `40-52`, `64-76`, ..., `208-220` | 12.15 | 5.27 | 8.16 |
+
+The `token_pad_eff` log field is the quick health check for mixed-length
+batches.  Values near 90-100% mean most pairformer work is on real tokens;
+values much lower than that mean batches are still mixing lengths too broadly.
+
 A follow-up branch tried to merge source JSONs before MSA/template preprocessing
 so preprocessing would run once for the transient campaign file instead of once
 per source file.  That cleaned up generated JSON siblings but did not materially
@@ -201,10 +235,11 @@ not the same bottleneck as the `N_sample=2560` same-output workload: `N_sample=1
 is pairformer-heavy because the trunk runs once per sequence, while
 `N_sample=5` shifts more time back to diffusion.
 
-Naively padding nearby but unequal token lengths into one pairformer batch is
-not promoted.  A corrected padding diagnostic snapshots every stage because the
-pairformer uses in-place kernels during inference; without those snapshots, an
-earlier row can be mutated by a later stage and point to the wrong boundary.
+Padded-token batching is not bitwise equivalent to singleton inference, so the
+padding diagnostics remain important.  A corrected padding diagnostic snapshots
+every stage because the pairformer uses in-place kernels during inference;
+without those snapshots, an earlier row can be mutated by a later stage and
+point to the wrong boundary.
 `scripts/perf/pairformer_padding_breakdown.py` reports two separate quantities:
 `*_valid_region` compares a true short tensor with the same valid crop embedded
 in a larger zero-padded tensor, while `*_invalid_region_sensitivity` compares
@@ -263,12 +298,14 @@ differences, but BF16 differences compound through the full trunk.  On a
 | FP32 CUEQ, TF32 disabled, 245 -> 384 tokens | 1.61e-5 | 1.18e-4 | 7.34e-6 | 7.49e-5 |
 | BF16 CUEQ, 245 -> 384 tokens | 0.2350 | 1.46875 | 0.1682 | 1.5625 |
 
-So the actionable rule is: exact-shape batching is correct; naive ragged padding
-is numerically different because the trunk sees a different physical reduction
-length.  Making ragged batching safe would require accepting this model-level
-numerical drift, grouping by tight length buckets and validating final outputs,
-or writing kernels that reduce only over each sequence's real length while still
-sharing a launch.
+So the actionable rule is: exact-shape batching is bitwise safest; masked
+padded-token trunk batching is numerically different because the trunk sees a
+different physical reduction length.  The promoted inference path accepts that
+small model-level drift for throughput, sorts records into tight length batches,
+passes masks through all token-trunk readers, and keeps atom-shaped diffusion and
+confidence work ragged.  A future custom kernel could reduce only over each
+sequence's real length while still sharing a launch, but that is a larger kernel
+project.
 
 The first broken invariant is therefore not "masked values leak"; it is
 "valid-crop output is invariant to physical token length".  The first nonzero
@@ -282,11 +319,10 @@ and the 48-block trunk.
 
 So zeroing or masking harder is not the fix; the masks already block padded
 content.  The problem is that cuDNN SDPA, CUEQ, and related matmul reductions are
-not bitwise invariant to padded physical length.  Padded mixed-shape batching
-should therefore be treated as an explicit numerical-change feature that needs
-end-to-end structure/designability validation, not as a safe default throughput
-optimization.  The runner keeps exact tensor-tree batching and leaves
-shape-heterogeneous records in separate buckets.
+not bitwise invariant to padded physical length.  The runner therefore exposes
+masked padded-token batching as the default throughput path for campaign runs,
+with `--batch_mode exact --batch_size 1` remaining available for strict
+singleton/parity debugging.
 
 ## Reproducing the benchmark
 
@@ -1149,7 +1185,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Inference DataLoader workers for exact-shape batches | B8 had a small screen win, but B32 hit tensor-sharing failures unless switched to slower file-system sharing; clean B32 no-worker batching was better | do not add host-pipeline complexity unless it survives the actual many-input gate |
 | CUDA graph capture of the denoiser | slower in this setup | graph overhead/constraints can outweigh launch savings |
 | Merging campaign JSONs before preprocessing | 64-file directory gate moved only from 197.54 s to 195.70 s (`1.009x`) and worsened preprocessing failure granularity | the remaining e2e gap is not mainly per-file JSON preprocessing |
-| Naive padded mixed-shape pairformer batching | valid-region differences accumulated over 48 blocks: FP32 `s/z` mean abs `0.012/0.006`, BF16 `0.236/0.168` for 245 -> 384 tokens | exact-shape batching is conservative but correct; padding needs explicit numerical acceptance criteria and probably real-output validation |
+| Naive padded mixed-shape pairformer batching | valid-region differences accumulated over 48 blocks: FP32 `s/z` mean abs `0.012/0.006`, BF16 `0.236/0.168` for 245 -> 384 tokens | do not claim bitwise parity; the promoted path masks all token readers, sorts by length to reduce physical-shape drift/waste, and keeps exact mode available |
 
 The main learning point: isolated wins are hypotheses, not promotions.  A
 candidate becomes part of the throughput stack only after a representative
@@ -1184,11 +1220,12 @@ Production code touched by the throughput stack:
   CUEQ attention kernel unchanged while removing hidden contiguous-copy traffic.
 - `protenix/model/modules/confidence.py` and `protenix/model/protenix.py`:
   confidence-logit chunk iteration and streaming summary consumption.
-- `runner/inference.py`, `runner/batch_inference.py`, and
-  `configs/configs_inference.py`: public campaign inference batching.  The
-  runner uses full-model batches for identical feature tensor trees and
-  same-token trunk batches for variable-atom same-length records, then writes
-  one output per input.
+- `runner/campaign_inputs.py`, `runner/inference.py`,
+  `runner/batch_inference.py`, and `configs/configs_inference.py`: public
+  campaign inference batching.  The CLI length-sorts raw campaign records before
+  featurization, the runner uses full-model batches for identical feature tensor
+  trees, and the trunk path supports both same-token variable-atom records and
+  masked padded-token records before writing one output per input.
 
 Profiling and reproducibility helpers:
 

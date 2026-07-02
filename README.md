@@ -93,7 +93,7 @@ Pick the path that matches your workload:
 
 | workload | best way to run it | what provides the speedup |
 | --- | --- | --- |
-| Many independent designs, usually `N_sample=1-5` | Put JSONs in one input directory, or combine records into one top-level JSON list, and use `--batch_size 32` | Same-shape records use full-model batches; same-token records with different atom counts share the pairformer trunk |
+| Many independent designs, usually `N_sample=1-5` | Put JSONs in one input directory, or combine records into one top-level JSON list, and use `--batch_size 32` | Same-shape records use full-model batches; ragged atom shapes and nearby different token lengths share the pairformer trunk |
 | Many samples for one design, e.g. `N_sample=1280-2560` | Use one input with a large `-e/--sample` value and the large-sample flags below | Diffusion, atom attention, elementwise gates, and confidence summary avoid repeated work and excess HBM traffic |
 
 #### Recommended path: many independent designs
@@ -131,16 +131,28 @@ little throughput.  If you hit OOM, try `--batch_size 16` or `8`.
 
 The default `--batch_mode auto` is deliberately conservative but usable for real
 sequence-design campaigns.  If all featurized tensor shapes match, the whole
-model runs as one exact-shape batch.  If token/MSA/template trunk shapes match
-but atom counts differ, only the expensive pairformer trunk is batched; atom
-input embedding, diffusion, and confidence stay per record with their original
-ragged atom tensors.  The runner does **not** pad ragged proteins into a single
-full-model batch, because padding the triangular pairformer changes the physical
-token-reduction length inside triangle multiplication.  The masks do stop
-padded values from leaking, but BF16/TF32 kernel schedules still introduce tiny
-valid-region differences that compound through the 48-block trunk.  See
-`docs/perf/inference_throughput.md` for the padding deep dive and reproduction
-commands.
+model runs as one exact-shape batch.  If atom counts differ, only the expensive
+pairformer trunk is batched; atom input embedding, diffusion, and confidence
+stay per record with their original ragged atom tensors.  If token counts also
+differ, the runner pads only token-trunk tensors inside a length-sorted batch,
+passes a real pair mask through template/MSA/pairformer blocks, then crops the
+valid `s`/`z` trunk outputs before the atom-shaped tail.  This is the practical
+mixed-sequence path for protein design campaigns.  It is not bitwise identical
+to singleton inference because BF16/TF32 reductions run at a different physical
+length, but padded values are masked from model attention/reduction paths.  Use
+`--batch_mode exact --batch_size 1` when exact singleton reproducibility
+matters.  See `docs/perf/inference_throughput.md` for the padding deep dive and
+reproduction commands.
+
+For mixed token lengths, input order matters unless records are packed by
+length.  This branch automatically writes a transient length-sorted campaign
+JSON before featurization when `--batch_size > 1` and `--batch_mode auto` or
+`padded` are used.  Good logs show high `token_pad_eff` and tight ranges such as
+`Predicting 8 padded-token-trunk (auto) input(s): N_token 184-196,
+token_pad_eff 96.9%`.  The optional `--token_bucket_size N` knob additionally
+splits the streaming queue into approximate token buckets for advanced callers;
+leave it at the default `0` for the normal CLI path, which already length-sorts
+the raw campaign records.
 
 Directory inputs are campaign-aware in this branch:
 
@@ -163,12 +175,14 @@ Measured one-H100 gates with repeated `7r6r` inputs, `N_sample=1`,
 | --- | ---: | ---: | ---: |
 | 32 one-record JSON files in a directory | 342.7 s, 0.093 seq/s | 121.5 s, 0.263 seq/s | 2.82x end to end |
 | One combined JSON with 32 same-shape records | 361.8 s runner time | 69.3 s runner time | 5.2x after initialization |
+| 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
 
 Quick sanity check: a good campaign run should log messages like
 `Predicting 32 same-shape (auto) input(s)` or
-`Predicting 32 same-token-trunk (auto) input(s)`.  If you only see singleton
-predictions, the inputs are not sharing token trunk shapes or you are not using
-this branch's runner.
+`Predicting 32 same-token-trunk (auto) input(s)`.  For mixed sequence lengths,
+look for `Predicting ... padded-token-trunk (auto)` plus a high
+`token_pad_eff`.  If you only see singleton predictions, the inputs are not
+sharing a compatible trunk boundary or you are not using this branch's runner.
 
 #### Fast path: many samples from one design
 
@@ -218,8 +232,8 @@ configuration measured about `9.18-9.21` samples/sec per GPU at
   `--triatt_kernel cuequivariance`, `--enable_cache true`,
   `--enable_fusion true`, and `--enable_tf32 true` unless you are debugging.
 - Throughput comes from filling the GPU.  For campaign inference, prioritize
-  large same-token buckets over more Python processes; `auto` will still use the
-  faster full-model batch when atom shapes happen to match exactly.
+  length-sorted compatible trunk batches over more Python processes; `auto` will
+  still use the faster full-model batch when atom shapes happen to match exactly.
 - Do not chase very large `--batch_size` values.  For low-sample campaigns the
   pairformer trunk becomes the bottleneck, so memory rises faster than
   throughput beyond the `32-64` range on the profiled 245-token case.
