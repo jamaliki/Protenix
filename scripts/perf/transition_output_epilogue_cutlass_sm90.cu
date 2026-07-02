@@ -13,6 +13,7 @@
 #include <cutlass/gemm/device/gemm_universal_adapter.h>
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/gemm/kernel/tile_scheduler.hpp>
+#include <cutlass/kernel_hardware_info.h>
 
 namespace {
 
@@ -78,7 +79,7 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     cutlass::layout::RowMajor,
     8,
     Element,
-    cutlass::layout::ColumnMajor,
+    cutlass::layout::RowMajor,
     8,
     ElementAccumulator,
     TileShape,
@@ -140,6 +141,9 @@ torch::Tensor forward(
   int64_t hidden = b.size(2);
   int64_t output_channels = weight.size(0);
   auto out = torch::empty_like(residual);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto hw_info = cutlass::KernelHardwareInfo::make_kernel_hardware_info<GemmKernel>(
+      b.get_device(), 0, 0, stream);
 
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGemm,
@@ -152,6 +156,7 @@ torch::Tensor forward(
         {}},
        bf16_ptr(residual), StrideC{tokens * output_channels, _1{}, output_channels},
        mutable_bf16_ptr(out), StrideD{tokens * output_channels, _1{}, output_channels}},
+      hw_info,
       {}};
 
   Gemm gemm;
@@ -160,9 +165,9 @@ torch::Tensor forward(
 
   cutlass::Status status = gemm.can_implement(arguments);
   TORCH_CHECK(status == cutlass::Status::kSuccess, "CUTLASS can_implement failed");
-  status = gemm.initialize(arguments, workspace.data_ptr(), at::cuda::getCurrentCUDAStream());
+  status = gemm.initialize(arguments, workspace.data_ptr(), stream);
   TORCH_CHECK(status == cutlass::Status::kSuccess, "CUTLASS initialize failed");
-  status = gemm.run(at::cuda::getCurrentCUDAStream());
+  status = gemm.run(stream);
   TORCH_CHECK(status == cutlass::Status::kSuccess, "CUTLASS run failed");
   return out;
 }
