@@ -98,6 +98,48 @@ def triton_local_attention_gate_fusion_enabled() -> bool:
 _SUPPORTED_INPUT_DTYPES = {torch.float32, torch.bfloat16}
 
 
+def _flatten_bias_for_sample_axis(
+    trunked_attn_bias: torch.Tensor,
+    batch_shape: torch.Size,
+    tail_shape: tuple[int, int, int, int],
+) -> Optional[tuple[torch.Tensor, int]]:
+    """Flatten atom-attention bias without expanding sample-invariant records.
+
+    Batched diffusion uses activations shaped ``[record, sample, ...]``.  The
+    local atom pair bias is invariant across diffusion samples, so the cached
+    tensor is usually ``[record, 1, heads, trunks, 32, 128]``.  Expanding that
+    to ``[record, sample, ...]`` and then flattening would either allocate a
+    large repeated bias or miss this Triton path entirely.  Instead, flatten the
+    real bias rows and tell the kernel how many activation sample lanes reuse
+    each row.
+    """
+    bias_batch_shape = trunked_attn_bias.shape[:-4]
+    if trunked_attn_bias.shape[-4:] != tail_shape:
+        return None
+    if len(bias_batch_shape) != len(batch_shape):
+        return None
+
+    if bias_batch_shape == batch_shape:
+        bias_sample_repeat = 1
+        flat_bias_samples = prod(batch_shape) if batch_shape else 1
+    elif (
+        len(batch_shape) > 0
+        and bias_batch_shape[:-1] == batch_shape[:-1]
+        and bias_batch_shape[-1] == 1
+    ):
+        # The final leading axis is the diffusion sample axis.  Reuse one
+        # record-level bias row for all samples of that record.
+        bias_sample_repeat = int(batch_shape[-1])
+        flat_bias_samples = prod(batch_shape[:-1]) if len(batch_shape) > 1 else 1
+    else:
+        return None
+
+    bias_flat = trunked_attn_bias.reshape(flat_bias_samples, *tail_shape)
+    if bias_flat.data_ptr() != trunked_attn_bias.data_ptr():
+        return None
+    return bias_flat, bias_sample_repeat
+
+
 if triton_local_attention_available():
 
     @triton.jit
@@ -110,6 +152,7 @@ if triton_local_attention_available():
         out_ptr,
         n_atoms: tl.constexpr,
         n_trunks: tl.constexpr,
+        bias_sample_repeat: tl.constexpr,
         pad_left: tl.constexpr,
         q_stride_s: tl.constexpr,
         q_stride_h: tl.constexpr,
@@ -147,6 +190,7 @@ if triton_local_attention_available():
         trunk = pid % n_trunks
         head = (pid // n_trunks) % n_heads
         sample = pid // (n_trunks * n_heads)
+        bias_sample = sample // bias_sample_repeat
 
         offs_m = tl.arange(0, block_m)
         offs_n = tl.arange(0, block_n)
@@ -159,7 +203,7 @@ if triton_local_attention_available():
         v_base = v_ptr + sample * v_stride_s + head * v_stride_h
         b_base = (
             bias_ptr
-            + sample * b_stride_s
+            + bias_sample * b_stride_s
             + head * b_stride_h
             + trunk * b_stride_t
         )
@@ -270,35 +314,25 @@ def triton_local_attention(
     batch_shape = q.shape[:-3]
     n_heads, n_atoms, head_dim = q.shape[-3:]
     n_trunks = (n_atoms + n_queries - 1) // n_queries
-    bias_batch_shape = trunked_attn_bias.shape[:-4]
-    if trunked_attn_bias.shape[-4:] != (n_heads, n_trunks, n_queries, n_keys):
+    bias_flat_and_repeat = _flatten_bias_for_sample_axis(
+        trunked_attn_bias=trunked_attn_bias,
+        batch_shape=batch_shape,
+        tail_shape=(n_heads, n_trunks, n_queries, n_keys),
+    )
+    if bias_flat_and_repeat is None:
         return None
-    if len(bias_batch_shape) != len(batch_shape) or any(
-        bias_dim not in {1, q_dim}
-        for bias_dim, q_dim in zip(bias_batch_shape, batch_shape)
-    ):
-        return None
+    bias_flat, bias_sample_repeat = bias_flat_and_repeat
 
     n_sample = prod(batch_shape) if batch_shape else 1
     flat_q_shape = (n_sample, n_heads, n_atoms, head_dim)
-    flat_bias_shape = (n_sample, n_heads, n_trunks, n_queries, n_keys)
     q_flat = q.reshape(flat_q_shape)
     k_flat = k.reshape(flat_q_shape)
     v_flat = v.reshape(flat_q_shape)
     gate_flat = gate.reshape(flat_q_shape) if gate is not None else None
-    bias_view = trunked_attn_bias.expand(
-        *batch_shape,
-        n_heads,
-        n_trunks,
-        n_queries,
-        n_keys,
-    )
-    bias_flat = bias_view.reshape(flat_bias_shape)
     if (
         q_flat.data_ptr() != q.data_ptr()
         or k_flat.data_ptr() != k.data_ptr()
         or v_flat.data_ptr() != v.data_ptr()
-        or bias_flat.data_ptr() != trunked_attn_bias.data_ptr()
         or (gate is not None and gate_flat.data_ptr() != gate.data_ptr())
     ):
         return None
@@ -328,6 +362,7 @@ def triton_local_attention(
         out,
         n_atoms,
         n_trunks,
+        bias_sample_repeat,
         (n_keys - n_queries) // 2,
         q_flat.stride(0),
         q_flat.stride(1),
