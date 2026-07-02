@@ -1214,6 +1214,7 @@ class Protenix(nn.Module):
 
         _sync_cuda_for_timing(sync_timings)
         time_tracker: dict[str, Any] = {"diffusion": time.time() - step_start}
+        time_tracker["diffusion_atom_transformer_batched"] = batch_atom_transformer
         if hasattr(dm, "consume_perf_stats"):
             time_tracker.update(dm.consume_perf_stats())
         return x_list, time_tracker

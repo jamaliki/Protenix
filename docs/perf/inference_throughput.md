@@ -107,21 +107,20 @@ bucket:
   batch.  This is still the fastest path because diffusion and confidence are
   batched too.
 - If token/MSA/template trunk shapes match but atom counts differ, only the
-  atom-independent trunk is batched.  The runner computes atom input embeddings
-  per record, stacks `s_inputs` and token-trunk features, runs one pairformer
-  trunk call, then finishes diffusion and confidence per original atom-shaped
-  record.
+  atom-independent trunk is batched.  The diffusion tail can still batch its
+  atom encoder/decoder by padding atoms and passing a real atom mask.
 - If token counts differ, the CLI first length-sorts the raw JSON records, then
   pads only token-trunk tensors inside each batch.  A real `pair_mask` is passed
-  through template, MSA, and pairformer blocks, and the valid `s`/`z` crop is
-  handed back to the atom-shaped diffusion/confidence tail.
+  through template, MSA, and pairformer blocks.  Diffusion then pads both token
+  activations and atom activations at the transformer boundaries, with separate
+  token and atom masks.
 
-This fixes same-length mutation campaigns without padding fake atoms through
-atom attention or confidence reductions, and it also supports the common
-different-length design campaign case.  Padded-token trunk batching is a
-controlled numerical-change feature, not a bitwise singleton reproduction path:
-the masks block padded content, but BF16/TF32 reductions can still differ
-slightly because kernels see a different physical token length.  Use
+This fixes same-length mutation campaigns without letting fake atoms participate
+in atom attention or confidence reductions, and it also supports the common
+different-length design campaign case.  Padded batching is a controlled
+numerical-change feature, not a bitwise singleton reproduction path: the masks
+block padded content, but BF16/TF32 reductions can still differ slightly because
+kernels see a different physical token/atom length.  Use
 `--batch_mode exact --batch_size 1` for bitwise singleton debugging.  Directory
 inputs are handled as one campaign: all preprocessed JSON records are merged
 into a short-lived, length-sorted file before inference so many one-record JSONs
@@ -278,9 +277,33 @@ encoder/decoder plus remaining pairformer work are the next large terms.
 
 This is why mixed token counts are supportable despite the original limitation:
 the model can operate on variable lengths, but every padded boundary must prove
-that fake entries are masked before softmax/reduction.  Token attention now has
-that mask.  Atom-local attention still does not, so full atom padding remains
-deliberately avoided rather than silently wrong.
+that fake entries are masked before softmax/reduction.  The token transformer
+uses a token key mask.  The atom transformer uses a separate atom key mask in
+the local 32-query/128-key attention trunks, zeros fake atom states before and
+after local attention, and excludes fake atoms from atom-to-token means.  Padding
+is therefore a GPU scheduling tool, not extra biological input.
+
+Mixed-token batched diffusion atom-transformer gate: commit `eea3464`, paired
+jobs `95606` and `95607`
+(`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/ptx_atom_{off,on}_n200_20260702_163818`)
+ran the same 32-protein, 40-220-token, `N_sample=1`, `N_step=200` workload on
+the same H100 node and commit.  The only difference was
+`PROTENIX_BATCH_ATOM_TRANSFORMER=0` versus `1`.
+
+| setting | job sec | predict sec sum | diffusion | atom encoder | diffusion transformer | atom decoder | warm records/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| atom batching off | 105.89 | 97.37 | 80.03 | 28.23 | 16.87 | 24.17 | 0.337 |
+| atom batching on | 60.97 | 52.28 | 34.90 | 4.66 | 17.14 | 3.92 | 0.640 |
+
+The paired end-to-end job speedup is `1.74x` over the immediately preceding
+token-diffusion batching path.  The diffusion tail itself moved by `2.29x`, and
+the atom encoder/decoder terms moved by about `6.1x` each.  Relative to the
+original mixed-token profile at job `95439`, warm throughput improved from
+`0.166` to `0.640 records/s` (`3.86x`), and summed predict time dropped from
+`193.22s` to `52.28s` (`3.70x`).  Good logs now report
+`token-trunk+diffusion-token-atom-batch`; setting
+`PROTENIX_BATCH_ATOM_TRANSFORMER=0` leaves the older
+`token-trunk+diffusion-transformer-batch` path available for bisects.
 
 A follow-up branch tried to merge source JSONs before MSA/template preprocessing
 so preprocessing would run once for the transient campaign file instead of once
@@ -1279,9 +1302,10 @@ Production code touched by the throughput stack:
 - `protenix/model/modules/primitives.py`: SDPA fallback policy, optional
   Triton local attention, fused elementwise gate calls, and shape-guarded
   pairformer `Transition` input-projection fusion.
-- `protenix/model/modules/transformer.py`: local-attention bias fusion and
-  attention/transition residual fusion hooks plus guarded transition
-  input-projection fusion.
+- `protenix/model/modules/transformer.py`: token/atom key-mask plumbing for
+  padded mixed-length batching, masked atom-to-token aggregation, local-attention
+  bias fusion, and attention/transition residual fusion hooks plus guarded
+  transition input-projection fusion.
 - `protenix/model/modules/local_attention_triton.py`: narrow Triton atom local
   attention forward kernel, including optional local-attention gate fusion.
 - `protenix/model/modules/local_attention_bias_triton.py`: fused LayerNorm +
@@ -1294,13 +1318,15 @@ Production code touched by the throughput stack:
   layout producer for triangle attention; keeps the fused projection GEMM and
   CUEQ attention kernel unchanged while removing hidden contiguous-copy traffic.
 - `protenix/model/modules/confidence.py` and `protenix/model/protenix.py`:
-  confidence-logit chunk iteration and streaming summary consumption.
+  confidence-logit chunk iteration, streaming summary consumption, and the
+  mixed-token diffusion sampler that pads/masks token and atom transformer
+  activations across records.
 - `runner/campaign_inputs.py`, `runner/inference.py`,
   `runner/batch_inference.py`, and `configs/configs_inference.py`: public
   campaign inference batching.  The CLI length-sorts raw campaign records before
   featurization, the runner uses full-model batches for identical feature tensor
   trees, and the trunk path supports both same-token variable-atom records and
-  masked padded-token records before writing one output per input.
+  masked padded-token/padded-atom records before writing one output per input.
 
 Profiling and reproducibility helpers:
 

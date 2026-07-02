@@ -374,6 +374,7 @@ class InferenceRunner(object):
             )
             batched_coordinates = None
             diffusion_time_per_item = None
+            diffusion_batch_source = "token-trunk-batch"
             if use_batched_diffusion:
                 batched_coordinates, batch_diffusion_time = (
                     self.model.sample_diffusion_batch_token_transformer(
@@ -396,6 +397,13 @@ class InferenceRunner(object):
                     )
                 )
                 batch_diffusion_time["diffusion_token_transformer_batched"] = True
+                diffusion_batch_source = (
+                    "token-trunk+diffusion-token-atom-batch"
+                    if batch_diffusion_time.get(
+                        "diffusion_atom_transformer_batched", False
+                    )
+                    else "token-trunk+diffusion-transformer-batch"
+                )
                 diffusion_time_per_item = _scale_time_dict(
                     batch_diffusion_time,
                     scale=1.0 / len(data_items),
@@ -439,11 +447,7 @@ class InferenceRunner(object):
         self.last_batch_time_summary = _summarize_model_time_dicts(
             [log_dict["time"] for log_dict in log_dicts if "time" in log_dict],
             item_count=len(data_items),
-            source=(
-                "token-trunk+diffusion-transformer-batch"
-                if batched_coordinates is not None
-                else "token-trunk-batch"
-            ),
+            source=diffusion_batch_source,
         )
         return predictions
 
