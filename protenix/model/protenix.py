@@ -61,6 +61,13 @@ def _env_flag_enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_flag_enabled_by_default(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return True
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _env_int(name: str) -> Optional[int]:
     value = os.environ.get(name)
     if value is None or not value.strip():
@@ -112,6 +119,35 @@ def _stack_padded_token_pairs(
     return padded
 
 
+def _stack_padded_axis(
+    tensors: list[torch.Tensor],
+    axis: int,
+    max_size: int,
+) -> torch.Tensor:
+    """Stack tensors after zero-padding one ragged axis to ``max_size``."""
+    first = tensors[0]
+    axis = axis if axis >= 0 else first.dim() + axis
+    out_shape = [len(tensors), *first.shape]
+    out_shape[1 + axis] = max_size
+    padded = first.new_zeros(out_shape)
+    for batch_idx, tensor in enumerate(tensors):
+        slices = [batch_idx]
+        for size in tensor.shape:
+            slices.append(slice(0, size))
+        padded[tuple(slices)] = tensor
+    return padded
+
+
+def _stack_padded_atom_indices(
+    tensors: list[torch.Tensor],
+    max_atoms: int,
+) -> torch.Tensor:
+    padded = tensors[0].new_zeros((len(tensors), max_atoms))
+    for batch_idx, tensor in enumerate(tensors):
+        padded[batch_idx, : tensor.shape[0]] = tensor
+    return padded
+
+
 def _make_token_mask(
     token_counts: list[int],
     max_tokens: int,
@@ -123,6 +159,19 @@ def _make_token_mask(
     for batch_idx, n_token in enumerate(token_counts):
         token_mask[batch_idx, :n_token] = True
     return token_mask
+
+
+def _make_atom_mask(
+    atom_counts: list[int],
+    max_atoms: int,
+    device: torch.device,
+) -> torch.Tensor:
+    atom_mask = torch.zeros(
+        (len(atom_counts), max_atoms), device=device, dtype=torch.bool
+    )
+    for batch_idx, n_atom in enumerate(atom_counts):
+        atom_mask[batch_idx, :n_atom] = True
+    return atom_mask
 
 
 def update_input_feature_dict(input_feature_dict: dict[str, Any]) -> dict[str, Any]:
@@ -722,11 +771,12 @@ class Protenix(nn.Module):
     ) -> tuple[list[torch.Tensor], dict[str, Any]]:
         """Run mixed-token diffusion with one token-transformer launch per step.
 
-        Atom attention is still executed record-by-record at the true atom
-        shape.  Only the token activations immediately surrounding the
-        full-token diffusion transformer are padded and masked.  That is the
-        important correctness boundary: fake atoms never enter atom attention,
-        and fake tokens are invisible as attention keys in the transformer.
+        Different proteins have different token and atom counts.  The fast path
+        pads both levels to the largest item in the current inference batch and
+        passes masks at the attention/reduction boundaries.  Padding is
+        therefore a scheduling device for the GPU, not a model input: fake
+        tokens are hidden from token attention, and fake atoms are hidden from
+        local atom attention and excluded from atom-to-token means.
         """
         return autocasting_disable_decorator(self.configs.skip_amp.sample_diffusion)(
             self._sample_diffusion_batch_token_transformer
@@ -792,6 +842,97 @@ class Protenix(nn.Module):
             self._prepare_diffusion_cache(feature_dict, z_i)
             for feature_dict, z_i in zip(input_feature_dicts, z_list)
         ]
+        atom_counts = [
+            int(feature_dict["atom_to_token_idx"].size(-1))
+            for feature_dict in input_feature_dicts
+        ]
+        max_atoms = max(atom_counts)
+        batch_atom_transformer = (
+            _env_flag_enabled_by_default("PROTENIX_BATCH_ATOM_TRANSFORMER")
+            and self.enable_diffusion_shared_vars_cache
+            and all(
+                cache["p_lm/c_l"][0] is not None and cache["p_lm/c_l"][1] is not None
+                for cache in caches
+            )
+        )
+        atom_batch: Optional[dict[str, Any]] = None
+        if batch_atom_transformer:
+            # Atom caches already contain the t-invariant pair conditioning.
+            # Padding these cached local-attention trunks lets all proteins in
+            # the batch share one H100 launch per atom-transformer block.  The
+            # mask below is still required: zero padding alone would allow fake
+            # atoms to become attention keys and would corrupt token means.
+            max_atom_blocks = max(
+                int(cache["p_lm/c_l"][0].shape[-4]) for cache in caches
+            )
+            atom_batch = {
+                "atom_to_token_idx": _stack_padded_atom_indices(
+                    [
+                        feature_dict["atom_to_token_idx"]
+                        for feature_dict in input_feature_dicts
+                    ],
+                    max_atoms=max_atoms,
+                ),
+                "atom_mask": _make_atom_mask(atom_counts, max_atoms, device),
+                "ref_pos": _stack_padded_axis(
+                    [feature_dict["ref_pos"] for feature_dict in input_feature_dicts],
+                    axis=0,
+                    max_size=max_atoms,
+                ),
+                "ref_charge": _stack_padded_axis(
+                    [
+                        feature_dict["ref_charge"]
+                        for feature_dict in input_feature_dicts
+                    ],
+                    axis=0,
+                    max_size=max_atoms,
+                ),
+                "ref_mask": _stack_padded_axis(
+                    [feature_dict["ref_mask"] for feature_dict in input_feature_dicts],
+                    axis=0,
+                    max_size=max_atoms,
+                ),
+                "ref_atom_name_chars": _stack_padded_axis(
+                    [
+                        feature_dict["ref_atom_name_chars"]
+                        for feature_dict in input_feature_dicts
+                    ],
+                    axis=0,
+                    max_size=max_atoms,
+                ),
+                "ref_element": _stack_padded_axis(
+                    [
+                        feature_dict["ref_element"]
+                        for feature_dict in input_feature_dicts
+                    ],
+                    axis=0,
+                    max_size=max_atoms,
+                ),
+                "d_lm": _stack_padded_axis(
+                    [feature_dict["d_lm"] for feature_dict in input_feature_dicts],
+                    axis=0,
+                    max_size=max_atom_blocks,
+                ),
+                "v_lm": _stack_padded_axis(
+                    [feature_dict["v_lm"] for feature_dict in input_feature_dicts],
+                    axis=0,
+                    max_size=max_atom_blocks,
+                ),
+                "p_lm": _stack_padded_axis(
+                    [cache["p_lm/c_l"][0] for cache in caches],
+                    axis=-4,
+                    max_size=max_atom_blocks,
+                ),
+                "c_l": _stack_padded_axis(
+                    [cache["p_lm/c_l"][1] for cache in caches],
+                    axis=0,
+                    max_size=max_atoms,
+                ),
+                # Unused when p_lm/c_l are supplied, but the encoder signature
+                # still requires it.  Keeping the real object documents that
+                # this path relies on the cached-cache branch.
+                "pad_info": input_feature_dicts[0]["pad_info"],
+            }
         x_list = [
             noise_schedule[0]
             * torch.randn(
@@ -811,6 +952,9 @@ class Protenix(nn.Module):
             a_tokens = []
             s_singles = []
             z_pairs = []
+            r_noisies = []
+            x_noisies = []
+            t_hats = []
             decoder_inputs = []
 
             for batch_idx, feature_dict in enumerate(input_feature_dicts):
@@ -847,57 +991,128 @@ class Protenix(nn.Module):
                         use_conditioning=True,
                     )
 
+                r_noisies.append(r_noisy)
+                x_noisies.append(x_noisy)
+                t_hats.append(t_hat)
+                s_singles.append(s_single)
+                z_pairs.append(z_pair)
+
+                if not batch_atom_transformer:
+                    with dm._profile_block(
+                        "atom_encoder"
+                    ), torch.profiler.record_function(
+                        "protenix/batched_token_atom_attention_encoder"
+                    ):
+                        with dm._atom_attention_autocast():
+                            a_token, q_skip, c_skip, p_skip = dm.atom_attention_encoder(
+                                feature_dict["atom_to_token_idx"],
+                                feature_dict["ref_pos"],
+                                feature_dict["ref_charge"],
+                                feature_dict["ref_mask"],
+                                feature_dict["ref_atom_name_chars"],
+                                feature_dict["ref_element"],
+                                feature_dict["d_lm"],
+                                feature_dict["v_lm"],
+                                feature_dict["pad_info"],
+                                r_l=r_noisy,
+                                s=s_list[batch_idx].unsqueeze(dim=-3),
+                                z=z_pair.unsqueeze(dim=-4),
+                                p_lm=cache["p_lm/c_l"][0],
+                                c_l=cache["p_lm/c_l"][1],
+                                inplace_safe=inplace_safe,
+                                chunk_size=chunk_size,
+                            )
+
+                    transformer_dtype = dm._diffusion_core_dtype(a_token.dtype)
+                    a_token = a_token.to(dtype=transformer_dtype)
+                    if inplace_safe:
+                        a_token += dm.linear_no_bias_s(dm.layernorm_s(s_single))
+                    else:
+                        a_token = a_token + dm.linear_no_bias_s(
+                            dm.layernorm_s(s_single)
+                        )
+                    a_tokens.append(a_token.squeeze(dim=-3))
+                    decoder_inputs.append(
+                        (batch_idx, x_noisy, t_hat, q_skip, c_skip, p_skip)
+                    )
+
+            if batch_atom_transformer:
+                assert atom_batch is not None
                 with dm._profile_block("atom_encoder"), torch.profiler.record_function(
-                    "protenix/batched_token_atom_attention_encoder"
+                    "protenix/batched_atom_attention_encoder"
                 ):
                     with dm._atom_attention_autocast():
-                        a_token, q_skip, c_skip, p_skip = dm.atom_attention_encoder(
-                            feature_dict["atom_to_token_idx"],
-                            feature_dict["ref_pos"],
-                            feature_dict["ref_charge"],
-                            feature_dict["ref_mask"],
-                            feature_dict["ref_atom_name_chars"],
-                            feature_dict["ref_element"],
-                            feature_dict["d_lm"],
-                            feature_dict["v_lm"],
-                            feature_dict["pad_info"],
-                            r_l=r_noisy,
-                            s=s_list[batch_idx].unsqueeze(dim=-3),
-                            z=z_pair.unsqueeze(dim=-4),
-                            p_lm=cache["p_lm/c_l"][0],
-                            c_l=cache["p_lm/c_l"][1],
-                            inplace_safe=inplace_safe,
-                            chunk_size=chunk_size,
+                        a_token_batch, q_skip_batch, c_skip_batch, p_skip_batch = (
+                            dm.atom_attention_encoder(
+                                atom_batch["atom_to_token_idx"],
+                                atom_batch["ref_pos"],
+                                atom_batch["ref_charge"],
+                                atom_batch["ref_mask"],
+                                atom_batch["ref_atom_name_chars"],
+                                atom_batch["ref_element"],
+                                atom_batch["d_lm"],
+                                atom_batch["v_lm"],
+                                atom_batch["pad_info"],
+                                r_l=_stack_padded_axis(
+                                    r_noisies, axis=-2, max_size=max_atoms
+                                ),
+                                s=_stack_padded_axis(
+                                    [s_i.unsqueeze(dim=-3) for s_i in s_list],
+                                    axis=-2,
+                                    max_size=max_tokens,
+                                ),
+                                z=_stack_padded_token_pairs(
+                                    z_pairs,
+                                    max_tokens=max_tokens,
+                                    channel_first=False,
+                                ).unsqueeze(dim=-4),
+                                p_lm=atom_batch["p_lm"],
+                                c_l=atom_batch["c_l"],
+                                inplace_safe=inplace_safe,
+                                chunk_size=chunk_size,
+                                atom_mask=atom_batch["atom_mask"],
+                            )
                         )
 
-                transformer_dtype = dm._diffusion_core_dtype(a_token.dtype)
-                a_token = a_token.to(dtype=transformer_dtype)
+                transformer_dtype = dm._diffusion_core_dtype(a_token_batch.dtype)
+                a_token_batch = a_token_batch.to(dtype=transformer_dtype)
+                s_single_batch = _stack_padded_axis(
+                    s_singles, axis=-2, max_size=max_tokens
+                )
                 if inplace_safe:
-                    a_token += dm.linear_no_bias_s(dm.layernorm_s(s_single))
+                    a_token_batch += dm.linear_no_bias_s(dm.layernorm_s(s_single_batch))
                 else:
-                    a_token = a_token + dm.linear_no_bias_s(dm.layernorm_s(s_single))
-                s_single_transformer = s_single.to(dtype=transformer_dtype)
-
-                if self.enable_efficient_fusion:
-                    z_pair_for_transformer = dm.normalize(
-                        z_pair.to(dtype=transformer_dtype)
+                    a_token_batch = a_token_batch + dm.linear_no_bias_s(
+                        dm.layernorm_s(s_single_batch)
                     )
-                    z_pair_for_transformer = permute_final_dims(
-                        z_pair_for_transformer, [2, 0, 1]
-                    ).contiguous()
-                else:
-                    z_pair_for_transformer = z_pair.to(dtype=transformer_dtype)
-
-                a_tokens.append(a_token.squeeze(dim=-3))
-                s_singles.append(s_single_transformer.squeeze(dim=-3))
-                z_pairs.append(z_pair_for_transformer)
-                decoder_inputs.append((batch_idx, x_noisy, t_hat, q_skip, c_skip, p_skip))
+                a_batch = a_token_batch.squeeze(dim=-3)
+                s_batch = s_single_batch.to(dtype=transformer_dtype).squeeze(dim=-3)
+            else:
+                transformer_dtype = dm._diffusion_core_dtype(a_tokens[0].dtype)
+                s_batch = _stack_padded_token_vectors(
+                    [
+                        s_i.to(dtype=transformer_dtype).squeeze(dim=-3)
+                        for s_i in s_singles
+                    ],
+                    max_tokens,
+                )
+                a_batch = _stack_padded_token_vectors(a_tokens, max_tokens)
 
             token_mask = _make_token_mask(token_counts, max_tokens, device)
-            a_batch = _stack_padded_token_vectors(a_tokens, max_tokens)
-            s_batch = _stack_padded_token_vectors(s_singles, max_tokens)
+            if self.enable_efficient_fusion:
+                z_pairs_for_transformer = [
+                    permute_final_dims(
+                        dm.normalize(z_pair.to(dtype=transformer_dtype)),
+                        [2, 0, 1],
+                    ).contiguous()
+                    for z_pair in z_pairs
+                ]
+            else:
+                z_pairs_for_transformer = [
+                    z_pair.to(dtype=transformer_dtype) for z_pair in z_pairs
+                ]
             z_batch = _stack_padded_token_pairs(
-                z_pairs,
+                z_pairs_for_transformer,
                 max_tokens=max_tokens,
                 channel_first=self.enable_efficient_fusion,
             )
@@ -918,32 +1133,67 @@ class Protenix(nn.Module):
             if a_batch.dtype != torch.float32:
                 a_batch = a_batch.to(dtype=torch.float32)
 
-            for out_idx, (
-                batch_idx,
-                x_noisy,
-                t_hat,
-                q_skip,
-                c_skip,
-                p_skip,
-            ) in enumerate(decoder_inputs):
-                n_token = token_counts[batch_idx]
-                a_token = dm.layernorm_a(a_batch[out_idx, :n_token].unsqueeze(dim=-3))
-
+            if batch_atom_transformer:
+                assert atom_batch is not None
+                a_decode_batch = dm.layernorm_a(a_batch).unsqueeze(dim=-3)
                 with dm._profile_block("atom_decoder"), torch.profiler.record_function(
-                    "protenix/batched_token_atom_attention_decoder"
+                    "protenix/batched_atom_attention_decoder"
                 ):
                     with dm._atom_attention_autocast():
-                        r_update = dm.atom_attention_decoder(
-                            atom_to_token_idx=input_feature_dicts[batch_idx][
-                                "atom_to_token_idx"
-                            ],
-                            a=a_token,
-                            q_skip=q_skip,
-                            c_skip=c_skip,
-                            p_skip=p_skip,
+                        r_update_batch = dm.atom_attention_decoder(
+                            atom_to_token_idx=atom_batch["atom_to_token_idx"],
+                            a=a_decode_batch,
+                            q_skip=q_skip_batch,
+                            c_skip=c_skip_batch,
+                            p_skip=p_skip_batch,
                             inplace_safe=inplace_safe,
                             chunk_size=chunk_size,
+                            atom_mask=atom_batch["atom_mask"],
                         )
+                decoder_outputs = [
+                    (
+                        batch_idx,
+                        x_noisies[batch_idx],
+                        t_hats[batch_idx],
+                        r_update_batch[batch_idx, :, : atom_counts[batch_idx]],
+                    )
+                    for batch_idx in range(len(input_feature_dicts))
+                ]
+            else:
+                decoder_outputs = []
+                for out_idx, (
+                    batch_idx,
+                    x_noisy,
+                    t_hat,
+                    q_skip,
+                    c_skip,
+                    p_skip,
+                ) in enumerate(decoder_inputs):
+                    n_token = token_counts[batch_idx]
+                    a_token = dm.layernorm_a(
+                        a_batch[out_idx, :n_token].unsqueeze(dim=-3)
+                    )
+
+                    with dm._profile_block(
+                        "atom_decoder"
+                    ), torch.profiler.record_function(
+                        "protenix/batched_token_atom_attention_decoder"
+                    ):
+                        with dm._atom_attention_autocast():
+                            r_update = dm.atom_attention_decoder(
+                                atom_to_token_idx=input_feature_dicts[batch_idx][
+                                    "atom_to_token_idx"
+                                ],
+                                a=a_token,
+                                q_skip=q_skip,
+                                c_skip=c_skip,
+                                p_skip=p_skip,
+                                inplace_safe=inplace_safe,
+                                chunk_size=chunk_size,
+                            )
+                    decoder_outputs.append((batch_idx, x_noisy, t_hat, r_update))
+
+            for batch_idx, x_noisy, t_hat, r_update in decoder_outputs:
 
                 with dm._profile_block("output_rescale"):
                     s_ratio = (t_hat / dm.sigma_data)[..., None, None].to(
