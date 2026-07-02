@@ -338,16 +338,11 @@ class Transition(nn.Module):
                 (x.shape[0], self.c_in), dtype=x.dtype, device=x.device
             )
             start = 0
-            input_weight = torch.cat(
-                (self.linear_no_bias_a.weight, self.linear_no_bias_b.weight), dim=0
-            )
             for chunk in chunks:
                 y = self.layernorm1(chunk)
-                # ``a`` and ``b`` are independent projections of the same
-                # normalized activation.  One wider GEMM removes an extra
-                # launch and avoids reading the large transition input twice.
-                a, b = F.linear(y, input_weight, None).chunk(2, dim=-1)
+                a = self.linear_no_bias_a(y)
                 a = F.silu(a, True)
+                b = self.linear_no_bias_b(y)
                 del y
                 b *= a
                 del a
