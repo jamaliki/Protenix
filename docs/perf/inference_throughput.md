@@ -350,6 +350,26 @@ slightly reduced pairformer time on this noisy node, but lost far more in
 diffusion and confidence.  The README mixed-campaign command intentionally uses
 the default-off settings.
 
+A batch-size follow-up on commit `7de6bdf` screened fixed B16/B20/B24/B32 with
+conditioning batching enabled (job `95646`,
+`runs/batchsize_screen_cond_b16_32_20260702_171044`).  The node was slower than
+the promoted conditioning gate, but the within-job shape tradeoff was clear:
+
+| batch shape | predict sec sum | pairformer | diffusion | note |
+| --- | ---: | ---: | ---: | --- |
+| B16 + B16 | 39.81 | 17.75 | 18.52 | cold first measured case on this node |
+| B20 + B12 | 34.95 | 16.73 | 16.39 | best fixed batch in this noisy screen |
+| B24 + B8 | 36.33 | 17.11 | 17.40 | more first-batch padding; small second batch |
+| B32 | 39.62 | 21.69 | 15.88 | diffusion improves, but pairformer padding dominates |
+
+This motivated a guarded prototype that used `--batch_size 32` for diffusion
+while chunking the pairformer trunk internally into B16 groups
+(`PROTENIX_TOKEN_TRUNK_BATCH_SIZE=16`, commit `6ac0d70`).  The representative
+gate (job `95654`, `runs/chunked_trunk_gate_20260702_172016`) produced
+`33.67s` for B32-with-B16-trunk, bracketed by B20 controls at `35.00s` and
+`33.81s`.  That is inside run noise and not a legitimate complexity trade, so
+the prototype was reverted in commit `adf02e5`.
+
 A follow-up branch tried to merge source JSONs before MSA/template preprocessing
 so preprocessing would run once for the transient campaign file instead of once
 per source file.  That cleaned up generated JSON siblings but did not materially
