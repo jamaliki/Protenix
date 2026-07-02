@@ -732,6 +732,30 @@ the core constraint for any future CuTe kernel: preserve the cuBLAS-class GMMA
 schedule first, then fuse the epilogue.  A slower matmul with a nicer epilogue is
 a net loss.
 
+The follow-up mainloop isolation probe separates the GEMM schedule from the
+gate/residual epilogue: `scripts/perf/transition_output_cutlass_mainloop_probe.py`
+and `scripts/perf/transition_output_cutlass_mainloop_probe_sm90.cu` time only
+`b @ weight.T` with the same BF16 tensors.  It compares PyTorch/cuBLAS's
+flattened large GEMM (`M=N_sample*N_token`) with two CUTLASS mappings: the same
+flattened shape, and the token-batched shape needed by the fused gate epilogue
+(`M=N_sample`, `L=N_token`).  Job `95168`
+(`transition_output_cutlass_mainloop_probe_20260702_1425`, commit `6dd2418`)
+used the prebuilt `sm_90a` extension cache from
+`transition_output_cutlass_mainloop_compile_6dd2418_sm90a`:
+
+| implementation | GEMM shape | ms | effective TFLOP/s | parity | decision |
+| --- | --- | ---: | ---: | ---: | --- |
+| PyTorch/cuBLAS | `M=313600, N=768, K=1536` | 0.976 | 757.8 | reference | keep |
+| CUTLASS SM90 flattened | `M=313600, N=768, K=1536, L=1` | 2.176 | 340.1 | exact BF16 | reject |
+| CUTLASS SM90 token-batched | `M=1280, N=768, K=1536, L=245` | 1.956 | 378.3 | exact BF16 | reject |
+
+This makes the rejection sharper: the first EVT candidate was not only paying
+for a complicated epilogue.  The generic CUTLASS collective/tile chosen here is
+already about 2x slower than cuBLAS on the plain transition GEMM.  The transition
+output boundary should not be touched in model code until a CUTLASS/CuTe
+mainloop reaches cuBLAS-class throughput on this exact shape; otherwise fusing
+the 0.47 ms epilogue cannot recover the lost GEMM time.
+
 `scripts/perf/transition_output_epilogue_hotspot.py` is the reusable screen for
 the next attempt.  It builds a real `ConditionedTransitionBlock`, fixes the
 output-boundary tensors, times the baseline `linear_b(b)` plus promoted
