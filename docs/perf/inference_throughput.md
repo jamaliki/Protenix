@@ -687,6 +687,15 @@ PROTENIX_RUN_NAME=transition_epilogue_candidate_$(date -u +%Y%m%d_%H%M%S) \
 sbatch scripts/perf/tokyo_transition_epilogue_hotspot.sbatch
 ```
 
+Before a native extension is ready, smoke-test the import/call path with the
+reference candidate:
+
+```bash
+CANDIDATE=scripts/perf/transition_output_epilogue_reference_candidate.py:transition_output_epilogue \
+PROTENIX_RUN_NAME=transition_epilogue_reference_candidate_$(date -u +%Y%m%d_%H%M%S) \
+sbatch scripts/perf/tokyo_transition_epilogue_hotspot.sbatch
+```
+
 The wrapper writes a clean `$RUN_DIR/result.json` directly from the Python
 harness, so extension compile logs on stdout do not corrupt the machine-readable
 timing record.
@@ -1052,6 +1061,8 @@ Profiling and reproducibility helpers:
   for CUEQ triangle attention and its layout/epilogue boundaries.
 - `scripts/perf/transition_output_epilogue_hotspot.py`: transition output-GEMM
   epilogue screen and candidate-injection harness for native CuTe/CUTLASS work.
+- `scripts/perf/transition_output_epilogue_reference_candidate.py`: baseline
+  candidate ABI smoke for the transition epilogue harness.
 - `scripts/perf/tokyo_transition_epilogue_hotspot.sbatch`: Tokyo one-H100
   wrapper for the transition epilogue screen, including CUDA/CUTLASS env setup.
 - `scripts/perf/confidence_head_hotspot.py`: confidence pairformer screen.
