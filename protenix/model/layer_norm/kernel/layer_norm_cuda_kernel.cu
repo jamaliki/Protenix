@@ -16,6 +16,7 @@
 #include <cooperative_groups.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <torch/extension.h>
 #include <iostream>
 
 #include <THC/THCDeviceUtils.cuh>
@@ -233,9 +234,9 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
     // Get element byte size
     const auto dtype = output->dtype();
     int element_size;
-    if (dtype == at::ScalarType::Float) {
+    if (dtype == torch::kFloat32) {
         element_size = 4;
-    } else if (dtype == at::ScalarType::Half || dtype == at::ScalarType::BFloat16) {
+    } else if (dtype == torch::kFloat16 || dtype == torch::kBFloat16) {
         element_size = 2;
     } else {
         throw std::runtime_error("Unsupported data type");
@@ -265,7 +266,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
     const dim3 block(threads_per_row, rows_per_block);
 
     // Type dispatch
-    if (dtype == at::ScalarType::Float) {
+    if (dtype == torch::kFloat32) {
         if (vec_size == 16) {
             LayerNormForwardV2<float, float4><<<grid, block>>>(
                 static_cast<float*>(input->data_ptr()),
@@ -298,7 +299,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
             );
         }
     }
-    else if (dtype == at::ScalarType::Half) {
+    else if (dtype == torch::kFloat16) {
                 if (vec_size == 16) {  // Use float4 to handle half type (8 elements)
             LayerNormForwardV2<at::Half, float4><<<grid, block>>>(
                 static_cast<at::Half*>(input->data_ptr()),
@@ -341,7 +342,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
             );
         }
     }
-    else if (dtype == at::ScalarType::BFloat16) {
+    else if (dtype == torch::kBFloat16) {
         if (vec_size == 16) {
             LayerNormForwardV2<at::BFloat16, float4><<<grid, block>>>(
                 static_cast<at::BFloat16*>(input->data_ptr()),
@@ -917,9 +918,9 @@ void HostLayerNormGradient(const V* dout, const float* mean, const float* invvar
     // Get element byte size
     const auto dtype = input->dtype();
     int element_size;
-    if (dtype == at::ScalarType::Float) {
+    if (dtype == torch::kFloat32) {
         element_size = 4;
-    } else if (dtype == at::ScalarType::Half || dtype == at::ScalarType::BFloat16) {
+    } else if (dtype == torch::kFloat16 || dtype == torch::kBFloat16) {
         element_size = 2;
     } else {
         throw std::runtime_error("Unsupported data type");
@@ -947,14 +948,14 @@ void HostLayerNormGradient(const V* dout, const float* mean, const float* invvar
     const int rows_per_block = threads_per_block / threads_per_row;
     const dim3 grid((row + rows_per_block - 1) / rows_per_block);
     const dim3 block(threads_per_row, rows_per_block);
-    if (dtype == at::ScalarType::Float) {
+    if (dtype == torch::kFloat32) {
     if (vec_size == 16)
         LayerNormInputGradV2<float, float4><<<grid, block>>>((float*)dout, input->DATA_PTR<float>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (float*)gamma, (float*)grad_input);
     else if(vec_size == 8)
         LayerNormInputGradV2<float, float2><<<grid, block>>>((float*)dout, input->DATA_PTR<float>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (float*)gamma, (float*)grad_input);
     else if(vec_size == 4)
         LayerNormInputGradV2<float, float><<<grid, block>>>((float*)dout, input->DATA_PTR<float>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (float*)gamma, (float*)grad_input);
-    } else if (dtype == at::ScalarType::Half) {
+    } else if (dtype == torch::kFloat16) {
     if (vec_size == 16)
         LayerNormInputGradV2<at::Half, float4><<<grid, block>>>((at::Half*)dout, input->DATA_PTR<at::Half>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (at::Half*)gamma, (at::Half*)grad_input);
     else if(vec_size == 8)
