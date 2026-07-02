@@ -246,6 +246,45 @@ if triton_fused_elementwise_available():
         out = a * (1.0 / (1.0 + tl.exp(-a))) * b
         tl.store(out_ptr + offsets, out, mask=mask)
 
+    @triton.jit
+    def _sigmoid_mul_heads_first_kernel(
+        gate_ptr,
+        heads_first_ptr,
+        out_ptr,
+        n_elements: tl.constexpr,
+        q_count: tl.constexpr,
+        head_dim: tl.constexpr,
+        heads_channels: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = pid * block_size + tl.arange(0, block_size)
+        valid = offsets < n_elements
+
+        hc = offsets % heads_channels
+        q = (offsets // heads_channels) % q_count
+        batch = offsets // (q_count * heads_channels)
+        h = hc // head_dim
+        c = hc % head_dim
+
+        # ``out`` and ``gate`` are contiguous in [..., Q, H * C] order.  The
+        # cuequivariance attention output is contiguous in [..., H, Q, C] order.
+        # This index swap performs the transpose+flatten while applying the
+        # gate, avoiding a separate sigmoid tensor, gated tensor, and reshape
+        # copy of the large pair representation.
+        source_offsets = (
+            batch * heads_channels * q_count
+            + h * q_count * head_dim
+            + q * head_dim
+            + c
+        )
+        gate = tl.load(gate_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
+        value = tl.load(heads_first_ptr + source_offsets, mask=valid, other=0.0).to(
+            tl.float32
+        )
+        out = (1.0 / (1.0 + tl.exp(-gate))) * value
+        tl.store(out_ptr + offsets, out, mask=valid)
+
 
 def _grid(n_elements: int) -> tuple[int]:
     return (triton.cdiv(n_elements, _BLOCK_SIZE),)
@@ -338,6 +377,66 @@ def triton_silu_mul_split(
     return out
 
 
+def triton_sigmoid_mul_heads_first(
+    gate: torch.Tensor,
+    heads_first: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Gate and flatten cuequivariance attention output in one pass.
+
+    ``gate`` is the linear gate projection in ``[..., Q, H * C]`` layout.
+    ``heads_first`` is the cuequivariance attention output in ``[..., H, Q, C]``
+    layout.  The ordinary PyTorch path computes
+    ``heads_first.transpose(-2, -3) * sigmoid(gate.view(...))`` and then
+    reshapes to ``[..., Q, H * C]`` for the output projection.  At high
+    sequence batch this reshape is a real HBM copy, not metadata.  This kernel
+    writes the contiguous projected layout directly.
+    """
+    if not triton_fused_elementwise_enabled():
+        return None
+    if not triton_fused_elementwise_available():
+        return None
+    if torch.is_grad_enabled():
+        return None
+    if gate.dtype not in _SUPPORTED_DTYPES:
+        return None
+    if not gate.is_cuda or not heads_first.is_cuda:
+        return None
+    if gate.dtype != heads_first.dtype:
+        return None
+    if not gate.is_contiguous() or not heads_first.is_contiguous():
+        return None
+    if gate.dim() < 2 or heads_first.dim() != gate.dim() + 1:
+        return None
+    q_count = gate.shape[-2]
+    heads_channels = gate.shape[-1]
+    head_count = heads_first.shape[-3]
+    if heads_first.shape[:-3] != gate.shape[:-2]:
+        return None
+    if heads_first.shape[-2] != q_count:
+        return None
+    if heads_channels % head_count != 0:
+        return None
+    head_dim = heads_channels // head_count
+    if heads_first.shape[-1] != head_dim:
+        return None
+    if gate.numel() == 0:
+        return None
+
+    out = torch.empty_like(gate)
+    _sigmoid_mul_heads_first_kernel[_grid(gate.numel())](
+        gate,
+        heads_first,
+        out,
+        gate.numel(),
+        q_count=q_count,
+        head_dim=head_dim,
+        heads_channels=heads_channels,
+        block_size=_BLOCK_SIZE,
+        num_warps=4,
+    )
+    return out
+
+
 def fused_sigmoid_mul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = triton_sigmoid_mul(x, y)
     if out is not None:
@@ -369,3 +468,16 @@ def fused_silu_mul_split(x: torch.Tensor, split_size: int) -> torch.Tensor:
         return out
     a, b = x.split(split_size, dim=-1)
     return F.silu(a) * b
+
+
+def fused_sigmoid_mul_heads_first(
+    gate: torch.Tensor,
+    heads_first: torch.Tensor,
+) -> torch.Tensor:
+    out = triton_sigmoid_mul_heads_first(gate, heads_first)
+    if out is not None:
+        return out
+    head_count = heads_first.shape[-3]
+    return torch.sigmoid(gate).view(gate.shape[:-1] + (head_count, -1)) * (
+        heads_first.transpose(-2, -3)
+    )

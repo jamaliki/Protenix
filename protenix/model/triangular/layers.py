@@ -23,6 +23,9 @@ import torch
 import torch.nn as nn
 from scipy.stats import truncnorm
 
+from protenix.model.modules.fused_elementwise_triton import (
+    triton_sigmoid_mul_heads_first,
+)
 from protenix.model.utils import (
     chunk_layer,
     flatten_final_dims,
@@ -421,6 +424,33 @@ class Attention(nn.Module):
 
         return o
 
+    def _wrap_up_heads_first(self, o: torch.Tensor, q_x: torch.Tensor) -> torch.Tensor:
+        """Output epilogue for cuequivariance's ``[..., H, Q, C]`` layout.
+
+        The generic path transposes cuequivariance output to ``[..., Q, H, C]``,
+        multiplies by a sigmoid gate, then reshapes to ``[..., Q, H * C]`` for
+        the output projection.  At high sequence batch the reshape is a real
+        HBM copy because the head dimension is not contiguous after the
+        transpose.  The Triton helper fuses sigmoid, multiply, transpose, and
+        flatten into one streaming write.  If any guard fails, fall back to the
+        original mathematically identical path.
+        """
+        if self.linear_g is not None:
+            gate = self.linear_g(q_x)
+            gated = triton_sigmoid_mul_heads_first(gate, o)
+            if gated is not None:
+                return self.linear_o(gated)
+
+            o = o.transpose(-2, -3)
+            g = self.sigmoid(gate)
+            g = g.view(g.shape[:-1] + (self.no_heads, -1))
+            o = o * g
+        else:
+            o = o.transpose(-2, -3)
+
+        o = flatten_final_dims(o, 2)
+        return self.linear_o(o)
+
     def forward(
         self,
         q_x: torch.Tensor,
@@ -487,7 +517,7 @@ class Attention(nn.Module):
             o = cuequivariance_triangular_attn(
                 q, k, v, biases[1].float(), (biases[0] == 0).bool(), scale
             )[0]
-            o = o.transpose(-2, -3)
+            return self._wrap_up_heads_first(o, q_x)
         else:
             o = _attention(q, k, v, biases)
             o = o.transpose(-2, -3)
