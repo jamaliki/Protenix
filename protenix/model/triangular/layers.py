@@ -21,6 +21,7 @@ from typing import Callable, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from scipy.stats import truncnorm
 
 from protenix.model.modules.fused_elementwise_triton import (
@@ -479,6 +480,8 @@ class Attention(nn.Module):
             "deepspeed",
             "triattention",
             "cuequivariance",
+            "sdpa",
+            "sdpa_dense",
         ]
 
         if biases is None:
@@ -530,6 +533,29 @@ class Attention(nn.Module):
                 # Squeeze only that overload; real B>1 sequence batches must
                 # be preserved for independent multi-target inference.
                 o = o.squeeze(0)
+            return self._wrap_up_heads_first(o, q_x)
+        elif triangle_attention in {"sdpa", "sdpa_dense"}:
+            # This is a screening path for dense many-sequence inference batches.
+            # PyTorch SDPA consumes one additive mask, while triangle attention has
+            # two logical bias terms: a padding mask and a learned triangular
+            # bias.  Materializing their sum at B64/N245 would create a huge
+            # [B, N, H, N, N] tensor.  The dense variant is only correct when the
+            # padding mask is all-valid, so it passes the learned bias directly
+            # and avoids that extra HBM traffic.
+            if triangle_attention == "sdpa_dense":
+                attn_bias = biases[1].to(dtype=q.dtype)
+            else:
+                attn_bias = biases[0]
+                for bias in biases[1:]:
+                    attn_bias = attn_bias + bias
+                attn_bias = attn_bias.to(dtype=q.dtype)
+            o = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_bias,
+                dropout_p=0.0,
+            )
             return self._wrap_up_heads_first(o, q_x)
         else:
             o = _attention(q, k, v, biases)
