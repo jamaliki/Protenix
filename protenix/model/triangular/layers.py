@@ -524,6 +524,12 @@ class Attention(nn.Module):
             # auxiliary tensors.
             if isinstance(o, tuple):
                 o = o[0]
+            if q.dim() == 4 and o.dim() == 5 and o.shape[0] == 1:
+                # cuequivariance may keep the explicit B=1 dimension even
+                # when the input used its documented unbatched overload.
+                # Squeeze only that overload; real B>1 sequence batches must
+                # be preserved for independent multi-target inference.
+                o = o.squeeze(0)
             return self._wrap_up_heads_first(o, q_x)
         else:
             o = _attention(q, k, v, biases)
