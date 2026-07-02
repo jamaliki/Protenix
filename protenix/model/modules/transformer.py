@@ -210,6 +210,7 @@ class AttentionPairBias(nn.Module):
         q: torch.Tensor,
         kv: torch.Tensor,
         z: torch.Tensor,
+        token_mask: Optional[torch.Tensor] = None,
         inplace_safe: bool = False,
         enable_efficient_fusion: bool = False,
     ) -> torch.Tensor:
@@ -251,6 +252,14 @@ class AttentionPairBias(nn.Module):
                 bias, [2, 0, 1]
             )  # [..., n_heads, N_token, N_token]
 
+        if token_mask is not None:
+            # Pairformer padding uses pair_mask[i, j] = token_mask[i] *
+            # token_mask[j].  The pair bias alone does not stop token attention
+            # from reading padded key/value tokens, so add a standard key mask
+            # in the same [..., H, Q, K] bias tensor consumed by attention.
+            key_bias = (token_mask.to(dtype=bias.dtype) - 1) * 1e4
+            bias = bias + key_bias[..., None, None, :]
+
         # Line 11: Multi-head attention with attention bias & gating (and optionally local attention)
         q = self.attention(q_x=q, kv_x=kv, attn_bias=bias, inplace_safe=inplace_safe)
 
@@ -267,6 +276,7 @@ class AttentionPairBias(nn.Module):
         chunk_size: Optional[int] = None,
         enable_efficient_fusion: bool = False,
         residual: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Details are given in local_forward and standard_forward"""
         # Input projections
@@ -299,6 +309,7 @@ class AttentionPairBias(nn.Module):
                 a,
                 kv if self.cross_attention_mode else a,
                 z,
+                token_mask=token_mask,
                 inplace_safe=inplace_safe,
                 enable_efficient_fusion=enable_efficient_fusion,
             )

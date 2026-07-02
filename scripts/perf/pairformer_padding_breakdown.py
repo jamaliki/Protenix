@@ -145,7 +145,8 @@ def run_stages(
     z = z + block.pair_transition(z)
     rows.append(("pair_transition", s, z))
 
-    s = s + block.attention_pair_bias(a=s, s=None, z=z)
+    token_mask = torch.diagonal(pair_mask, dim1=-2, dim2=-1)
+    s = s + block.attention_pair_bias(a=s, s=None, z=z, token_mask=token_mask)
     rows.append(("token_attention", s, z))
 
     s = s + block.single_transition(s)
