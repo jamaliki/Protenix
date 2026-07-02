@@ -388,7 +388,12 @@ class MSAPairWeightedAveraging(nn.Module):
             initializer="zeros",
         )
 
-    def forward(self, m: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        m: torch.Tensor,
+        z: torch.Tensor,
+        pair_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             m (torch.Tensor): msa embedding
@@ -408,6 +413,12 @@ class MSAPairWeightedAveraging(nn.Module):
         b = self.linear_no_bias_z(
             self.layernorm_z(z)
         )  # [...,n_token, n_token, n_heads]
+        if pair_mask is not None:
+            # Padded-token inference uses pair_mask[i, j] = valid_i * valid_j.
+            # This softmax averages values over token keys; without the key mask,
+            # valid query tokens can read fake padded keys through the MSA stack
+            # before the pairformer block gets a chance to mask them.
+            b = b + (pair_mask.to(dtype=b.dtype) - 1).unsqueeze(-1) * 1e4
         g = torch.sigmoid(
             self.linear_no_bias_mg(m)
         )  # [...,n_msa_sampled, n_token, n_heads * c]
@@ -461,7 +472,12 @@ class MSAStack(nn.Module):
         self.msa_chunk_size = msa_chunk_size
         self.msa_max_size = msa_max_size
 
-    def forward(self, m: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        m: torch.Tensor,
+        z: torch.Tensor,
+        pair_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             m (torch.Tensor): msa embedding
@@ -483,7 +499,7 @@ class MSAStack(nn.Module):
                 m, dim=-3, pad_length=(0, self.msa_max_size - m.shape[-3]), value=0
             )
             msa_pair_weighted = self.chunk_forward(
-                self.msa_pair_weighted_averaging, m_new, z, chunk_size
+                self.msa_pair_weighted_averaging, m_new, z, chunk_size, pair_mask
             )
             msa_pair_weighted = msa_pair_weighted.narrow(-3, 0, m.shape[-3])
             m = dropout_add_rowwise(
@@ -499,7 +515,7 @@ class MSAStack(nn.Module):
             if (not self.training) and (z.shape[-2] > 2000 or m.shape[-3] > 5120):
                 del msa_pair_weighted, m_transition
         else:
-            m = self.inference_forward(m, z, chunk_size)
+            m = self.inference_forward(m, z, chunk_size, pair_mask)
         return m
 
     def chunk_forward(
@@ -508,6 +524,7 @@ class MSAStack(nn.Module):
         m: torch.Tensor,
         z: torch.Tensor,
         chunk_size: int = 2048,
+        pair_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -542,7 +559,14 @@ class MSAStack(nn.Module):
 
         # Process each chunk with gradient checkpointing
         if z is not None:
-            processed_chunks = [checkpoint_fn(module, chunk, z) for chunk in m_chunks]
+            if pair_mask is None:
+                processed_chunks = [
+                    checkpoint_fn(module, chunk, z) for chunk in m_chunks
+                ]
+            else:
+                processed_chunks = [
+                    checkpoint_fn(module, chunk, z, pair_mask) for chunk in m_chunks
+                ]
         else:
             processed_chunks = [checkpoint_fn(module, chunk) for chunk in m_chunks]
         if (not self.training) and m.shape[-3] > 5120:
@@ -554,7 +578,11 @@ class MSAStack(nn.Module):
         return m
 
     def inference_forward(
-        self, m: torch.Tensor, z: torch.Tensor, chunk_size: int = 2048
+        self,
+        m: torch.Tensor,
+        z: torch.Tensor,
+        chunk_size: int = 2048,
+        pair_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Inplace slice forward for saving memory
         Args:
@@ -575,7 +603,7 @@ class MSAStack(nn.Module):
             end = min((i + 1) * chunk_size, num_msa)
             m_chunk = m.narrow(-3, start, end - start)
             # Use inplace to save memory
-            m_chunk += self.msa_pair_weighted_averaging(m_chunk, z)
+            m_chunk += self.msa_pair_weighted_averaging(m_chunk, z, pair_mask)
             m_chunk += self.transition_m(m_chunk)
         return m
 
@@ -670,7 +698,7 @@ class MSABlock(nn.Module):
         )
         if not self.is_last_block:
             # MSA stack
-            m = self.msa_stack(m, z)
+            m = self.msa_stack(m, z, pair_mask)
         # Pair stack
         _, z = self.pair_stack(
             s=None,

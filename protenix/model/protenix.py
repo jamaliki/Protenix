@@ -241,6 +241,7 @@ class Protenix(nn.Module):
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
         mc_dropout: bool = False,
+        pair_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the token trunk once atom-derived ``s_inputs`` are available.
 
@@ -252,6 +253,10 @@ class Protenix(nn.Module):
         Instead, the runner can compute the atom input embedding per record,
         stack only the token-shaped trunk inputs here, and then finish the
         atom/diffusion/confidence tail per record.
+
+        ``pair_mask`` is normally ``None`` because unpadded inference has no fake
+        tokens.  Padded variable-token batches pass a real mask so triangular,
+        MSA, template, and token-attention paths cannot read padded token keys.
         """
         z_constraint = None
 
@@ -304,6 +309,7 @@ class Protenix(nn.Module):
                         z += self.template_embedder(
                             input_feature_dict,
                             z,
+                            pair_mask=pair_mask,
                             triangle_multiplicative=self.configs.triangle_multiplicative,
                             triangle_attention=self.configs.triangle_attention,
                             inplace_safe=inplace_safe,
@@ -313,7 +319,7 @@ class Protenix(nn.Module):
                         input_feature_dict,
                         z,
                         s_inputs,
-                        pair_mask=None,
+                        pair_mask=pair_mask,
                         triangle_multiplicative=self.configs.triangle_multiplicative,
                         triangle_attention=self.configs.triangle_attention,
                         inplace_safe=inplace_safe,
@@ -324,6 +330,7 @@ class Protenix(nn.Module):
                         z = z + self.template_embedder(
                             input_feature_dict,
                             z,
+                            pair_mask=pair_mask,
                             triangle_multiplicative=self.configs.triangle_multiplicative,
                             triangle_attention=self.configs.triangle_attention,
                             inplace_safe=inplace_safe,
@@ -333,7 +340,7 @@ class Protenix(nn.Module):
                         input_feature_dict,
                         z,
                         s_inputs,
-                        pair_mask=None,
+                        pair_mask=pair_mask,
                         triangle_multiplicative=self.configs.triangle_multiplicative,
                         triangle_attention=self.configs.triangle_attention,
                         inplace_safe=inplace_safe,
@@ -343,7 +350,7 @@ class Protenix(nn.Module):
                 s, z = self.pairformer_stack(
                     s,
                     z,
-                    pair_mask=None,
+                    pair_mask=pair_mask,
                     triangle_multiplicative=self.configs.triangle_multiplicative,
                     triangle_attention=self.configs.triangle_attention,
                     inplace_safe=inplace_safe,

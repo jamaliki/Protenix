@@ -241,7 +241,7 @@ class InferenceRunner(object):
     def predict_token_batch(
         self, data_items: list[Mapping[str, Any]]
     ) -> list[dict[str, torch.Tensor]]:
-        """Batch the expensive token trunk for same-token, variable-atom records.
+        """Batch the expensive token trunk for ragged campaign records.
 
         Protein design campaigns commonly mutate residues while keeping the
         target length fixed.  Those records share the pairformer trunk shape but
@@ -250,10 +250,11 @@ class InferenceRunner(object):
         change softmax denominators and fake atoms also affect atom-level
         confidence reductions unless every downstream operation is mask-aware.
 
-        This path keeps atom-shaped work ragged and exact by running the atom
-        input embedding and the diffusion/confidence tail per record.  Only the
-        token-shaped trunk inputs and ``s_inputs`` are stacked, which captures
-        the main low-sample throughput win without ragged token padding.
+        This path therefore keeps atom-shaped work ragged and exact by running
+        the atom input embedding and diffusion/confidence tail per record.  For
+        different token counts it pads only token-trunk tensors to the largest
+        sequence in the bucket, passes a real ``pair_mask`` through the trunk,
+        then crops ``s``/``z`` back before the atom-shaped tail.
         """
         if len(data_items) == 1:
             return [
@@ -277,13 +278,18 @@ class InferenceRunner(object):
             to_device(_copy_tree(data["input_feature_dict"]), self.device)
             for data in data_items
         ]
+        token_counts = [
+            int(feature_dict["residue_index"].shape[-1])
+            for feature_dict in feature_dicts
+        ]
+        pad_token_trunk = len(set(token_counts)) > 1
+        max_tokens = max(token_counts)
         chunk_size = self.configs.infer_setting.chunk_size
-        n_token = feature_dicts[0]["residue_index"].shape[-1]
         if (
             hasattr(self.configs.infer_setting, "dynamic_chunk_size")
             and self.configs.infer_setting.dynamic_chunk_size
         ):
-            chunk_size = self.model._get_dynamic_chunk_size(n_token)
+            chunk_size = self.model._get_dynamic_chunk_size(max_tokens)
         inplace_safe = not (self.model.training or torch.is_grad_enabled())
 
         with enable_amp:
@@ -300,13 +306,45 @@ class InferenceRunner(object):
                 prepared_features.append(feature_dict)
                 s_inputs_list.append(s_inputs)
 
-            trunk_feature_dict = _stack_tree(
-                [
-                    _trunk_feature_dict(feature_dict)
-                    for feature_dict in prepared_features
-                ]
-            )
-            s_inputs_batch = torch.stack(s_inputs_list, dim=0)
+            if pad_token_trunk:
+                trunk_feature_dict = _stack_tree(
+                    [
+                        _pad_token_trunk_tree(
+                            _trunk_feature_dict(feature_dict),
+                            n_token=n_token_i,
+                            max_tokens=max_tokens,
+                        )
+                        for feature_dict, n_token_i in zip(
+                            prepared_features, token_counts
+                        )
+                    ]
+                )
+                s_inputs_batch = torch.stack(
+                    [
+                        _pad_tensor_token_axes(
+                            s_inputs,
+                            token_axes=(0,),
+                            max_tokens=max_tokens,
+                        )
+                        for s_inputs in s_inputs_list
+                    ],
+                    dim=0,
+                )
+                pair_mask = _make_pair_mask(
+                    token_counts=token_counts,
+                    max_tokens=max_tokens,
+                    device=s_inputs_batch.device,
+                    dtype=s_inputs_batch.dtype,
+                )
+            else:
+                trunk_feature_dict = _stack_tree(
+                    [
+                        _trunk_feature_dict(feature_dict)
+                        for feature_dict in prepared_features
+                    ]
+                )
+                s_inputs_batch = torch.stack(s_inputs_list, dim=0)
+                pair_mask = None
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             trunk_start = time.perf_counter()
@@ -316,6 +354,7 @@ class InferenceRunner(object):
                 N_cycle=self.model.N_cycle,
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
+                pair_mask=pair_mask,
             )
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -325,13 +364,20 @@ class InferenceRunner(object):
 
             predictions = []
             log_dicts = []
-            for batch_idx, feature_dict in enumerate(prepared_features):
+            for batch_idx, (feature_dict, n_token_i) in enumerate(
+                zip(prepared_features, token_counts)
+            ):
+                s_i = s_batch[batch_idx]
+                z_i = z_batch[batch_idx]
+                if pad_token_trunk:
+                    s_i = s_i[:n_token_i]
+                    z_i = z_i[:n_token_i, :n_token_i]
                 pred_dict, log_dict, time_tracker = (
                     self.model.finish_inference_from_pairformer(
                         input_feature_dict=feature_dict,
                         s_inputs=s_inputs_list[batch_idx],
-                        s=s_batch[batch_idx],
-                        z=z_batch[batch_idx],
+                        s=s_i,
+                        z=z_i,
                         label_dict=None,
                         N_cycle=self.model.N_cycle,
                         mode="inference",
@@ -379,7 +425,7 @@ def _inference_batch_size(configs: Any) -> int:
 def _inference_batch_mode(configs: Any) -> str:
     """Return how records are allowed to share one inference batch."""
     mode = str(configs.get("inference_batch_mode", "auto")).strip().lower()
-    if mode not in {"auto", "exact", "token"}:
+    if mode not in {"auto", "exact", "token", "padded"}:
         logger.warning("Unknown inference_batch_mode=%r; using auto mode.", mode)
         return "auto"
     return mode
@@ -423,12 +469,184 @@ def _copy_tree(value: Any) -> Any:
 
 
 def _trunk_feature_dict(feature_dict: Mapping[str, Any]) -> dict[str, Any]:
-    """Keep only features that can participate in same-token trunk batching."""
+    """Keep only features that can safely enter token-trunk batching."""
     return {
         key: value
         for key, value in feature_dict.items()
         if key not in _ATOM_ONLY_FEATURE_KEYS
     }
+
+
+_TOKEN_AXIS_BY_KEY = {
+    "asym_id": (0,),
+    "deletion_mean": (0,),
+    "entity_id": (0,),
+    "esm_token_embedding": (0,),
+    "frame_atom_index": (0,),
+    "has_frame": (0,),
+    "profile": (0,),
+    "residue_index": (0,),
+    "restype": (0,),
+    "sym_id": (0,),
+    "token_index": (0,),
+    "has_deletion": (-1,),
+    "deletion_value": (-1,),
+    "msa": (-1,),
+    "template_aatype": (-1,),
+    "template_atom_mask": (-2,),
+    "template_atom_positions": (-3,),
+    "relp": (0, 1),
+    "token_bonds": (0, 1),
+    "template_backbone_frame_mask": (-2, -1),
+    "template_distogram": (-3, -2),
+    "template_pseudo_beta_mask": (-2, -1),
+    "template_unit_vector": (-3, -2),
+}
+
+
+def _normalize_axes(axes: tuple[int, ...], ndim: int) -> tuple[int, ...]:
+    return tuple(axis if axis >= 0 else ndim + axis for axis in axes)
+
+
+def _token_axes_for_tensor(
+    key_path: tuple[str, ...], tensor: torch.Tensor, n_token: int
+) -> tuple[int, ...]:
+    """Return the token-length axes for a feature tensor.
+
+    The tempting generic rule, "pad every axis whose size equals N_token", is
+    wrong for e.g. a 32-residue sequence where ``restype`` has shape
+    ``[32, 32]``: the second axis is amino-acid class, not token position.  This
+    small key map keeps padded-token batching explicit and reviewable.
+    """
+    key = key_path[-1] if key_path else ""
+    axes = _TOKEN_AXIS_BY_KEY.get(key)
+    if axes is not None:
+        normalized = _normalize_axes(axes, tensor.ndim)
+        if all(
+            0 <= axis < tensor.ndim and tensor.shape[axis] == n_token
+            for axis in normalized
+        ):
+            return normalized
+        return ()
+    if key_path and key_path[0] == "constraint_feature":
+        return tuple(
+            axis for axis, size in enumerate(tensor.shape) if size == n_token
+        )
+    return ()
+
+
+def _padded_shape_signature(
+    value: Any,
+    n_token: int,
+    key_path: tuple[str, ...] = (),
+) -> Any:
+    if isinstance(value, torch.Tensor):
+        token_axes = set(_token_axes_for_tensor(key_path, value, n_token))
+        shape = tuple(
+            "N_TOKEN" if axis in token_axes else size
+            for axis, size in enumerate(value.shape)
+        )
+        return ("tensor", shape, str(value.dtype))
+    if isinstance(value, MappingABC):
+        return (
+            "dict",
+            tuple(
+                (
+                    key,
+                    _padded_shape_signature(
+                        value[key], n_token, (*key_path, str(key))
+                    ),
+                )
+                for key in sorted(value)
+            ),
+        )
+    if isinstance(value, (list, tuple)):
+        return (
+            type(value).__name__,
+            tuple(
+                _padded_shape_signature(item, n_token, key_path)
+                for item in value
+            ),
+        )
+    return ("value", type(value).__name__, repr(value))
+
+
+def _padded_token_trunk_signature(data: Mapping[str, Any]) -> Any:
+    n_token = int(data["N_token"].item())
+    return _padded_shape_signature(
+        _trunk_feature_dict(data["input_feature_dict"]), n_token
+    )
+
+
+def _pad_tensor_token_axes(
+    tensor: torch.Tensor,
+    token_axes: tuple[int, ...],
+    max_tokens: int,
+) -> torch.Tensor:
+    if not token_axes:
+        return tensor
+    out_shape = list(tensor.shape)
+    changed = False
+    for axis in token_axes:
+        if out_shape[axis] > max_tokens:
+            raise ValueError(
+                f"cannot pad tensor shape {tuple(tensor.shape)} to {max_tokens}"
+            )
+        if out_shape[axis] != max_tokens:
+            out_shape[axis] = max_tokens
+            changed = True
+    if not changed:
+        return tensor
+    padded = tensor.new_zeros(out_shape)
+    slices = tuple(slice(0, size) for size in tensor.shape)
+    padded[slices] = tensor
+    return padded
+
+
+def _pad_token_trunk_tree(
+    value: Any,
+    n_token: int,
+    max_tokens: int,
+    key_path: tuple[str, ...] = (),
+) -> Any:
+    if isinstance(value, torch.Tensor):
+        return _pad_tensor_token_axes(
+            value,
+            token_axes=_token_axes_for_tensor(key_path, value, n_token),
+            max_tokens=max_tokens,
+        )
+    if isinstance(value, MappingABC):
+        return {
+            key: _pad_token_trunk_tree(
+                sub_value, n_token, max_tokens, (*key_path, str(key))
+            )
+            for key, sub_value in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _pad_token_trunk_tree(item, n_token, max_tokens, key_path)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _pad_token_trunk_tree(item, n_token, max_tokens, key_path)
+            for item in value
+        )
+    return value
+
+
+def _make_pair_mask(
+    token_counts: list[int],
+    max_tokens: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    token_mask = torch.zeros(
+        (len(token_counts), max_tokens), device=device, dtype=dtype
+    )
+    for batch_idx, n_token in enumerate(token_counts):
+        token_mask[batch_idx, :n_token] = 1
+    return token_mask[..., :, None] * token_mask[..., None, :]
 
 
 def _tensor_tree_signature(value: Any) -> Any:
@@ -468,7 +686,9 @@ def _token_trunk_signature(data: Mapping[str, Any]) -> Any:
 
 
 def _input_batch_signature(data: Mapping[str, Any], batch_mode: str) -> Any:
-    if batch_mode in {"auto", "token"}:
+    if batch_mode in {"auto", "padded"}:
+        return _padded_token_trunk_signature(data)
+    if batch_mode == "token":
         return _token_trunk_signature(data)
     return _input_feature_signature(data)
 
@@ -478,21 +698,30 @@ def _effective_batch_mode(
 ) -> str:
     """Choose the fastest safe execution boundary for an already grouped batch.
 
-    ``auto`` is the practical campaign default.  It groups pending records by
-    token-trunk shape so same-length designs with different side-chain atom
-    counts can share the expensive pairformer.  If the full feature trees also
-    match exactly, we keep the older full-model batch path because it can batch
-    the diffusion/confidence tail too.
+    ``auto`` is the practical campaign default.  It first keeps the older
+    full-model exact-shape path when possible, then same-token trunk batching,
+    then padded-token trunk batching.  Padded mode is the variable-sequence
+    escape hatch: atom work stays ragged, while only token-trunk tensors are
+    padded and protected by ``pair_mask``.
     """
     if len(items) <= 1 or batch_mode == "exact":
         return "exact"
     if batch_mode == "token":
         return "token"
+    if batch_mode == "padded":
+        return "padded"
 
     first_signature = _input_feature_signature(items[0][0])
-    if all(_input_feature_signature(data) == first_signature for data, _ in items[1:]):
+    if all(
+        _input_feature_signature(data) == first_signature for data, _ in items[1:]
+    ):
         return "exact"
-    return "token"
+    first_token_signature = _token_trunk_signature(items[0][0])
+    if all(
+        _token_trunk_signature(data) == first_token_signature for data, _ in items[1:]
+    ):
+        return "token"
+    return "padded"
 
 
 def _stack_tree(items: list[Any]) -> Any:
@@ -626,9 +855,15 @@ def _describe_batch(
 ) -> None:
     first_data = items[0][0]
     names = [data["sample_name"] for data, _atom_array in items]
+    token_counts = [int(data["N_token"].item()) for data, _atom_array in items]
     atom_counts = [int(data["N_atom"].item()) for data, _atom_array in items]
     effective_mode = _effective_batch_mode(items, batch_mode)
-    batch_kind = "same-shape" if effective_mode == "exact" else "same-token-trunk"
+    batch_kind_by_mode = {
+        "exact": "same-shape",
+        "token": "same-token-trunk",
+        "padded": "padded-token-trunk",
+    }
+    batch_kind = batch_kind_by_mode[effective_mode]
     if batch_mode == "auto":
         batch_kind = f"{batch_kind} (auto)"
     logger.info(
@@ -638,7 +873,11 @@ def _describe_batch(
         len(items),
         batch_kind,
         seed,
-        int(first_data["N_token"].item()),
+        (
+            str(token_counts[0])
+            if min(token_counts) == max(token_counts)
+            else f"{min(token_counts)}-{max(token_counts)}"
+        ),
         min(atom_counts),
         max(atom_counts),
         int(first_data["N_msa"].item()),
@@ -652,10 +891,9 @@ def _run_prediction_batch(
     items: list[tuple[dict[str, Any], Any]],
     batch_mode: str,
 ) -> Mapping[str, Any] | list[Mapping[str, Any]]:
-    first_data = items[0][0]
-    n_token = int(first_data["N_token"].item())
+    n_token = max(int(data["N_token"].item()) for data, _atom_array in items)
     runner.update_model_configs(update_inference_configs(configs, n_token))
-    if _effective_batch_mode(items, batch_mode) == "token":
+    if _effective_batch_mode(items, batch_mode) in {"token", "padded"}:
         return runner.predict_token_batch([data for data, _atom_array in items])
     batch_data = first_data if len(items) == 1 else _stack_prediction_inputs(items)
     return runner.predict(batch_data)

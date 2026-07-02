@@ -341,7 +341,7 @@ def get_default_runner(
         use_rna_msa (bool): Whether to use RNA MSA.
         use_seeds_in_json (bool): Whether to use seeds defined in the JSON file.
         inference_batch_size (int): Number of compatible inputs per model forward.
-        inference_batch_mode (str): Batching boundary: "auto", "exact", or "token".
+        inference_batch_mode (str): Batching boundary: "auto", "exact", "token", or "padded".
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Whether to use TFG guidance.
 
@@ -509,7 +509,7 @@ def inference_jsons(
         use_rna_msa (bool): Whether to use RNA MSA.
         use_seeds_in_json (bool): Whether to use seeds from JSON.
         inference_batch_size (int): Number of compatible inputs per model forward.
-        inference_batch_mode (str): Batching boundary: "auto", "exact", or "token".
+        inference_batch_mode (str): Batching boundary: "auto", "exact", "token", or "padded".
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Use TFG guidance.
         hmmsearch_binary_path (Optional[str]): Path to hmmsearch binary.
@@ -754,12 +754,12 @@ def protenix_cli() -> None:
 )
 @click.option(
     "--batch_mode",
-    type=click.Choice(["auto", "exact", "token"]),
+    type=click.Choice(["auto", "exact", "token", "padded"]),
     default="auto",
     help=(
-        "'auto' uses full-model same-shape batches when possible and token-trunk "
-        "batches for same-token records with different atom counts. 'exact' and "
-        "'token' force one boundary."
+        "'auto' uses full-model same-shape batches when possible, then same-token "
+        "trunk batches, then padded-token trunk batches. 'exact', 'token', and "
+        "'padded' force one boundary."
     ),
 )
 @click.option(
@@ -895,7 +895,7 @@ def predict(
         use_seeds_in_json (bool): Use seeds from JSON.
         need_atom_confidence (bool): Compute atom-level confidence scores.
         batch_size (int): Number of compatible inputs per model forward.
-        batch_mode (str): Batching boundary: "auto", "exact", or "token".
+        batch_mode (str): Batching boundary: "auto", "exact", "token", or "padded".
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Use TFG guidance.
         hmmsearch_binary_path (Optional[str]): Path to hmmsearch binary.

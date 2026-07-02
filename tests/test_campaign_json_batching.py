@@ -19,7 +19,11 @@ import unittest
 
 import torch
 
-from runner.inference import _effective_batch_mode, _input_batch_signature
+from runner.inference import (
+    _effective_batch_mode,
+    _input_batch_signature,
+    _pad_token_trunk_tree,
+)
 from runner.campaign_inputs import (
     group_inference_jsons_by_seed,
     load_inference_records,
@@ -114,6 +118,7 @@ class TestCampaignJsonBatching(unittest.TestCase):
         def make_data(n_atom: int) -> dict:
             n_token = 4
             return {
+                "N_token": torch.tensor([n_token]),
                 "input_feature_dict": {
                     "residue_index": torch.zeros(n_token, dtype=torch.long),
                     "token_index": torch.zeros(n_token, dtype=torch.long),
@@ -149,6 +154,7 @@ class TestCampaignJsonBatching(unittest.TestCase):
         def make_data(n_atom: int) -> dict:
             n_token = 4
             return {
+                "N_token": torch.tensor([n_token]),
                 "input_feature_dict": {
                     "residue_index": torch.zeros(n_token, dtype=torch.long),
                     "token_bonds": torch.zeros(n_token, n_token),
@@ -170,6 +176,45 @@ class TestCampaignJsonBatching(unittest.TestCase):
             _effective_batch_mode([(same_a, None), (ragged, None)], "auto"),
             "token",
         )
+
+    def test_auto_mode_uses_padded_trunk_for_different_token_counts(self):
+        def make_data(n_token: int, n_atom: int) -> dict:
+            return {
+                "N_token": torch.tensor([n_token]),
+                "input_feature_dict": {
+                    "residue_index": torch.zeros(n_token, dtype=torch.long),
+                    "token_index": torch.zeros(n_token, dtype=torch.long),
+                    "token_bonds": torch.zeros(n_token, n_token),
+                    "msa": torch.zeros(1, n_token, dtype=torch.long),
+                    "restype": torch.zeros(n_token, 32),
+                    "ref_pos": torch.zeros(n_atom, 3),
+                    "atom_to_token_idx": torch.zeros(n_atom, dtype=torch.long),
+                },
+            }
+
+        short_token = make_data(32, 200)
+        long_token = make_data(40, 250)
+
+        self.assertEqual(
+            _input_batch_signature(short_token, "auto"),
+            _input_batch_signature(long_token, "auto"),
+        )
+        self.assertEqual(
+            _effective_batch_mode([(short_token, None), (long_token, None)], "auto"),
+            "padded",
+        )
+
+    def test_token_padding_does_not_pad_restype_class_axis(self):
+        n_token = 32
+        feature_tree = {
+            "restype": torch.zeros(n_token, 32),
+            "token_bonds": torch.zeros(n_token, n_token),
+        }
+
+        padded = _pad_token_trunk_tree(feature_tree, n_token=n_token, max_tokens=40)
+
+        self.assertEqual(tuple(padded["restype"].shape), (40, 32))
+        self.assertEqual(tuple(padded["token_bonds"].shape), (40, 40))
 
 
 if __name__ == "__main__":

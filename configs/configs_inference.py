@@ -32,10 +32,10 @@ inference_configs = {
     # public runner keeps this at 1 by default; larger values use the batching
     # boundary selected below and never pad ragged records through the model.
     "inference_batch_size": 1,
-    # "auto" first tries full-model exact-shape batching.  When same-length
-    # design records have different atom counts, it batches only the token trunk
-    # and leaves atom-shaped diffusion/confidence work per record.  "exact" and
-    # "token" force one boundary for debugging or benchmarking.
+    # "auto" first tries full-model exact-shape batching, then same-token trunk
+    # batching, then padded-token trunk batching for different sequence lengths.
+    # Atom-shaped diffusion/confidence work stays per record.  "exact", "token",
+    # and "padded" force one boundary for debugging or benchmarking.
     "inference_batch_mode": "auto",
     "use_msa": True,
     "enable_tf32": True,
