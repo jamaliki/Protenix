@@ -422,6 +422,42 @@ projection, gate, flatten, and output-projection work while preserving the
 current CUEQ attention throughput.  A slower "mega-kernel" attention mainloop
 would lose, as the earlier CUTLASS transition-output experiment did.
 
+Nsight Compute job `95692`
+(`runs/ncu_triangle_actual_shapes_20260702_180029_ccfix`, commit `60d9c2d`)
+captured one warmed `TriangleAttention.forward` launch range at the actual
+mixed-campaign shapes.  The important result is that CUEQ's core is not one
+opaque slow kernel: it delegates the attention mainloop to a strong cuDNN SDPA
+launch, then pays several layout/wrapper/epilogue launches around it.
+
+| shape/module | cuDNN SDPA | CUEQ/nvjet transforms | Triton q/k/v layout | Triton gate/flatten | LayerNorm | output GEMM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| B20, N=148, starting | 0.640 ms | 0.313 ms | 0.233 ms | 0.110 ms | 0.097 ms | 0.067 ms |
+| B12, N=220, starting | 0.980 ms | 0.413 ms | 0.310 ms | 0.144 ms | 0.126 ms | 0.086 ms |
+
+NCU's speed-of-light counters classify the attention mainloop as mostly
+compute/L1 work (`~59%` SM throughput, only `~19-22%` DRAM throughput on these
+captures), while q/k/v layout and gate/flatten are DRAM/L2-heavy (`~84-89%`
+DRAM throughput).  That is a useful kernel-design constraint: replacing the
+cuDNN/CUEQ attention mainloop is unlikely to win unless the replacement is
+vendor-quality, but further wrapper or epilogue fusion can still remove real
+HBM traffic if it does not slow the mainloop.
+
+The existing non-CUEQ backends are not a shortcut.  Job `95693`
+(`runs/triatt_backend_actual_shapes_20260702_180427`) compared one full
+`PairformerBlock` with the same CUEQ triangle-multiplication path and only the
+triangle-attention backend changed:
+
+| shape | CUEQ block ms | TriAttention block ms | torch block ms | decision |
+| --- | ---: | ---: | ---: | --- |
+| B20, N=148 | 8.23 | 9.16 | 15.84 | keep CUEQ |
+| B12, N=220 | 10.55 | 12.12 | 23.70 | keep CUEQ |
+| B16, N=220 | 13.76 | 15.81 | 31.22 | keep CUEQ |
+
+So the attractive boundary is not "swap CUEQ for another available attention
+backend".  It is a narrower producer/consumer boundary around CUEQ: fewer q/k/v
+layout passes, fewer gate/flatten/residual passes, or a native extension that
+keeps cuDNN/CUEQ-class attention throughput while deleting wrapper traffic.
+
 A follow-up branch tried to merge source JSONs before MSA/template preprocessing
 so preprocessing would run once for the transient campaign file instead of once
 per source file.  That cleaned up generated JSON siblings but did not materially
@@ -1394,6 +1430,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Scoped pairformer transition elementwise fusion | isolated pair-transition subrange improved 18-19%, but the full representative gate showed pairformer flat/slower | subrange wins must be rejected when the measured full-workload subtotal does not move |
 | Custom Triton transition output GEMM+gate/residual | best tile 2.00 ms versus 1.51 ms for cuBLAS plus fused gate/residual | the output epilogue is still attractive, but only if implemented as a vendor-quality CuTe/CUTLASS epilogue |
 | Naive fused Triton triangle attention | correct at N64, but B16/N245 slowed from 4.24-4.26 ms to 6.22-7.78 ms | the right boundary still needs a vendor-quality CUEQ/CuTe schedule |
+| Replacing CUEQ triangle attention with existing `triattention` or torch backends | actual-shape one-block screens were slower: TriAttention `1.11-1.15x` slower, torch about `1.9-2.3x` slower | keep CUEQ; target its layout/wrapper/epilogue boundaries instead |
 | CUEQ triangle-multiplication ONDEMAND tuning | total B64 block +0.34%, below noise | the shipped/default schedule is close enough for this shape |
 | CUEQ q/k/v layout block-size retuning | block `256` beat the current `1024` by 3.7-4.2% in isolation, but only saves `0.04-0.12` ms per layout launch | do not promote tiny tile retunes without a full-gate signal |
 | Logical ending-node triangle attention without explicit pair transposes | bitwise exact one-block screen but only `1.0076-1.0089x` at B32/B64/B96 | explicit pair-tensor orientation copies are measurable but not the dominant pairformer boundary |
