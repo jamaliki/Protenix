@@ -186,49 +186,71 @@ mask leak.  `scripts/perf/pairformer_padding_mechanism.py` is the smaller
 primitive-level reproducer for the same question: it runs triangle
 multiplication, triangle attention, a per-cell pair transition, and
 token attention independently so the first bad boundary is not hidden by the
-rest of the block.  From the repository root:
+rest of the block.  `scripts/perf/pairformer_padding_deep_dive.py` goes one
+level deeper for triangle multiplication and records layer norm, projection,
+masked projection, token-reduction matmul, output projection, and gating stages.
+From the repository root:
 
 ```bash
 PYTHONPATH=$PWD python scripts/perf/pairformer_padding_mechanism.py \
   --short-tokens 245 --full-tokens 384
+PYTHONPATH=$PWD python scripts/perf/pairformer_padding_deep_dive.py \
+  --short-tokens 245 --full-tokens 384
 ```
 
-With the fixed diagnostic, one padded 245-token block inside a 384-token tensor
-is almost exact in FP32, but the valid-region difference grows through a full
-stack.  On a 48-block random pairformer stack:
+The exact broken boundary is not a mask leak.  Job `95118`
+(`runs/padding_deep_dive_20260702_134126`, commit `7f9322d`) compared a true
+245-token tensor, the same values embedded in a 384-token zero-padded tensor,
+and the same padded tensor with random invalid rows/columns.  Invalid values
+never changed the valid crop at any measured stage.  The first nonzero
+valid-crop difference appears at `tri_mul_out.combine_token_reduction`, the
+triangle-multiplication matmul whose reduction dimension is token length.  The
+per-cell operations before it were exactly invariant:
+
+| BF16 deep-dive stage, 245 -> 384 | valid max abs | valid mean abs | invalid-region sensitivity |
+| --- | ---: | ---: | ---: |
+| input, layer norm, A/B projections, A/B masked projections | 0 | 0 | 0 |
+| `combine_token_reduction` | 0.0625 | 1.93e-7 | 0 |
+| `layer_norm_out` | 0.015625 | 1.06e-7 | 0 |
+| `output_projection` | 0.00390625 | 1.48e-7 | 0 |
+| final triangle-multiplication output | 0.001953125 | 7.45e-8 | 0 |
+
+Precision matters because the failure is accumulation schedule, not masking:
+
+| isolated op / mode | valid max abs | valid mean abs | invalid-region sensitivity | note |
+| --- | ---: | ---: | ---: | --- |
+| triangle multiplication, BF16 CUEQ | 0.001953125 | 9.46e-8 | 0 | first drift at token-reduction matmul |
+| triangle multiplication, FP32 with TF32 allowed | 7.57e-5 | 1.05e-7 | 0 | TF32 matmul still schedule-dependent |
+| triangle multiplication, FP32 with TF32 disabled | 2.38e-7 | 2.80e-8 | 0 | CUEQ residual-scale noise only |
+| token attention, BF16 SDPA | 4.88e-4 | 1.09e-7 | 0 | no key/value leakage |
+| token attention, FP32 with TF32 allowed | 9.10e-5 | 1.25e-5 | 0 | SDPA schedule-dependent |
+| token attention, FP32 with TF32 disabled | 8.20e-8 | 1.20e-8 | 0 | near roundoff |
+
+One padded 245-token block inside a 384-token tensor therefore starts with tiny
+differences, but BF16 differences compound through the full trunk.  On a
+48-block random pairformer stack in the same job:
 
 | mode | valid `s` mean abs | valid `s` max abs | valid `z` mean abs | valid `z` max abs |
 | --- | ---: | ---: | ---: | ---: |
-| FP32 CUEQ, 245 -> 384 tokens | 0.0120 | 0.0775 | 0.0060 | 0.0653 |
-| BF16 CUEQ, 245 -> 384 tokens | 0.2359 | 1.4375 | 0.1676 | 1.6094 |
+| FP32 CUEQ, TF32 disabled, 245 -> 384 tokens | 1.61e-5 | 1.18e-4 | 7.34e-6 | 7.49e-5 |
+| BF16 CUEQ, 245 -> 384 tokens | 0.2350 | 1.46875 | 0.1682 | 1.5625 |
 
-The mechanism is length-dependent numerical drift, not padded-token leakage.  A
-focused mechanism screen compared three cases for both triangle multiplication
-and token attention: true 245-token tensors, the same valid 245-token crop from a
-384-token tensor, and a 384-token tensor where the invalid padded region was
-changed from zeros to random values.  Changing invalid padded values produced
-exactly zero valid-region change.  Changing the physical kernel length from 245
-to 384, however, produced small valid-region differences even though the padded
-lanes were masked or zeroed:
-
-| isolated op | comparison | dtype/kernel | max abs valid diff | note |
-| --- | --- | --- | ---: | --- |
-| outgoing triangle multiplication | padded zeros vs random invalid padded values | FP32/BF16, torch/CUEQ | 0 | no invalid-token leakage |
-| outgoing triangle multiplication | 245-token physical tensor vs 384-token padded tensor | FP32 torch/CUEQ | 7.46e-05 / 1.01e-04 | length-dependent reduction schedule |
-| outgoing triangle multiplication | 245-token physical tensor vs 384-token padded tensor | BF16 torch/CUEQ | 0.0078125 / 0.015625 | one-to-two BF16 ulps at first boundary |
-| token attention | padded zeros vs random invalid padded values | FP32/BF16 SDPA | 0 | no invalid-token leakage |
-| token attention | 245-token physical tensor vs 384-token padded tensor | FP32 SDPA | about 9e-05 | length-dependent SDPA schedule |
-| token attention | 245-token physical tensor vs 384-token padded tensor | BF16 SDPA | 0.000488 | small first-boundary drift |
+So the actionable rule is: exact-shape batching is correct; naive ragged padding
+is numerically different because the trunk sees a different physical reduction
+length.  Making ragged batching safe would require accepting this model-level
+numerical drift, grouping by tight length buckets and validating final outputs,
+or writing kernels that reduce only over each sequence's real length while still
+sharing a launch.
 
 The first broken invariant is therefore not "masked values leak"; it is
 "valid-crop output is invariant to physical token length".  The first nonzero
 boundary is the first triangle multiplication, whose reduction over the
 third/residue dimension changes from `N=245` to `N=384` even though the extra
-terms are masked to zero.  Triangle attention and token attention can add the
-same class of drift because their softmax/matmul kernels also choose schedules
-from the physical key length.  Pair and single transitions are not the root
-cause; they consume already-different activations and amplify them through
-LayerNorm, SiLU/gates, residual updates, and the 48-block trunk.
+terms are masked to zero.  Token attention can add the same class of drift
+because SDPA also chooses schedules from the physical key length.  Pair and
+single transitions are not the root cause; they consume already-different
+activations and amplify them through LayerNorm, SiLU/gates, residual updates,
+and the 48-block trunk.
 
 So zeroing or masking harder is not the fix; the masks already block padded
 content.  The problem is that cuDNN SDPA, CUEQ, and related matmul reductions are
