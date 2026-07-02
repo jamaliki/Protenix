@@ -145,6 +145,13 @@ workflow.  Both variants still write generated MSA JSON siblings during
 preprocessing; the promoted change is about not treating those siblings as new
 inputs on directory reruns.
 
+A follow-up branch tried to merge source JSONs before MSA/template preprocessing
+so preprocessing would run once for the transient campaign file instead of once
+per source file.  That cleaned up generated JSON siblings but did not materially
+move throughput: job `94969`, 64 one-record `7r6r` JSONs, current `main`
+`197.54s` versus candidate `195.70s` (`1.009x`).  It also made preprocessing
+failure granularity coarser, so it was not promoted.
+
 The model-only same-shape sweep shows where larger batches stop helping:
 
 | shape | sequence throughput | output-sample throughput | wall sec | peak reserved GiB | dominant work |
@@ -837,6 +844,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Default BF16 full-token attention after the promoted stack | isolated trunk-attention hotspot improved, but full exact-shape gates moved only +0.16% at B64 and +0.27% at B96 | do not promote dtype-policy changes unless the representative throughput gate moves, not just the local kernel |
 | Inference DataLoader workers for exact-shape batches | B8 had a small screen win, but B32 hit tensor-sharing failures unless switched to slower file-system sharing; clean B32 no-worker batching was better | do not add host-pipeline complexity unless it survives the actual many-input gate |
 | CUDA graph capture of the denoiser | slower in this setup | graph overhead/constraints can outweigh launch savings |
+| Merging campaign JSONs before preprocessing | 64-file directory gate moved only from 197.54 s to 195.70 s (`1.009x`) and worsened preprocessing failure granularity | the remaining e2e gap is not mainly per-file JSON preprocessing |
 
 The main learning point: isolated wins are hypotheses, not promotions.  A
 candidate becomes part of the throughput stack only after a representative
