@@ -440,13 +440,31 @@ sample-axis parity tests plus the ragged-batch helper tests.
 
 Candidate gate status: queued from isolated checkout
 `/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_sampleaxis_40e51f8`.
-Smoke job `95935`
-(`runs/sample_axis_ns2_smoke_20260702_204806`, `N_sample=2`, `N_step=1`) runs
-the real model path with both flags enabled.  Representative paired job `95936`
-(`runs/sample_axis_ns5_pair_b16_n200_20260702_204806`, `afterok:95935`)
-compares the current flattened sample-lane path against the explicit
-sample-axis path on the 32 mixed 40-220-token proteins with `N_sample=5`,
-`N_step=200`, `--batch_size 16`, confidence enabled, no MSA/template.
+The first queued pair, jobs `95935`/`95936`, was canceled before running because
+the script accidentally enabled the large-sample Triton elementwise/residual
+flags that job `95635` had already rejected for mixed B16 campaigns.  The first
+canary replacement, job `95940`, then failed before model execution because a
+fresh checkout tried to JIT-build the fast layernorm extension without
+`CUDA_HOME`.  Corrected canary jobs `95948`/`95949` set `CUDA_HOME` to the CUDA
+toolkit bundled inside `env-boltz2`, plus `CC`, `CXX`, `LD_LIBRARY_PATH`, and a
+run-local `TORCH_EXTENSIONS_DIR`.
+
+Smoke job `95948`
+(`runs/sample_axis_canary_cudafix_b16s5_n200_20260702_205708`, `N_sample=2`,
+`N_step=1`) runs the real model path with both sample-axis flags enabled.
+Representative paired job `95949` (`afterok:95948`) uses the same 32 mixed
+40-220-token proteins with `N_sample=5`, `N_step=200`, `--batch_size 16`,
+confidence enabled, no MSA/template, and compares four cases on one canary H100:
+
+1. `old_low_sample_boundary`: `PROTENIX_BATCH_DIFFUSION_MAX_SAMPLES=1`,
+   default full-attention FP32 policy.
+2. `flat_sample_lanes_fp32attn`: current flattened low-sample path,
+   default full-attention FP32 policy.
+3. `flat_sample_lanes_bf16attn`: current flattened low-sample path with
+   `PROTENIX_ATTENTION_FORCE_FP32=0`.
+4. `explicit_sample_axis_bf16attn`: explicit sample-axis path with both
+   `PROTENIX_ATTENTION_FORCE_FP32=0` and
+   `PROTENIX_RANK5_FULL_ATTENTION_BF16=1`.
 
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`
