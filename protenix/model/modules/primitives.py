@@ -94,6 +94,14 @@ def transition_input_projection_fusion_enabled() -> bool:
     }
 
 
+def transition_input_projection_max_elements() -> int:
+    value = os.getenv("PROTENIX_FUSED_TRANSITION_INPUT_MAX_ELEMENTS", "4000000000")
+    try:
+        return int(value)
+    except ValueError:
+        return 0
+
+
 _NON_CUDNN_SDPA_BACKENDS = [
     SDPBackend.FLASH_ATTENTION,
     SDPBackend.EFFICIENT_ATTENTION,
@@ -337,6 +345,13 @@ class Transition(nn.Module):
         if not x.is_cuda:
             return False
         hidden = self.n * self.c_in
+        # The fused producer writes a [rows, 2 * hidden] activation before the
+        # split-aware SiLU kernel consumes it.  That is worthwhile at B64/N245
+        # but too memory-heavy at larger batches, so large shapes stay on the
+        # original two-GEMM path instead of trading speed for a huge transient.
+        projected_elements = x.shape[0] * (2 * hidden)
+        if projected_elements > transition_input_projection_max_elements():
+            return False
         return (
             self.linear_no_bias_a.weight.shape == (hidden, self.c_in)
             and self.linear_no_bias_b.weight.shape == (hidden, self.c_in)
