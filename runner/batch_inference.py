@@ -17,11 +17,21 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 from pathlib import Path
 from typing import List, Optional, Union
+
+# Keep direct script execution robust under clean Slurm environments.  When
+# launched as ``python runner/batch_inference.py``, Python puts ``runner/`` on
+# sys.path rather than the repository root, so absolute project imports such as
+# ``runner.campaign_inputs`` can otherwise fail unless the caller remembered to
+# export PYTHONPATH.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import click
 import tqdm
