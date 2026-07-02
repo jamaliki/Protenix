@@ -277,8 +277,16 @@ def main() -> None:
     parser.add_argument("--tokens", type=int, default=245)
     parser.add_argument("--c-in", type=int, default=128)
     parser.add_argument("--factor", type=int, default=4)
-    parser.add_argument("--input-dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
-    parser.add_argument("--compute-dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
+    parser.add_argument(
+        "--input-dtype",
+        choices=["bfloat16", "float16", "float32"],
+        default="bfloat16",
+    )
+    parser.add_argument(
+        "--compute-dtype",
+        choices=["bfloat16", "float16", "float32"],
+        default="bfloat16",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--profile", action="store_true")
@@ -311,6 +319,12 @@ def main() -> None:
     results: dict[str, Any] = {}
     torch.cuda.reset_peak_memory_stats()
     with amp:
+        # First calls can include cuBLAS/TRITON setup.  Warm the manual subrange
+        # path once so the reported launch breakdown reflects steady-state work.
+        manual_timed(module, x, fused_input=False)
+        if can_use_wide_input_projection:
+            manual_timed(module, x, fused_input=True)
+
         reference, baseline_parts = manual_timed(module, x, fused_input=False)
         if can_use_wide_input_projection:
             fused_parts_out, fused_parts = manual_timed(module, x, fused_input=True)

@@ -312,31 +312,49 @@ different transition boundary in the trunk pairformer.  Pairformer
 projection followed by the split-aware Triton `SiLU(first_half) * second_half`
 consumer.
 
-The implementation is intentionally shape-guarded by
+The wide-input implementation is intentionally shape-guarded by
 `PROTENIX_FUSED_TRANSITION_INPUT_MAX_ELEMENTS` (default `4000000000`).  The
 fused producer writes a temporary with `2 * hidden` channels; at B64/N245 this
 is large but profitable, while an unguarded B96 run failed because the
-concatenated activation was too large.  Larger batches therefore fall back to
-the original two-GEMM path instead of trading stability for a small isolated
-win.
+concatenated activation was too large.  Larger batches therefore keep the
+original two GEMMs, but now still fuse the fallback `SiLU(a) * b` expression
+with an in-place Triton kernel.  That fallback fusion preserves the original
+activation memory model: it overwrites `b` rather than allocating a third giant
+hidden tensor.
 
-The split-aware Triton kernel also uses 64-bit element offsets.  At B64/N245
-the output has about 1.97B elements and the concatenated input is addressed past
-3.9B elements, so 32-bit pointer arithmetic silently overflows and produces
-NaNs.
+Two indexing details mattered:
 
-Representative H100 screens:
+- The split-aware wide-input kernel uses 64-bit element offsets.  At B64/N245
+  the output has about 1.97B elements and the concatenated input is addressed
+  past 3.9B elements, so 32-bit pointer arithmetic silently overflows and
+  produces NaNs.
+- The in-place fallback kernel chunks tensors above 1B elements using narrowed
+  flat views.  Passing one giant Triton vector with large offsets looked fast
+  but failed parity/illegal-access checks near B96.  Narrowed chunks keep each
+  kernel's local offsets small while reducing PyTorch's SiLU+multiply launches
+  from eight large chunks to three fused chunks at B96.
+
+Representative H100 screens after adding the in-place fallback:
 
 | screen | baseline | candidate | result |
 | --- | ---: | ---: | --- |
-| B64 pairformer block | 70.92 ms | 68.39 ms | 1.037x, finite |
-| B64 full gate | 0.801 seq/s | 0.809 seq/s | +0.9%, peak 46.5 GiB |
-| B96 full gate | 0.817 seq/s | 0.819 seq/s | +0.2%, guarded fallback on giant pair transition |
+| B32 transition hotspot | 7.922 ms | 6.429 ms | 1.232x, wide input |
+| B64 transition hotspot | 15.835 ms | 12.851 ms | 1.232x, wide input |
+| B96 transition hotspot | 23.732 ms | 19.829 ms | 1.197x, in-place fallback |
+| B64 full exact-shape gate | 0.47473 seq/s | 0.47468 seq/s | neutral, peak 46.5 GiB |
+| B96 full exact-shape gate | 0.50211 seq/s | 0.50818 seq/s | +1.21%, peak 57.8 GiB |
 
-The B64 block comparison is not bitwise-identical because changing the GEMM
-shape changes BF16 rounding (`z` max abs about 0.03125, `s` max abs about
-0.0625), but the full gates produced finite coordinates and confidence
-summaries.
+The full gate used one H100, repeated `7r6r`, `N_sample=1`, `N_step=200`,
+confidence enabled, exact-shape batching, and the same optimized environment
+for main and candidate:
+`PROTENIX_TRITON_FUSED_ELEMENTWISE=1` and
+`PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION=1`.  B64 is neutral because the
+wide-input path was already active there.  B96 improves because the previous
+guarded fallback still had separate memory-bound SiLU and multiply launches.
+All full-gate coordinates were finite and confidence summaries were preserved.
+The BF16 transition output is not bitwise-identical because fusion changes
+rounding order; hotspot parity was `max_abs <= 0.03125` and mean abs about
+`0.0013` after the final projection.
 
 ### 3. Specialize atom local attention
 
