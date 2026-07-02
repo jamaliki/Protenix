@@ -95,10 +95,12 @@ stack, and memory headroom; the fast path is therefore exposed through explicit
 environment flags rather than enabled silently for every user.
 
 For protein-design style throughput with many independent `N_sample=1` inputs,
-the same profiling loop found the trunk pairformer transition as a useful
-memory boundary. A guarded transition input-projection fusion improves B64 and
-falls back for larger batches where the fused temporary would be too large; on
-the same one-H100 `7r6r` benchmark, B96 measured about `0.819` sequences/sec.
+the same profiling loop found the trunk pairformer triangle-attention epilogue
+as a useful memory boundary. The guarded Triton epilogue fuses sigmoid gating,
+head-layout conversion, and flattening after the CUEQ attention kernel, giving
+about a 6-7% one-block throughput gain at B64-B96. A separate guarded
+transition input-projection fusion remains opt-in for memory/batch-size
+experiments.
 
 For the recommended flags, reproduction commands, profiling scripts, and the
 negative results that shaped the implementation, see

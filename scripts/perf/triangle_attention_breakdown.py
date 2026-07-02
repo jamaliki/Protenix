@@ -22,6 +22,7 @@ import torch
 from protenix.model.modules.fused_elementwise_triton import (
     triton_fused_elementwise_available,
     triton_fused_elementwise_enabled,
+    triton_triangle_attention_epilogue_enabled,
     triton_sigmoid_mul_heads_first,
 )
 from protenix.model.triangular.layers import (
@@ -222,6 +223,9 @@ def layout_probe(
 
     return {
         "triton_enabled": triton_fused_elementwise_enabled(),
+        "triangle_attention_epilogue_enabled": (
+            triton_triangle_attention_epilogue_enabled()
+        ),
         "triton_available": triton_fused_elementwise_available(),
         "helper_returned": fused is not None,
         "gate_shape": list(gate.shape),

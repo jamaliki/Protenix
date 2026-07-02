@@ -43,15 +43,39 @@ except ImportError:  # pragma: no cover - optional runtime dependency.
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 _BLOCK_SIZE = 1024
+_FALSE_ENV_VALUES = {"0", "false", "off", "no"}
+
+
+def _env_flag_enabled(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() not in _FALSE_ENV_VALUES
 
 
 def triton_fused_elementwise_enabled() -> bool:
-    return os.getenv("PROTENIX_TRITON_FUSED_ELEMENTWISE", "0").lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
+    return _env_flag_enabled("PROTENIX_TRITON_FUSED_ELEMENTWISE", default=False)
+
+
+def triton_triangle_attention_epilogue_enabled() -> bool:
+    """Whether to fuse cuequivariance triangle-attention's output epilogue.
+
+    This epilogue is the fixed memory-bound pattern after CUEQ returns heads in
+    ``[..., H, Q, C]`` layout: sigmoid gate, multiply, transpose/flatten, then
+    output projection.  The Triton path is inference-only and has strict shape
+    guards, so keep it default-on for throughput while retaining two opt-outs:
+
+    - ``PROTENIX_TRITON_TRIANGLE_ATTENTION_EPILOGUE=0`` disables only this path.
+    - ``PROTENIX_TRITON_FUSED_ELEMENTWISE=0`` disables all elementwise fusions
+      unless the triangle-attention-specific variable is set explicitly.
+    """
+    specific = os.getenv("PROTENIX_TRITON_TRIANGLE_ATTENTION_EPILOGUE")
+    if specific is not None:
+        return specific.lower() not in _FALSE_ENV_VALUES
+    global_flag = os.getenv("PROTENIX_TRITON_FUSED_ELEMENTWISE")
+    if global_flag is not None:
+        return global_flag.lower() not in _FALSE_ENV_VALUES
+    return True
 
 
 def triton_fused_elementwise_available() -> bool:
@@ -391,7 +415,7 @@ def triton_sigmoid_mul_heads_first(
     sequence batch this reshape is a real HBM copy, not metadata.  This kernel
     writes the contiguous projected layout directly.
     """
-    if not triton_fused_elementwise_enabled():
+    if not triton_triangle_attention_epilogue_enabled():
         return None
     if not triton_fused_elementwise_available():
         return None

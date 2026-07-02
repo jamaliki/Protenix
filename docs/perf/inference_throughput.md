@@ -143,6 +143,51 @@ sample dimension `1` while the activation tensor has sample dimension
 This is the right kind of fusion: the fused operation is simple, memory-bound,
 and avoids intermediate reads/writes without replacing a high-quality GEMM.
 
+#### Pairformer triangle-attention epilogue for many-sequence batches
+
+The many-independent-sequence workload (`batch=B`, `N_sample=1`) is trunk
+pairformer-bound.  At B64/N245 on one H100, one pairformer block spends about
+half its time in the two triangle-attention modules:
+
+| block subrange | B64 mean ms | block share |
+| --- | ---: | ---: |
+| starting triangle attention | 19.91 | 25.1% |
+| ending triangle attention | 19.88 | 25.1% |
+| pair transition | 14.26 | 18.0% |
+| outgoing triangle multiplication | 9.64 | 12.2% |
+| incoming triangle multiplication | 9.60 | 12.1% |
+
+Within one B64 triangle-attention module, the CUEQ attention kernel is the
+largest launch (~10.1 ms), but the output epilogue is also material:
+sigmoid-gate projection/layout/multiply/flatten/output-projection costs about
+4.97 ms.  The existing CUEQ kernel returns heads in `[..., H, Q, C]` layout.
+The default PyTorch epilogue transposes that layout, multiplies by a sigmoid
+gate, then flattens to `[..., Q, H * C]`; at high sequence batch, flattening is
+a real HBM copy rather than a metadata view.
+
+`triton_sigmoid_mul_heads_first` fuses sigmoid, multiply, head-layout
+conversion, and flattening into one streaming Triton write while leaving the
+CUEQ attention kernel and output projection unchanged.  This path is
+inference-only, shape-guarded, and now default-on for triangle attention.  Set
+`PROTENIX_TRITON_TRIANGLE_ATTENTION_EPILOGUE=0` to disable only this epilogue,
+or set `PROTENIX_TRITON_FUSED_ELEMENTWISE=0` to disable all elementwise Triton
+fusions unless the triangle-attention-specific variable is set explicitly.
+
+Representative one-H100 screens, `N_token=245`, BF16, CUEQ triangle ops,
+in-place inference:
+
+| screen | baseline | fused epilogue | result |
+| --- | ---: | ---: | ---: |
+| B64 pairformer block | 76.34 ms | 71.41 ms | 1.069x |
+| B96 pairformer block | 114.24 ms | 106.75 ms | 1.070x |
+| B64 one-block sequence throughput | 828.6 seq/s | 883.0 seq/s | +6.6% |
+| B96 one-block sequence throughput | 828.3 seq/s | 887.8 seq/s | +7.2% |
+
+The candidate kept exact BF16 parity in the batched-vs-loop hotspot screen for
+this boundary (`z` max abs 0.0).  The remaining dominant cost is the CUEQ core
+itself; replacing that needs a real attention-kernel design, not another
+layout cleanup.
+
 #### Pairformer transition input fusion for many-sequence batches
 
 The many-independent-sequence workload (`batch=B`, `N_sample=1`) exposes a
