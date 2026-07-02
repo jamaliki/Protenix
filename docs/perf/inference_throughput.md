@@ -156,22 +156,22 @@ workflow.  Both variants still write generated MSA JSON siblings during
 preprocessing; the promoted change is about not treating those siblings as new
 inputs on directory reruns.
 
-Same-token trunk batching gate: job `95276`
-(`runs/same_token_batch_gate_20260702_144135`, commit `f26c607`) used two
+Same-token trunk batching gate: job `95368`
+(`runs/same_token_auto_gate_20260702_145350`, commit `6962fda`) used two
 40-token proteins with different side-chain atom counts (`polyA_len40`:
-`N_atom=201`; `polyW_len40`: `N_atom=561`) and `--batch_size 2
---batch_mode token`.  The log shows one shared trunk batch:
+`N_atom=201`; `polyW_len40`: `N_atom=561`) and only `--batch_size 2`, relying
+on the default `--batch_mode auto`.  The log shows one shared trunk batch:
 
 ```text
-Predicting 2 same-token-trunk input(s) [seed:101]: N_token 40, N_atom 201-561, N_msa 1
+Predicting 2 same-token-trunk (auto) input(s) [seed:101]: N_token 40, N_atom 201-561, N_msa 1
 ```
 
-Both CIFs and summaries were produced.  A paired `--batch_mode exact` run
-(job `95280`) correctly fragmented into two singleton batches because the full
-feature trees had different atom shapes.  That pair is a functional gate, not a
-speed claim: the tiny shape is dominated by first-run compilation and model
-initialization.  Representative throughput gates should use larger same-token
-campaigns and warmed timing windows.
+Both CIFs and summaries were produced.  A paired `--batch_mode exact` run on
+the earlier commit (job `95280`) correctly fragmented into two singleton batches
+because the full feature trees had different atom shapes.  These tiny jobs are
+functional gates, not speed claims: they are dominated by first-run compilation
+and model initialization.  Representative throughput gates should use larger
+same-token campaigns and warmed timing windows.
 
 A follow-up branch tried to merge source JSONs before MSA/template preprocessing
 so preprocessing would run once for the transient campaign file instead of once
