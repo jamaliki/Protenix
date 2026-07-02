@@ -648,6 +648,12 @@ extension compiled for `sm_90`, included `<cute/tensor.hpp>` and
 and returned the expected result.  Future native-kernel screens should use this
 environment rather than installing another compiler stack.
 
+For Hopper GMMA kernels, `sm_90` is not enough.  CUTLASS emits architecture-
+conditional GMMA instructions that must be compiled as `sm_90a`; otherwise the
+kernel can compile and load but trip a device-side assert at runtime.  The Tokyo
+transition-epilogue harness now defaults to `TORCH_CUDA_ARCH_LIST=9.0a`, and the
+CUTLASS candidate import path fails early if a non-`90a` arch list is supplied.
+
 #### Round 142-147: first custom-kernel boundary attempts
 
 The transition-output epilogue was the first CUTLASS target because it looked
@@ -697,6 +703,34 @@ The transition-output epilogue remains a good first **native CuTe** target, but
 the implementation has to keep the vendor GEMM schedule and add the epilogue
 load/store logic.  Replacing cuBLAS with a generic Triton matmul loses more GEMM
 efficiency than the 0.47 ms memory-bound epilogue can pay back.
+
+A first SM90 CUTLASS EVT version now exists as an isolated benchmark candidate:
+`scripts/perf/transition_output_epilogue_cutlass_candidate.py` plus
+`scripts/perf/transition_output_epilogue_cutlass_sm90.cu`.  It is intentionally
+not wired into model inference.  It demonstrates the correct fusion boundary and
+argument mapping:
+
+- `M = N_sample`, `N = c_a`, `K = hidden`, `L = N_token`;
+- `b[:, token, :]` is the A operand;
+- `weight[c_a, hidden]` is used as a shared B operand across token batches;
+- `gate[0, token, c_a]` is an auxiliary epilogue load with `stride_m=0`; and
+- the visitor tree computes `residual + sigmoid(gate) * accumulator`.
+
+Job `95156`
+(`transition_epilogue_cutlass_sm90a_prebuilt_20260702_141033`, commit
+`1732bd5`) compiled the candidate for `sm_90a` and ran the warmed H100 screen.
+It is a correctness success but a performance rejection:
+
+| implementation | boundary ms | effective TFLOP/s | parity max / mean | decision |
+| --- | ---: | ---: | ---: | --- |
+| cuBLAS GEMM + promoted Triton epilogue | 1.464 | 731.7 GEMM-only | reference | keep |
+| CUTLASS SM90 EVT fused epilogue | 2.374 | 505.2 boundary | 0.03125 / 1.42e-4 | reject |
+
+The fused kernel removes the projected store/reload on paper, but its generic
+CUTLASS mainloop/EVT path loses too much tensor-core throughput.  This confirms
+the core constraint for any future CuTe kernel: preserve the cuBLAS-class GMMA
+schedule first, then fuse the epilogue.  A slower matmul with a nicer epilogue is
+a net loss.
 
 `scripts/perf/transition_output_epilogue_hotspot.py` is the reusable screen for
 the next attempt.  It builds a real `ConditionedTransitionBlock`, fixes the
@@ -749,6 +783,7 @@ Latest warmed one-H100 roofline screen, commit `0cba4ac`, `N_sample=1280`,
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | `95081` | `transition_epilogue_roofline_warm_baseline_20260702_132714` | 1.448 | 1.012 | 0.474 | 731 | 3.05 | baseline |
 | `95082` | `transition_epilogue_roofline_warm_reference_20260702_132714` | 1.468 | 1.027 | 0.474 | 721 | 3.05 | reference candidate 1.482 ms, exact parity, 0.991x |
+| `95156` | `transition_epilogue_cutlass_sm90a_prebuilt_20260702_141033` | 1.464 baseline / 2.374 candidate | 1.011 baseline | 0.473 baseline | 731 baseline / 505 candidate boundary | 3.06 baseline | CUTLASS EVT candidate valid but 0.617x, reject |
 
 The lower-bound byte model reports 2.90 GB of logical boundary traffic for the
 baseline and 1.93 GB for a fused-epilogue GEMM.  The removable projected
