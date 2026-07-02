@@ -204,13 +204,18 @@ def profile_one(name: str, fn: TensorFactory, warmup: int) -> list[dict[str, Any
 
     rows = []
     for event in prof.key_averages():
-        cuda_us = event.cuda_time_total
-        if cuda_us <= 0:
+        # PyTorch renamed the CUDA profiler field to the backend-neutral
+        # device_time_total in newer releases.  Keep the harness portable
+        # because the cluster profiling env can lag the login environment.
+        device_us = getattr(event, "device_time_total", None)
+        if device_us is None:
+            device_us = getattr(event, "cuda_time_total", 0.0)
+        if device_us <= 0:
             continue
         rows.append(
             {
                 "name": event.key,
-                "cuda_ms": cuda_us / 1000.0,
+                "cuda_ms": device_us / 1000.0,
                 "calls": event.count,
                 "shapes": str(event.input_shapes)[:240],
             }
