@@ -32,7 +32,7 @@ from configs.configs_inference import inference_configs
 from configs.configs_model_type import model_configs
 from protenix.config.config import parse_configs, parse_sys_args
 from protenix.data.inference.infer_dataloader import get_inference_dataloader
-from protenix.model.protenix import Protenix
+from protenix.model.protenix import Protenix, update_input_feature_dict
 from protenix.utils.distributed import DIST_WRAPPER
 from protenix.utils.seed import seed_everything
 from protenix.utils.torch_utils import to_device
@@ -237,6 +237,116 @@ class InferenceRunner(object):
 
         return prediction
 
+    @torch.no_grad()
+    def predict_token_batch(
+        self, data_items: list[Mapping[str, Any]]
+    ) -> list[dict[str, torch.Tensor]]:
+        """Batch the expensive token trunk for same-token, variable-atom records.
+
+        Protein design campaigns commonly mutate residues while keeping the
+        target length fixed.  Those records share the pairformer trunk shape but
+        do not share atom shapes because residue side chains have different atom
+        counts.  Padding fake atoms through atom attention is risky: fake keys
+        change softmax denominators and fake atoms also affect atom-level
+        confidence reductions unless every downstream operation is mask-aware.
+
+        This path keeps atom-shaped work ragged and exact by running the atom
+        input embedding and the diffusion/confidence tail per record.  Only the
+        token-shaped trunk inputs and ``s_inputs`` are stacked, which captures
+        the main low-sample throughput win without ragged token padding.
+        """
+        if len(data_items) == 1:
+            return [
+                self.predict(
+                    {"input_feature_dict": data_items[0]["input_feature_dict"]}
+                )
+            ]
+
+        eval_precision = {
+            "fp32": torch.float32,
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+        }[self.configs.dtype]
+        enable_amp = (
+            torch.autocast(device_type="cuda", dtype=eval_precision)
+            if torch.cuda.is_available()
+            else nullcontext()
+        )
+
+        feature_dicts = [
+            to_device(_copy_tree(data["input_feature_dict"]), self.device)
+            for data in data_items
+        ]
+        chunk_size = self.configs.infer_setting.chunk_size
+        n_token = feature_dicts[0]["residue_index"].shape[-1]
+        if (
+            hasattr(self.configs.infer_setting, "dynamic_chunk_size")
+            and self.configs.infer_setting.dynamic_chunk_size
+        ):
+            chunk_size = self.model._get_dynamic_chunk_size(n_token)
+        inplace_safe = not (self.model.training or torch.is_grad_enabled())
+
+        with enable_amp:
+            prepared_features = []
+            s_inputs_list = []
+            for feature_dict in feature_dicts:
+                feature_dict = self.model.relative_position_encoding.generate_relp(
+                    feature_dict
+                )
+                feature_dict = update_input_feature_dict(feature_dict)
+                s_inputs = self.model.input_embedder(
+                    feature_dict, inplace_safe=False, chunk_size=chunk_size
+                )
+                prepared_features.append(feature_dict)
+                s_inputs_list.append(s_inputs)
+
+            trunk_feature_dict = _stack_tree(
+                [
+                    _trunk_feature_dict(feature_dict)
+                    for feature_dict in prepared_features
+                ]
+            )
+            s_inputs_batch = torch.stack(s_inputs_list, dim=0)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            trunk_start = time.perf_counter()
+            s_batch, z_batch = self.model.get_pairformer_output_from_s_inputs(
+                input_feature_dict=trunk_feature_dict,
+                s_inputs=s_inputs_batch,
+                N_cycle=self.model.N_cycle,
+                inplace_safe=inplace_safe,
+                chunk_size=chunk_size,
+            )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            trunk_sec_per_item = (
+                time.perf_counter() - trunk_start
+            ) / len(data_items)
+
+            predictions = []
+            log_dicts = []
+            for batch_idx, feature_dict in enumerate(prepared_features):
+                pred_dict, log_dict, time_tracker = (
+                    self.model.finish_inference_from_pairformer(
+                        input_feature_dict=feature_dict,
+                        s_inputs=s_inputs_list[batch_idx],
+                        s=s_batch[batch_idx],
+                        z=z_batch[batch_idx],
+                        label_dict=None,
+                        N_cycle=self.model.N_cycle,
+                        mode="inference",
+                        inplace_safe=inplace_safe,
+                        chunk_size=chunk_size,
+                        pairformer_sec=trunk_sec_per_item,
+                    )
+                )
+                log_dict["time"] = time_tracker
+                predictions.append(pred_dict)
+                log_dicts.append(log_dict)
+
+        self.last_log_dict = log_dicts[-1] if log_dicts else {}
+        return predictions
+
     def print(self, msg: str) -> None:
         """
         Print message only on the master rank (rank 0).
@@ -264,6 +374,61 @@ def _inference_batch_size(configs: Any) -> int:
     except Exception:
         value = 1
     return max(1, value)
+
+
+def _inference_batch_mode(configs: Any) -> str:
+    """Return how records are allowed to share one inference batch."""
+    mode = str(configs.get("inference_batch_mode", "exact")).strip().lower()
+    if mode not in {"exact", "token"}:
+        logger.warning("Unknown inference_batch_mode=%r; using exact mode.", mode)
+        return "exact"
+    return mode
+
+
+_ATOM_ONLY_FEATURE_KEYS = {
+    "atom_to_token_idx",
+    "atom_to_tokatom_idx",
+    "bond_mask",
+    "d_lm",
+    "distogram_rep_atom_mask",
+    "entity_mol_id",
+    "is_dna",
+    "is_ligand",
+    "is_protein",
+    "is_rna",
+    "modified_res_mask",
+    "mol_atom_index",
+    "mol_id",
+    "pad_info",
+    "pae_rep_atom_mask",
+    "plddt_m_rep_atom_mask",
+    "ref_atom_name_chars",
+    "ref_charge",
+    "ref_element",
+    "ref_mask",
+    "ref_pos",
+    "ref_space_uid",
+    "v_lm",
+}
+
+
+def _copy_tree(value: Any) -> Any:
+    if isinstance(value, MappingABC):
+        return {key: _copy_tree(sub_value) for key, sub_value in value.items()}
+    if isinstance(value, list):
+        return [_copy_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_copy_tree(item) for item in value)
+    return value
+
+
+def _trunk_feature_dict(feature_dict: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep only features that can participate in same-token trunk batching."""
+    return {
+        key: value
+        for key, value in feature_dict.items()
+        if key not in _ATOM_ONLY_FEATURE_KEYS
+    }
 
 
 def _tensor_tree_signature(value: Any) -> Any:
@@ -295,6 +460,17 @@ def _tensor_tree_signature(value: Any) -> Any:
 
 def _input_feature_signature(data: Mapping[str, Any]) -> Any:
     return _tensor_tree_signature(data["input_feature_dict"])
+
+
+def _token_trunk_signature(data: Mapping[str, Any]) -> Any:
+    """Shape/dtype signature for the safe same-token trunk-batch boundary."""
+    return _tensor_tree_signature(_trunk_feature_dict(data["input_feature_dict"]))
+
+
+def _input_batch_signature(data: Mapping[str, Any], batch_mode: str) -> Any:
+    if batch_mode == "token":
+        return _token_trunk_signature(data)
+    return _input_feature_signature(data)
 
 
 def _stack_tree(items: list[Any]) -> Any:
@@ -423,17 +599,23 @@ def _dump_prediction(
     )
 
 
-def _describe_batch(items: list[tuple[dict[str, Any], Any]], seed: int) -> None:
+def _describe_batch(
+    items: list[tuple[dict[str, Any], Any]], seed: int, batch_mode: str
+) -> None:
     first_data = items[0][0]
     names = [data["sample_name"] for data, _atom_array in items]
+    atom_counts = [int(data["N_atom"].item()) for data, _atom_array in items]
+    batch_kind = "same-shape" if batch_mode == "exact" else "same-token-trunk"
     logger.info(
-        "[Rank %s] Predicting %d same-shape input(s) [seed:%s]: "
-        "N_token %s, N_atom %s, N_msa %s, names=%s",
+        "[Rank %s] Predicting %d %s input(s) [seed:%s]: "
+        "N_token %s, N_atom %s-%s, N_msa %s, names=%s",
         DIST_WRAPPER.rank,
         len(items),
+        batch_kind,
         seed,
         int(first_data["N_token"].item()),
-        int(first_data["N_atom"].item()),
+        min(atom_counts),
+        max(atom_counts),
         int(first_data["N_msa"].item()),
         ",".join(names[:4]) + ("..." if len(names) > 4 else ""),
     )
@@ -443,10 +625,13 @@ def _run_prediction_batch(
     runner: InferenceRunner,
     configs: Any,
     items: list[tuple[dict[str, Any], Any]],
-) -> Mapping[str, Any]:
+    batch_mode: str,
+) -> Mapping[str, Any] | list[Mapping[str, Any]]:
     first_data = items[0][0]
     n_token = int(first_data["N_token"].item())
     runner.update_model_configs(update_inference_configs(configs, n_token))
+    if len(items) > 1 and batch_mode == "token":
+        return runner.predict_token_batch([data for data, _atom_array in items])
     batch_data = first_data if len(items) == 1 else _stack_prediction_inputs(items)
     return runner.predict(batch_data)
 
@@ -457,6 +642,7 @@ def _fallback_to_singletons(
     items: list[tuple[dict[str, Any], Any]],
     seed: int,
     num_data: int,
+    batch_mode: str,
     exc: Exception,
 ) -> None:
     if len(items) == 1:
@@ -470,21 +656,23 @@ def _fallback_to_singletons(
         return
 
     logger.warning(
-        "Batched prediction of %d same-shape inputs failed; falling back "
+        "Batched prediction of %d compatible inputs failed; falling back "
         "to singleton inference. Error: %s",
         len(items),
         exc,
     )
     torch.cuda.empty_cache()
     for item in items:
-        _predict_and_dump_items(runner, configs, [item], seed, num_data)
+        _predict_and_dump_items(runner, configs, [item], seed, num_data, batch_mode)
 
 
 def _prediction_items(
-    prediction: Mapping[str, Any],
+    prediction: Mapping[str, Any] | list[Mapping[str, Any]],
     configs: Any,
     batch_size: int,
 ) -> list[Mapping[str, Any]]:
+    if isinstance(prediction, list):
+        return prediction
     if batch_size == 1:
         return [prediction]
     return _split_batched_prediction(
@@ -500,17 +688,18 @@ def _predict_and_dump_items(
     items: list[tuple[dict[str, Any], Any]],
     seed: int,
     num_data: int,
+    batch_mode: str,
 ) -> None:
-    """Run one exact-shape batch, split outputs, and dump per input."""
+    """Run one compatible batch, split outputs, and dump per input."""
     if not items:
         return
 
     batch_size = len(items)
-    _describe_batch(items, seed)
+    _describe_batch(items, seed, batch_mode)
     start = time.perf_counter()
     try:
         predict_start = time.perf_counter()
-        prediction = _run_prediction_batch(runner, configs, items)
+        prediction = _run_prediction_batch(runner, configs, items, batch_mode)
         if torch.cuda.is_available():
             # The dumper soon copies prediction tensors to CPU.  Synchronizing
             # here attributes completed GPU work to ``predict_sec`` instead of
@@ -519,7 +708,9 @@ def _predict_and_dump_items(
             torch.cuda.synchronize()
         predict_sec = time.perf_counter() - predict_start
     except Exception as exc:
-        _fallback_to_singletons(runner, configs, items, seed, num_data, exc)
+        _fallback_to_singletons(
+            runner, configs, items, seed, num_data, batch_mode, exc
+        )
         return
 
     split_start = time.perf_counter()
@@ -757,6 +948,7 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
         seed_everything(seed=seed, deterministic=configs.deterministic)
         t1_start = time.time()
         batch_size = _inference_batch_size(configs)
+        batch_mode = _inference_batch_mode(configs)
         pending: dict[Any, list[tuple[dict[str, Any], Any]]] = {}
 
         def flush_signature(signature: Any) -> None:
@@ -767,6 +959,7 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                 items=items,
                 seed=seed,
                 num_data=num_data,
+                batch_mode=batch_mode,
             )
 
         for batch in dataloader:
@@ -787,7 +980,7 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                         f"N_asym {data['N_asym'].item()}, N_token {data['N_token'].item()}, "
                         f"N_atom {data['N_atom'].item()}, N_msa {data['N_msa'].item()}"
                     )
-                    signature = _input_feature_signature(data)
+                    signature = _input_batch_signature(data, batch_mode)
                     pending.setdefault(signature, []).append((data, atom_array))
                     if len(pending[signature]) >= batch_size:
                         flush_signature(signature)

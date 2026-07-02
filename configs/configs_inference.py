@@ -33,6 +33,12 @@ inference_configs = {
     # are used only when all tensor feature shapes match exactly, so ragged
     # padding cannot leak into model outputs.
     "inference_batch_size": 1,
+    # "exact" batches the whole model only when every feature tensor shape
+    # matches.  "token" is an explicit campaign-throughput mode for records
+    # with the same token/MSA/template trunk shape but different atom counts:
+    # atom-shaped work stays per-record, while the expensive token trunk is
+    # stacked across records.
+    "inference_batch_mode": "exact",
     "use_msa": True,
     "enable_tf32": True,
     "enable_efficient_fusion": True,

@@ -215,6 +215,44 @@ class Protenix(nn.Module):
         s_inputs = self.input_embedder(
             input_feature_dict, inplace_safe=False, chunk_size=chunk_size
         )  # [..., N_token, 449]
+
+        s, z = self.get_pairformer_output_from_s_inputs(
+            input_feature_dict=input_feature_dict,
+            s_inputs=s_inputs,
+            N_cycle=N_cycle,
+            inplace_safe=inplace_safe,
+            chunk_size=chunk_size,
+            mc_dropout=mc_dropout,
+        )
+
+        if self.train_confidence_only:
+            self.input_embedder.train()
+            self.template_embedder.train()
+            self.msa_module.train()
+            self.pairformer_stack.train()
+
+        return s_inputs, s, z
+
+    def get_pairformer_output_from_s_inputs(
+        self,
+        input_feature_dict: dict[str, Any],
+        s_inputs: torch.Tensor,
+        N_cycle: int,
+        inplace_safe: bool = False,
+        chunk_size: Optional[int] = None,
+        mc_dropout: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the token trunk once atom-derived ``s_inputs`` are available.
+
+        This split is useful for high-throughput design campaigns.  Many
+        sequences have the same token length but different atom counts because
+        amino acids have different side-chain sizes.  Padding atom dimensions
+        into one full-model batch is not a semantic no-op unless every atom
+        attention and summary reduction learns about the artificial atoms.
+        Instead, the runner can compute the atom input embedding per record,
+        stack only the token-shaped trunk inputs here, and then finish the
+        atom/diffusion/confidence tail per record.
+        """
         z_constraint = None
 
         if "constraint_feature" in input_feature_dict:
@@ -312,13 +350,7 @@ class Protenix(nn.Module):
                     chunk_size=chunk_size,
                 )
 
-        if self.train_confidence_only:
-            self.input_embedder.train()
-            self.template_embedder.train()
-            self.msa_module.train()
-            self.pairformer_stack.train()
-
-        return s_inputs, s, z
+        return s, z
 
     def sample_diffusion(self, **kwargs: Any) -> torch.Tensor:
         """
@@ -581,48 +613,36 @@ class Protenix(nn.Module):
         # For token counts larger than the largest threshold, use smallest chunk_size
         return 32  # extreme case for very large proteins
 
-    def _main_inference_loop(
+    def finish_inference_from_pairformer(
         self,
         input_feature_dict: dict[str, Any],
-        label_dict: dict[str, Any],
+        s_inputs: torch.Tensor,
+        s: torch.Tensor,
+        z: torch.Tensor,
+        label_dict: Optional[dict[str, Any]],
         N_cycle: int,
         mode: str,
-        inplace_safe: bool = True,
-        chunk_size: Optional[int] = 4,
+        inplace_safe: bool,
+        chunk_size: Optional[int],
         symmetric_permutation: SymmetricPermutation = None,
-        mc_dropout: bool = False,
+        step_st: Optional[float] = None,
+        pairformer_sec: Optional[float] = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
-        """
-        Main inference loop (single model seed) for the Alphafold3 model.
-        mc_dropout: do not use by default
+        """Finish inference after the token trunk has produced ``s`` and ``z``.
 
-        Returns:
-            tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]: Prediction, log, and time dictionaries.
+        The normal full-model path calls this immediately after
+        ``get_pairformer_output``.  The campaign batching path can instead
+        compute atom input embeddings for several same-token records, run this
+        trunk in one batched call, then call this tail once per record.  Keeping
+        this boundary explicit avoids padding variable atom counts through atom
+        attention, diffusion, and confidence reductions.
         """
         sync_timings = _env_flag_enabled("PROTENIX_SYNC_TIMINGS")
-        _sync_cuda_for_timing(sync_timings)
-        step_st = time.time()
-        N_token = input_feature_dict["residue_index"].shape[-1]
-
-        # Apply dynamic chunk_size if enabled (otherwise keep the passed chunk_size)
-        if (
-            hasattr(self.configs.infer_setting, "dynamic_chunk_size")
-            and self.configs.infer_setting.dynamic_chunk_size
-        ):
-            chunk_size = self._get_dynamic_chunk_size(N_token)
-        # If dynamic chunking is disabled, chunk_size keeps its original value from the function parameter
-
-        log_dict = {}
-        pred_dict = {}
-        time_tracker = {}
-
-        s_inputs, s, z = self.get_pairformer_output(
-            input_feature_dict=input_feature_dict,
-            N_cycle=N_cycle,
-            inplace_safe=inplace_safe,
-            chunk_size=chunk_size,
-            mc_dropout=mc_dropout,
-        )
+        pred_dict: dict[str, Any] = {}
+        log_dict: dict[str, Any] = {}
+        time_tracker: dict[str, Any] = {}
+        if step_st is None:
+            step_st = time.time()
 
         keys_to_delete = []
         for key in input_feature_dict.keys():
@@ -640,7 +660,10 @@ class Protenix(nn.Module):
             del input_feature_dict[key]
         _sync_cuda_for_timing(sync_timings)
         step_trunk = time.time()
-        time_tracker.update({"pairformer": step_trunk - step_st})
+        pairformer_time = (
+            step_trunk - step_st if pairformer_sec is None else pairformer_sec
+        )
+        time_tracker.update({"pairformer": pairformer_time})
         # Sample diffusion
         # [..., N_sample, N_atom, 3]
         N_sample = self.configs.sample_diffusion["N_sample"]
@@ -843,6 +866,59 @@ class Protenix(nn.Module):
         )
 
         return pred_dict, log_dict, time_tracker
+
+    def _main_inference_loop(
+        self,
+        input_feature_dict: dict[str, Any],
+        label_dict: dict[str, Any],
+        N_cycle: int,
+        mode: str,
+        inplace_safe: bool = True,
+        chunk_size: Optional[int] = 4,
+        symmetric_permutation: SymmetricPermutation = None,
+        mc_dropout: bool = False,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
+        """
+        Main inference loop (single model seed) for the Alphafold3 model.
+        mc_dropout: do not use by default
+
+        Returns:
+            tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]: Prediction, log, and time dictionaries.
+        """
+        sync_timings = _env_flag_enabled("PROTENIX_SYNC_TIMINGS")
+        _sync_cuda_for_timing(sync_timings)
+        step_st = time.time()
+        N_token = input_feature_dict["residue_index"].shape[-1]
+
+        # Apply dynamic chunk_size if enabled (otherwise keep the passed chunk_size)
+        if (
+            hasattr(self.configs.infer_setting, "dynamic_chunk_size")
+            and self.configs.infer_setting.dynamic_chunk_size
+        ):
+            chunk_size = self._get_dynamic_chunk_size(N_token)
+        # If dynamic chunking is disabled, chunk_size keeps its original value from the function parameter
+
+        s_inputs, s, z = self.get_pairformer_output(
+            input_feature_dict=input_feature_dict,
+            N_cycle=N_cycle,
+            inplace_safe=inplace_safe,
+            chunk_size=chunk_size,
+            mc_dropout=mc_dropout,
+        )
+
+        return self.finish_inference_from_pairformer(
+            input_feature_dict=input_feature_dict,
+            s_inputs=s_inputs,
+            s=s,
+            z=z,
+            label_dict=label_dict,
+            N_cycle=N_cycle,
+            mode=mode,
+            inplace_safe=inplace_safe,
+            chunk_size=chunk_size,
+            symmetric_permutation=symmetric_permutation,
+            step_st=step_st,
+        )
 
     def main_train_loop(
         self,

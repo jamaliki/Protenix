@@ -17,6 +17,9 @@ import os
 import tempfile
 import unittest
 
+import torch
+
+from runner.inference import _input_batch_signature
 from runner.campaign_inputs import (
     group_inference_jsons_by_seed,
     load_inference_records,
@@ -106,6 +109,37 @@ class TestCampaignJsonBatching(unittest.TestCase):
 
             self.assertEqual(merged_path, path)
             self.assertIsNone(cleanup_path)
+
+    def test_token_batch_signature_ignores_atom_only_shapes(self):
+        def make_data(n_atom: int) -> dict:
+            n_token = 4
+            return {
+                "input_feature_dict": {
+                    "residue_index": torch.zeros(n_token, dtype=torch.long),
+                    "token_index": torch.zeros(n_token, dtype=torch.long),
+                    "asym_id": torch.zeros(n_token, dtype=torch.long),
+                    "token_bonds": torch.zeros(n_token, n_token),
+                    "msa": torch.zeros(1, n_token, dtype=torch.long),
+                    "has_deletion": torch.zeros(1, n_token),
+                    "deletion_value": torch.zeros(1, n_token),
+                    "ref_pos": torch.zeros(n_atom, 3),
+                    "ref_mask": torch.ones(n_atom),
+                    "atom_to_token_idx": torch.zeros(n_atom, dtype=torch.long),
+                    "bond_mask": torch.zeros(n_atom, n_atom),
+                }
+            }
+
+        short_atom = make_data(20)
+        long_atom = make_data(23)
+
+        self.assertNotEqual(
+            _input_batch_signature(short_atom, "exact"),
+            _input_batch_signature(long_atom, "exact"),
+        )
+        self.assertEqual(
+            _input_batch_signature(short_atom, "token"),
+            _input_batch_signature(long_atom, "token"),
+        )
 
 
 if __name__ == "__main__":
