@@ -401,6 +401,12 @@ falls back to a slow path, the right next boundary is a custom token-attention
 kernel that indexes bias by `record = flat_batch // N_sample` without
 materializing repeated bias rows.
 
+Masked probe status: queued as job `95919`
+(`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/token_attn_bias_broadcast_masked_20260702_203322`),
+dependent on the representative `N_sample=5` gate (`afterany:95869`).  It
+uses `--valid-fraction 0.8` at `tokens=124` and `220`, so it measures the
+padding-mask case that actually matters for sorted mixed-token batches.
+
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`
 (`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/fusion_flags_pair_b16_n200_20260702_170343`)
