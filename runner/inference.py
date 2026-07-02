@@ -504,16 +504,29 @@ def _predict_and_dump_items(
 
     batch_size = len(items)
     _describe_batch(items, seed)
-    start = time.time()
+    start = time.perf_counter()
     try:
+        predict_start = time.perf_counter()
         prediction = _run_prediction_batch(runner, configs, items)
+        if torch.cuda.is_available():
+            # The dumper soon copies prediction tensors to CPU.  Synchronizing
+            # here attributes completed GPU work to ``predict_sec`` instead of
+            # hiding it inside file-writing time, without adding extra work to
+            # normal dumped inference.
+            torch.cuda.synchronize()
+        predict_sec = time.perf_counter() - predict_start
     except Exception as exc:
         _fallback_to_singletons(runner, configs, items, seed, num_data, exc)
         return
 
+    split_start = time.perf_counter()
     predictions = _prediction_items(prediction, configs, batch_size)
+    split_sec = time.perf_counter() - split_start
+    dump_sec = 0.0
     for prediction_i, (data, atom_array) in zip(predictions, items):
+        dump_start = time.perf_counter()
         _dump_prediction(runner, data, atom_array, seed, prediction_i)
+        dump_sec += time.perf_counter() - dump_start
         logger.info(
             "[Rank %s] %s [seed:%s] succeeded in batched forward. "
             "Results saved to %s",
@@ -523,12 +536,16 @@ def _predict_and_dump_items(
             configs.dump_dir,
         )
     logger.info(
-        "[Rank %s] Finished %d/%d input(s) [seed:%s] in %.2fs.",
+        "[Rank %s] Finished %d/%d input(s) [seed:%s] in %.2fs "
+        "(predict %.2fs, split %.2fs, dump %.2fs).",
         DIST_WRAPPER.rank,
         batch_size,
         num_data,
         seed,
-        time.time() - start,
+        time.perf_counter() - start,
+        predict_sec,
+        split_sec,
+        dump_sec,
     )
     torch.cuda.empty_cache()
 
