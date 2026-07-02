@@ -95,6 +95,15 @@ def transition_input_projection_fusion_enabled() -> bool:
     }
 
 
+def transition_addmm_residual_enabled() -> bool:
+    return os.getenv("PROTENIX_TRANSITION_ADDMM_RESIDUAL", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
 def transition_input_projection_max_elements() -> int:
     value = os.getenv("PROTENIX_FUSED_TRANSITION_INPUT_MAX_ELEMENTS", "4000000000")
     try:
@@ -377,7 +386,30 @@ class Transition(nn.Module):
         projected = F.linear(x, self._input_projection_params())
         return triton_silu_mul_split(projected, self.n * self.c_in)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _output_projection(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if residual is None:
+            return self.linear_no_bias(x)
+        if (
+            self.linear_no_bias.precision is not None
+            or self.linear_no_bias.bias is not None
+        ):
+            return self.linear_no_bias(x) + residual
+
+        # This is the same GEMM as ``self.linear_no_bias(x)`` with the caller's
+        # residual supplied as C and beta=1.  It keeps the cuBLAS/cuBLASLt
+        # mainloop, but asks the library epilogue to do the residual add instead
+        # of launching a separate full-tensor add after the transition returns.
+        return torch.addmm(residual, x, self.linear_no_bias.weight.t())
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             x (torch.Tensor): the input tensor
@@ -392,14 +424,24 @@ class Transition(nn.Module):
             a = self.linear_no_bias_a(x)
             b = self.linear_no_bias_b(x)
             x = self.linear_no_bias(F.silu(a) * b)
+            if residual is not None:
+                x = x + residual
             return x
         else:
             other_dims = x.shape[:-1]
             dim_size = x.shape[-1]
             size = x.shape[-2]
             x = x.reshape(-1, dim_size)
+            residual_flat = (
+                None if residual is None else residual.reshape(-1, self.c_in)
+            )
             chunk_num = 1 if size < 3200 else 8
             chunks = torch.chunk(x, chunk_num, dim=-2)
+            residual_chunks = (
+                (None,) * len(chunks)
+                if residual_flat is None
+                else torch.chunk(residual_flat, chunk_num, dim=-2)
+            )
             outputs = (
                 None
                 if chunk_num == 1
@@ -408,7 +450,7 @@ class Transition(nn.Module):
                 )
             )
             start = 0
-            for chunk in chunks:
+            for chunk, residual_chunk in zip(chunks, residual_chunks):
                 y = self.layernorm1(chunk)
                 b = self._fused_input_projection(y)
                 if b is None:
@@ -422,7 +464,7 @@ class Transition(nn.Module):
                         b = fused_b
                     del a
                 del y
-                b = self.linear_no_bias(b)
+                b = self._output_projection(b, residual_chunk)
                 if outputs is None:
                     # Most inference shapes, including B64/N245 pairformer,
                     # use a single chunk.  Returning the projection directly
