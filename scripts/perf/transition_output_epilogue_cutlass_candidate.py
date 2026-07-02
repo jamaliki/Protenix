@@ -18,6 +18,7 @@ It compiles only on the Tokyo CUDA/CUTLASS environment used by
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -33,6 +34,37 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _header_include_paths(cutlass_include: str) -> list[str]:
+    """Return include roots needed by the out-of-tree CUDA extension.
+
+    PyTorch's extension builder supplies the PyTorch headers, but not every
+    cluster environment exposes CUDA runtime headers through ``CUDA_HOME/include``.
+    On Tokyo, the active Python environment provides CUDA 13 headers through the
+    ``nvidia-cu13`` wheel, while ``CUDA_HOME`` mainly provides ``nvcc``.  Passing
+    both locations keeps the benchmark candidate reproducible without hardcoding
+    one user's exact Python minor version.
+    """
+
+    paths = [Path(cutlass_include)]
+    cuda_home = os.environ.get("CUDA_HOME")
+    if cuda_home:
+        root = Path(cuda_home)
+        paths.extend([root / "include", root / "targets/x86_64-linux/include"])
+
+    for root in [Path(sys.prefix), Path(torch.__file__).resolve().parents[1]]:
+        paths.extend(root.glob("lib/python*/site-packages/nvidia/cu*/include"))
+
+    include_paths: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        if path.is_dir():
+            resolved = str(path.resolve())
+            if resolved not in seen:
+                include_paths.append(resolved)
+                seen.add(resolved)
+    return include_paths
+
+
 def _extension():
     global _EXT
     if _EXT is not None:
@@ -46,7 +78,7 @@ def _extension():
     _EXT = load(
         name="protenix_transition_epilogue_cutlass_sm90",
         sources=[str(source)],
-        extra_include_paths=[cutlass_include],
+        extra_include_paths=_header_include_paths(cutlass_include),
         extra_cuda_cflags=[
             "-O3",
             "--use_fast_math",
