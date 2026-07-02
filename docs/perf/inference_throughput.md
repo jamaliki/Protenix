@@ -625,6 +625,36 @@ candidate is promoted as an automatic BF16/FP16 inference fallback, with
 training, CPU, missing Triton, non-contiguous tensors, unsupported feature
 dimensions, and default FP32 all falling back to PyTorch.
 
+Post-promotion profile: job `96188`
+(`runs/post_ln_default_profile_20260702_230930_88afbbe`) repeated the N20
+mixed-campaign profiler at commit `88afbbe` with
+`PROTENIX_TRITON_LAYER_NORM` unset.  It wrote a 1.8 GB trace and confirmed the
+component bottleneck shifted: summed predict was `37.82s`, with pairformer
+`19.51s` (52%), confidence `10.44s` (28%), and diffusion `5.70s` (15%).  The
+largest raw CUDA classes were now:
+
+| post-LN kernel class | self CUDA ms | calls | avg us | interpretation |
+| --- | ---: | ---: | ---: | --- |
+| GEMM via `aten::mm` | 2893 | 53862 | 53.7 | many small/medium matmuls are now the broad floor |
+| CUDA command-buffer full | 2747 | 23853 | 115.2 | launch/command-buffer overhead remains material |
+| CUEQ triangle attention | 1929 | 3200 | 778.6 | pairformer attention is a real remaining target |
+| cuDNN SDPA FMHA | 1868 | 2400 | 778.4 | vendor token attention is also material |
+| PyTorch `vectorized_layer_norm_kernel` | 1776 | 13832 | 128.4 | remaining native LayerNorm is mostly FP32/policy-disabled |
+| Triton `_layer_norm_kernel` | 1605 | 7400 | 216.9 | promoted BF16/FP16 LayerNorm fallback now carries its share |
+| CUEQ fused gated dual GEMM | 1051 | 5760 | 182.4 | CUEQ-adjacent fused MLP path remains nontrivial |
+
+Mining the trace metadata showed the remaining `aten::native_layer_norm` calls
+are not unsupported BF16 shapes; they are FP32 diffusion-token shapes such as
+`[80, 124, 768]`, `[80, 124, 384]`, `[80, 220, 768]`, and `[80, 220, 384]`
+with last-dimension-contiguous strides.  That explains why the conservative
+default (`auto`) is slower than the earlier `PROTENIX_TRITON_LAYER_NORM=1`
+forced run: `auto` leaves FP32 on PyTorch.  A paired N200 gate,
+job `96214`
+(`runs/layer_norm_force_fp32_gate_n200_20260702_235207_88afbbe`), is queued to
+compare default `auto` against forced-all Triton LayerNorm in the same job.  Do
+not promote FP32 LayerNorm by default unless that gate beats the conservative
+default cleanly; the isolated FP32 microbenchmarks were mixed.
+
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`
 (`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/fusion_flags_pair_b16_n200_20260702_170343`)
@@ -1869,9 +1899,10 @@ Profiling and reproducibility helpers:
 Do not expect another large gain from config changes.  The next proper
 same-output campaign should be one of:
 
-1. profile the post-LayerNorm default on the representative mixed
-   `N_sample=5`, `N_step=20` path and compare the new top kernels against the
-   pre-LayerNorm trace; LayerNorm should no longer be the largest class;
+1. finish queued job `96214`, the paired default-`auto` versus forced-all
+   LayerNorm N200 gate.  If forced-all wins cleanly, consider a narrower policy
+   that enables Triton for the observed large-row FP32 diffusion-token
+   LayerNorms without enabling every FP32 shape;
 2. a deliberate atom/trunk kernel-layout rewrite, especially around producers
    feeding attention kernels;
 3. a confidence-pairformer precision/tiling campaign with explicit numerical
