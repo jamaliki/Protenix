@@ -252,14 +252,12 @@ if triton_fused_elementwise_available():
     def _silu_mul_inplace_y_kernel(
         x_ptr,
         y_ptr,
-        offset_base: tl.constexpr,
         n_elements: tl.constexpr,
         block_size: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        local_offsets = pid * block_size + tl.arange(0, block_size)
-        mask = local_offsets < n_elements
-        offsets = (offset_base + local_offsets).to(tl.int64)
+        offsets = (pid * block_size + tl.arange(0, block_size)).to(tl.int64)
+        mask = offsets < n_elements
         x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         out = x * (1.0 / (1.0 + tl.exp(-x))) * y
@@ -407,21 +405,27 @@ def triton_silu_mul_inplace_y(
     """
     if not _can_use_triton(x, y):
         return None
-    # Very large pair-transition batches exceed 2^31 elements.  Splitting into
-    # offset chunks avoids unsafe giant-vector indexing while still replacing
-    # PyTorch's separate SiLU and multiply chunk launches with one fused launch
-    # per chunk.
     total = y.numel()
-    for start in range(0, total, _MAX_TRITON_VECTOR_ELEMENTS):
-        n_elements = min(_MAX_TRITON_VECTOR_ELEMENTS, total - start)
-        _silu_mul_inplace_y_kernel[_grid(n_elements)](
-            x,
-            y,
-            start,
-            n_elements,
-            block_size=_BLOCK_SIZE,
-            num_warps=4,
+    if total <= _MAX_TRITON_VECTOR_ELEMENTS:
+        _silu_mul_inplace_y_kernel[_grid(total)](
+            x, y, total, block_size=_BLOCK_SIZE, num_warps=4
         )
+    else:
+        # Very large pair-transition batches exceed the safe range for one
+        # Triton vector launch.  Use narrowed flat views so each kernel sees a
+        # small pointer base and local offsets, while still replacing PyTorch's
+        # separate SiLU and multiply chunk launches with one fused launch/chunk.
+        x_flat = x.reshape(-1)
+        y_flat = y.reshape(-1)
+        for start in range(0, total, _MAX_TRITON_VECTOR_ELEMENTS):
+            n_elements = min(_MAX_TRITON_VECTOR_ELEMENTS, total - start)
+            _silu_mul_inplace_y_kernel[_grid(n_elements)](
+                x_flat.narrow(0, start, n_elements),
+                y_flat.narrow(0, start, n_elements),
+                n_elements,
+                block_size=_BLOCK_SIZE,
+                num_warps=4,
+            )
     return y
 
 
