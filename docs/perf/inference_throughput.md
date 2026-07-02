@@ -500,9 +500,12 @@ dimension where the attention-head dimension should be.  Commit `6cf7a2e`
 passes `s_batch` directly and documents the shape invariant.  Remote CPU/import
 tests in `env-boltz2` pass for `tests.test_campaign_json_batching`,
 `tests.test_ragged_multisample_diffusion`, and `tests.test_diffusion_transformer`.
-The corrected GPU smoke is queued as job `96056`
-(`runs/sample_axis_shape_fix_smoke_20260702_214336`) and must pass before any
-`N_sample=5` sample-axis timing can be trusted.
+Commit `cc5b7ee` also makes `PROTENIX_RAISE_ON_BATCH_FALLBACK=1` propagate past
+the outer per-record error handler, so diagnostic smokes now fail the Slurm job
+instead of writing an error file and exiting zero.  The corrected GPU smoke is
+queued as job `96061`
+(`runs/sample_axis_shape_fix_smoke_20260702_214538_cc5b7ee`) and must pass
+before any `N_sample=5` sample-axis timing can be trusted.
 
 Once the smoke passes, the representative paired gate should use the same 32
 mixed 40-220-token proteins with `N_sample=5`, `N_step=200`, `--batch_size 16`,
