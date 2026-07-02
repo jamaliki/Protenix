@@ -369,6 +369,38 @@ class InferenceRunner(object):
                 time.perf_counter() - trunk_start
             ) / len(data_items)
 
+            use_batched_diffusion = _batched_token_diffusion_enabled(
+                self.configs, len(data_items)
+            )
+            batched_coordinates = None
+            diffusion_time_per_item = None
+            if use_batched_diffusion:
+                batched_coordinates, batch_diffusion_time = (
+                    self.model.sample_diffusion_batch_token_transformer(
+                        input_feature_dicts=prepared_features,
+                        s_inputs_list=s_inputs_list,
+                        s_list=[
+                            s_batch[idx, : token_counts[idx]]
+                            if pad_token_trunk
+                            else s_batch[idx]
+                            for idx in range(len(data_items))
+                        ],
+                        z_list=[
+                            z_batch[idx, : token_counts[idx], : token_counts[idx]]
+                            if pad_token_trunk
+                            else z_batch[idx]
+                            for idx in range(len(data_items))
+                        ],
+                        chunk_size=chunk_size,
+                        inplace_safe=inplace_safe,
+                    )
+                )
+                batch_diffusion_time["diffusion_token_transformer_batched"] = True
+                diffusion_time_per_item = _scale_time_dict(
+                    batch_diffusion_time,
+                    scale=1.0 / len(data_items),
+                )
+
             predictions = []
             log_dicts = []
             for batch_idx, (feature_dict, n_token_i) in enumerate(
@@ -391,6 +423,12 @@ class InferenceRunner(object):
                         inplace_safe=inplace_safe,
                         chunk_size=chunk_size,
                         pairformer_sec=trunk_sec_per_item,
+                        precomputed_coordinate=(
+                            batched_coordinates[batch_idx]
+                            if batched_coordinates is not None
+                            else None
+                        ),
+                        precomputed_diffusion_time=diffusion_time_per_item,
                     )
                 )
                 log_dict["time"] = time_tracker
@@ -401,7 +439,11 @@ class InferenceRunner(object):
         self.last_batch_time_summary = _summarize_model_time_dicts(
             [log_dict["time"] for log_dict in log_dicts if "time" in log_dict],
             item_count=len(data_items),
-            source="token-trunk-batch",
+            source=(
+                "token-trunk+diffusion-transformer-batch"
+                if batched_coordinates is not None
+                else "token-trunk-batch"
+            ),
         )
         return predictions
 
@@ -669,6 +711,56 @@ def _make_pair_mask(
     for batch_idx, n_token in enumerate(token_counts):
         token_mask[batch_idx, :n_token] = 1
     return token_mask[..., :, None] * token_mask[..., None, :]
+
+
+def _env_enabled_by_default(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return True
+    return value.strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _guidance_enabled(configs: Any) -> bool:
+    try:
+        guidance = configs.sample_diffusion.to_dict().get("guidance")
+    except AttributeError:
+        guidance = getattr(configs.sample_diffusion, "guidance", None)
+    if guidance is None:
+        return False
+    if isinstance(guidance, MappingABC):
+        return bool(guidance.get("enable", False))
+    return bool(getattr(guidance, "enable", False))
+
+
+def _batched_token_diffusion_enabled(configs: Any, batch_size: int) -> bool:
+    """Whether to share the diffusion token transformer across ragged records."""
+    if batch_size <= 1:
+        return False
+    if not _env_enabled_by_default("PROTENIX_BATCH_DIFFUSION_TRANSFORMER"):
+        return False
+    if int(configs.sample_diffusion.N_sample) != 1:
+        return False
+    if _guidance_enabled(configs):
+        return False
+    return True
+
+
+def _scale_time_dict(time_dict: Mapping[str, Any], scale: float) -> dict[str, Any]:
+    """Convert batch-total diffusion timings into per-record accounting.
+
+    The new sampler runs one shared token-transformer launch per diffusion step.
+    For batch summaries we want the sum of per-record timing dictionaries to be
+    the true batch wall time, so numeric leaves are divided over records.
+    """
+    scaled = {}
+    for key, value in time_dict.items():
+        if isinstance(value, bool):
+            scaled[key] = value
+        elif isinstance(value, Number):
+            scaled[key] = float(value) * scale
+        else:
+            scaled[key] = value
+    return scaled
 
 
 def _tensor_tree_signature(value: Any) -> Any:

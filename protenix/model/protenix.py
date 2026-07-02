@@ -45,7 +45,11 @@ from protenix.model.modules.pairformer import (
 )
 from protenix.model.modules.primitives import LinearNoBias
 from protenix.model.triangular.layers import LayerNorm
-from protenix.model.utils import simple_merge_dict_list
+from protenix.model.utils import (
+    centre_random_augmentation,
+    permute_final_dims,
+    simple_merge_dict_list,
+)
 from protenix.utils.logger import get_logger
 from protenix.utils.permutation.permutation import SymmetricPermutation
 from protenix.utils.torch_utils import autocasting_disable_decorator
@@ -67,6 +71,58 @@ def _env_int(name: str) -> Optional[int]:
 def _sync_cuda_for_timing(enabled: bool) -> None:
     if enabled and torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+def _stack_padded_token_vectors(
+    tensors: list[torch.Tensor],
+    max_tokens: int,
+) -> torch.Tensor:
+    """Stack ``[N_token, C]`` tensors while keeping padding explicit.
+
+    Padding is safe only because the downstream token transformer receives the
+    matching key mask.  Fake token activations are zero-filled, but valid tokens
+    keep exactly the values produced by the ragged atom encoder.
+    """
+    batch = len(tensors)
+    first = tensors[0]
+    padded = first.new_zeros((batch, max_tokens, *first.shape[1:]))
+    for batch_idx, tensor in enumerate(tensors):
+        padded[batch_idx, : tensor.shape[0]] = tensor
+    return padded
+
+
+def _stack_padded_token_pairs(
+    tensors: list[torch.Tensor],
+    max_tokens: int,
+    channel_first: bool,
+) -> torch.Tensor:
+    """Stack token-pair tensors in either ``[N, N, C]`` or ``[C, N, N]`` form."""
+    batch = len(tensors)
+    first = tensors[0]
+    if channel_first:
+        padded = first.new_zeros((batch, first.shape[0], max_tokens, max_tokens))
+        for batch_idx, tensor in enumerate(tensors):
+            n_token = tensor.shape[-1]
+            padded[batch_idx, :, :n_token, :n_token] = tensor
+    else:
+        padded = first.new_zeros((batch, max_tokens, max_tokens, first.shape[-1]))
+        for batch_idx, tensor in enumerate(tensors):
+            n_token = tensor.shape[0]
+            padded[batch_idx, :n_token, :n_token] = tensor
+    return padded
+
+
+def _make_token_mask(
+    token_counts: list[int],
+    max_tokens: int,
+    device: torch.device,
+) -> torch.Tensor:
+    token_mask = torch.zeros(
+        (len(token_counts), max_tokens), device=device, dtype=torch.bool
+    )
+    for batch_idx, n_token in enumerate(token_counts):
+        token_mask[batch_idx, :n_token] = True
+    return token_mask
 
 
 def update_input_feature_dict(input_feature_dict: dict[str, Any]) -> dict[str, Any]:
@@ -620,6 +676,298 @@ class Protenix(nn.Module):
         # For token counts larger than the largest threshold, use smallest chunk_size
         return 32  # extreme case for very large proteins
 
+    def _prepare_diffusion_cache(
+        self,
+        input_feature_dict: dict[str, Any],
+        z: torch.Tensor,
+    ) -> dict[str, Any]:
+        """Prepare the diffusion inputs that are invariant across denoising steps."""
+        cache = dict()
+        if self.enable_diffusion_shared_vars_cache:
+            # Lines 1-5 of Algorithm 21 calculate z in diffusion conditioning.
+            cache["pair_z"] = autocasting_disable_decorator(
+                self.configs.skip_amp.sample_diffusion
+            )(self.diffusion_module.diffusion_conditioning.prepare_cache)(
+                input_feature_dict["relp"], z, False
+            )
+            cache["p_lm/c_l"] = autocasting_disable_decorator(
+                self.configs.skip_amp.sample_diffusion
+            )(self.diffusion_module.atom_attention_encoder.prepare_cache)(
+                ref_pos=input_feature_dict["ref_pos"],
+                ref_charge=input_feature_dict["ref_charge"],
+                ref_mask=input_feature_dict["ref_mask"],
+                ref_element=input_feature_dict["ref_element"],
+                ref_atom_name_chars=input_feature_dict["ref_atom_name_chars"],
+                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+                d_lm=input_feature_dict["d_lm"],
+                v_lm=input_feature_dict["v_lm"],
+                pad_info=input_feature_dict["pad_info"],
+                r_l=True,
+                z=cache["pair_z"],
+                inplace_safe=False,
+            )
+        else:
+            cache["pair_z"] = None
+            cache["p_lm/c_l"] = [None, None]
+        return cache
+
+    def sample_diffusion_batch_token_transformer(
+        self,
+        input_feature_dicts: list[dict[str, Any]],
+        s_inputs_list: list[torch.Tensor],
+        s_list: list[torch.Tensor],
+        z_list: list[torch.Tensor],
+        chunk_size: Optional[int],
+        inplace_safe: bool,
+    ) -> tuple[list[torch.Tensor], dict[str, Any]]:
+        """Run mixed-token diffusion with one token-transformer launch per step.
+
+        Atom attention is still executed record-by-record at the true atom
+        shape.  Only the token activations immediately surrounding the
+        full-token diffusion transformer are padded and masked.  That is the
+        important correctness boundary: fake atoms never enter atom attention,
+        and fake tokens are invisible as attention keys in the transformer.
+        """
+        return autocasting_disable_decorator(self.configs.skip_amp.sample_diffusion)(
+            self._sample_diffusion_batch_token_transformer
+        )(
+            input_feature_dicts=input_feature_dicts,
+            s_inputs_list=s_inputs_list,
+            s_list=s_list,
+            z_list=z_list,
+            chunk_size=chunk_size,
+            inplace_safe=inplace_safe,
+        )
+
+    def _sample_diffusion_batch_token_transformer(
+        self,
+        input_feature_dicts: list[dict[str, Any]],
+        s_inputs_list: list[torch.Tensor],
+        s_list: list[torch.Tensor],
+        z_list: list[torch.Tensor],
+        chunk_size: Optional[int],
+        inplace_safe: bool,
+    ) -> tuple[list[torch.Tensor], dict[str, Any]]:
+        if self.training or torch.is_grad_enabled():
+            raise RuntimeError("batched token diffusion is inference-only")
+
+        N_sample = int(self.configs.sample_diffusion["N_sample"])
+        if N_sample != 1:
+            raise RuntimeError("batched token diffusion currently requires N_sample=1")
+
+        guidance_cfg = self.configs.sample_diffusion.to_dict().get("guidance")
+        if guidance_cfg is not None and guidance_cfg.get("enable", False):
+            raise RuntimeError("batched token diffusion does not support guidance")
+
+        dm = self.diffusion_module
+        sync_timings = _env_flag_enabled("PROTENIX_SYNC_TIMINGS")
+        token_counts = [int(s_i.shape[-2]) for s_i in s_inputs_list]
+        max_tokens = max(token_counts)
+        device = s_inputs_list[0].device
+        dtype = s_inputs_list[0].dtype
+
+        N_step = int(self.configs.sample_diffusion["N_step"])
+        noise_schedule = self.inference_noise_scheduler(
+            N_step=N_step, device=device, dtype=dtype
+        )
+        c_tau_last_schedule = noise_schedule[:-1]
+        c_tau_schedule = noise_schedule[1:]
+        gamma0 = float(self.configs.sample_diffusion["gamma0"])
+        gamma_min = float(self.configs.sample_diffusion["gamma_min"])
+        noise_scale_lambda = float(self.configs.sample_diffusion["noise_scale_lambda"])
+        step_scale_eta = float(self.configs.sample_diffusion["step_scale_eta"])
+        gamma_schedule = torch.where(
+            c_tau_schedule > gamma_min,
+            torch.full_like(c_tau_schedule, gamma0),
+            torch.zeros_like(c_tau_schedule),
+        )
+        t_hat_schedule = c_tau_last_schedule * (gamma_schedule + 1)
+        noise_scale_schedule = noise_scale_lambda * torch.sqrt(
+            t_hat_schedule**2 - c_tau_last_schedule**2
+        )
+
+        _sync_cuda_for_timing(sync_timings)
+        step_start = time.time()
+        caches = [
+            self._prepare_diffusion_cache(feature_dict, z_i)
+            for feature_dict, z_i in zip(input_feature_dicts, z_list)
+        ]
+        x_list = [
+            noise_schedule[0]
+            * torch.randn(
+                (1, feature_dict["atom_to_token_idx"].size(-1), 3),
+                device=device,
+                dtype=dtype,
+            )
+            for feature_dict in input_feature_dicts
+        ]
+
+        if hasattr(dm, "reset_perf_stats"):
+            dm.reset_perf_stats()
+
+        for c_tau, t_hat_scalar, noise_scale in zip(
+            c_tau_schedule, t_hat_schedule, noise_scale_schedule
+        ):
+            a_tokens = []
+            s_singles = []
+            z_pairs = []
+            decoder_inputs = []
+
+            for batch_idx, feature_dict in enumerate(input_feature_dicts):
+                x_l = (
+                    centre_random_augmentation(x_input_coords=x_list[batch_idx], N_sample=1)
+                    .squeeze(dim=-3)
+                    .to(dtype)
+                )
+                x_noisy = x_l + noise_scale * torch.randn(
+                    size=x_l.shape, device=device, dtype=dtype
+                )
+                t_hat = t_hat_scalar.reshape(1).to(dtype)
+
+                # EDM input scaling is cheap, but keep the same named timing
+                # range as DiffusionModule.forward so profile summaries compare.
+                with dm._profile_block("input_scale"):
+                    r_noisy = (
+                        x_noisy
+                        / torch.sqrt(dm.sigma_data**2 + t_hat**2)[..., None, None]
+                    )
+
+                cache = caches[batch_idx]
+                with dm._profile_block("conditioning"), torch.profiler.record_function(
+                    "protenix/batched_token_diffusion_conditioning"
+                ):
+                    s_single, z_pair = dm.diffusion_conditioning(
+                        t_hat_noise_level=t_hat,
+                        relp_feature=feature_dict["relp"],
+                        s_inputs=s_inputs_list[batch_idx],
+                        s_trunk=s_list[batch_idx],
+                        z_trunk=None if cache["pair_z"] is not None else z_list[batch_idx],
+                        pair_z=cache["pair_z"],
+                        inplace_safe=inplace_safe,
+                        use_conditioning=True,
+                    )
+
+                with dm._profile_block("atom_encoder"), torch.profiler.record_function(
+                    "protenix/batched_token_atom_attention_encoder"
+                ):
+                    with dm._atom_attention_autocast():
+                        a_token, q_skip, c_skip, p_skip = dm.atom_attention_encoder(
+                            feature_dict["atom_to_token_idx"],
+                            feature_dict["ref_pos"],
+                            feature_dict["ref_charge"],
+                            feature_dict["ref_mask"],
+                            feature_dict["ref_atom_name_chars"],
+                            feature_dict["ref_element"],
+                            feature_dict["d_lm"],
+                            feature_dict["v_lm"],
+                            feature_dict["pad_info"],
+                            r_l=r_noisy,
+                            s=s_list[batch_idx].unsqueeze(dim=-3),
+                            z=z_pair.unsqueeze(dim=-4),
+                            p_lm=cache["p_lm/c_l"][0],
+                            c_l=cache["p_lm/c_l"][1],
+                            inplace_safe=inplace_safe,
+                            chunk_size=chunk_size,
+                        )
+
+                transformer_dtype = dm._diffusion_core_dtype(a_token.dtype)
+                a_token = a_token.to(dtype=transformer_dtype)
+                if inplace_safe:
+                    a_token += dm.linear_no_bias_s(dm.layernorm_s(s_single))
+                else:
+                    a_token = a_token + dm.linear_no_bias_s(dm.layernorm_s(s_single))
+                s_single_transformer = s_single.to(dtype=transformer_dtype)
+
+                if self.enable_efficient_fusion:
+                    z_pair_for_transformer = dm.normalize(
+                        z_pair.to(dtype=transformer_dtype)
+                    )
+                    z_pair_for_transformer = permute_final_dims(
+                        z_pair_for_transformer, [2, 0, 1]
+                    ).contiguous()
+                else:
+                    z_pair_for_transformer = z_pair.to(dtype=transformer_dtype)
+
+                a_tokens.append(a_token.squeeze(dim=-3))
+                s_singles.append(s_single_transformer.squeeze(dim=-3))
+                z_pairs.append(z_pair_for_transformer)
+                decoder_inputs.append((batch_idx, x_noisy, t_hat, q_skip, c_skip, p_skip))
+
+            token_mask = _make_token_mask(token_counts, max_tokens, device)
+            a_batch = _stack_padded_token_vectors(a_tokens, max_tokens)
+            s_batch = _stack_padded_token_vectors(s_singles, max_tokens)
+            z_batch = _stack_padded_token_pairs(
+                z_pairs,
+                max_tokens=max_tokens,
+                channel_first=self.enable_efficient_fusion,
+            )
+
+            with dm._profile_block("transformer"), torch.profiler.record_function(
+                "protenix/batched_token_diffusion_transformer"
+            ):
+                with dm._diffusion_core_autocast():
+                    a_batch = dm.diffusion_transformer(
+                        a=a_batch,
+                        s=s_batch,
+                        z=z_batch,
+                        inplace_safe=inplace_safe,
+                        chunk_size=chunk_size,
+                        enable_efficient_fusion=self.enable_efficient_fusion,
+                        token_mask=token_mask,
+                    )
+            if a_batch.dtype != torch.float32:
+                a_batch = a_batch.to(dtype=torch.float32)
+
+            for out_idx, (
+                batch_idx,
+                x_noisy,
+                t_hat,
+                q_skip,
+                c_skip,
+                p_skip,
+            ) in enumerate(decoder_inputs):
+                n_token = token_counts[batch_idx]
+                a_token = dm.layernorm_a(a_batch[out_idx, :n_token].unsqueeze(dim=-3))
+
+                with dm._profile_block("atom_decoder"), torch.profiler.record_function(
+                    "protenix/batched_token_atom_attention_decoder"
+                ):
+                    with dm._atom_attention_autocast():
+                        r_update = dm.atom_attention_decoder(
+                            atom_to_token_idx=input_feature_dicts[batch_idx][
+                                "atom_to_token_idx"
+                            ],
+                            a=a_token,
+                            q_skip=q_skip,
+                            c_skip=c_skip,
+                            p_skip=p_skip,
+                            inplace_safe=inplace_safe,
+                            chunk_size=chunk_size,
+                        )
+
+                with dm._profile_block("output_rescale"):
+                    s_ratio = (t_hat / dm.sigma_data)[..., None, None].to(
+                        r_update.dtype
+                    )
+                    x_denoised = (
+                        1 / (1 + s_ratio**2) * x_noisy
+                        + t_hat[..., None, None]
+                        / torch.sqrt(1 + s_ratio**2)
+                        * r_update
+                    ).to(r_update.dtype)
+
+                delta = (x_noisy - x_denoised) / t_hat[..., None, None]
+                dt = c_tau - t_hat
+                x_list[batch_idx] = (
+                    x_noisy + step_scale_eta * dt[..., None, None] * delta
+                )
+
+        _sync_cuda_for_timing(sync_timings)
+        time_tracker: dict[str, Any] = {"diffusion": time.time() - step_start}
+        if hasattr(dm, "consume_perf_stats"):
+            time_tracker.update(dm.consume_perf_stats())
+        return x_list, time_tracker
+
     def finish_inference_from_pairformer(
         self,
         input_feature_dict: dict[str, Any],
@@ -634,6 +982,8 @@ class Protenix(nn.Module):
         symmetric_permutation: SymmetricPermutation = None,
         step_st: Optional[float] = None,
         pairformer_sec: Optional[float] = None,
+        precomputed_coordinate: Optional[torch.Tensor] = None,
+        precomputed_diffusion_time: Optional[dict[str, Any]] = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
         """Finish inference after the token trunk has produced ``s`` and ``z``.
 
@@ -671,62 +1021,45 @@ class Protenix(nn.Module):
             step_trunk - step_st if pairformer_sec is None else pairformer_sec
         )
         time_tracker.update({"pairformer": pairformer_time})
-        # Sample diffusion
-        # [..., N_sample, N_atom, 3]
-        N_sample = self.configs.sample_diffusion["N_sample"]
-        N_step = self.configs.sample_diffusion["N_step"]
+        if precomputed_coordinate is None:
+            # Sample diffusion
+            # [..., N_sample, N_atom, 3]
+            N_sample = self.configs.sample_diffusion["N_sample"]
+            N_step = self.configs.sample_diffusion["N_step"]
 
-        noise_schedule = self.inference_noise_scheduler(
-            N_step=N_step, device=s_inputs.device, dtype=s_inputs.dtype
-        )
-        cache = dict()
-        if self.enable_diffusion_shared_vars_cache:
-            # line 1-5 of algorithm 21 calculate z in diffusion conditioning
-            cache["pair_z"] = autocasting_disable_decorator(
-                self.configs.skip_amp.sample_diffusion
-            )(self.diffusion_module.diffusion_conditioning.prepare_cache)(
-                input_feature_dict["relp"], z, False
+            noise_schedule = self.inference_noise_scheduler(
+                N_step=N_step, device=s_inputs.device, dtype=s_inputs.dtype
             )
-            cache["p_lm/c_l"] = autocasting_disable_decorator(
-                self.configs.skip_amp.sample_diffusion
-            )(self.diffusion_module.atom_attention_encoder.prepare_cache)(
-                ref_pos=input_feature_dict["ref_pos"],
-                ref_charge=input_feature_dict["ref_charge"],
-                ref_mask=input_feature_dict["ref_mask"],
-                ref_element=input_feature_dict["ref_element"],
-                ref_atom_name_chars=input_feature_dict["ref_atom_name_chars"],
-                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
-                d_lm=input_feature_dict["d_lm"],
-                v_lm=input_feature_dict["v_lm"],
-                pad_info=input_feature_dict["pad_info"],
-                r_l=True,
-                z=cache["pair_z"],
-                inplace_safe=False,
+            cache = self._prepare_diffusion_cache(input_feature_dict, z)
+            if hasattr(self.diffusion_module, "reset_perf_stats"):
+                self.diffusion_module.reset_perf_stats()
+            pred_dict["coordinate"] = self.sample_diffusion(
+                denoise_net=self.diffusion_module,
+                input_feature_dict=input_feature_dict,
+                s_inputs=s_inputs,
+                s_trunk=s,
+                z_trunk=None if cache["pair_z"] is not None else z,
+                pair_z=cache["pair_z"],
+                p_lm=cache["p_lm/c_l"][0],
+                c_l=cache["p_lm/c_l"][1],
+                N_sample=N_sample,
+                noise_schedule=noise_schedule,
+                inplace_safe=inplace_safe,
+                enable_efficient_fusion=self.enable_efficient_fusion,
             )
         else:
-            cache["pair_z"] = None
-            cache["p_lm/c_l"] = [None, None]
-        if hasattr(self.diffusion_module, "reset_perf_stats"):
-            self.diffusion_module.reset_perf_stats()
-        pred_dict["coordinate"] = self.sample_diffusion(
-            denoise_net=self.diffusion_module,
-            input_feature_dict=input_feature_dict,
-            s_inputs=s_inputs,
-            s_trunk=s,
-            z_trunk=None if cache["pair_z"] is not None else z,
-            pair_z=cache["pair_z"],
-            p_lm=cache["p_lm/c_l"][0],
-            c_l=cache["p_lm/c_l"][1],
-            N_sample=N_sample,
-            noise_schedule=noise_schedule,
-            inplace_safe=inplace_safe,
-            enable_efficient_fusion=self.enable_efficient_fusion,
-        )
+            pred_dict["coordinate"] = precomputed_coordinate
 
         _sync_cuda_for_timing(sync_timings)
         step_diffusion = time.time()
-        time_tracker.update({"diffusion": step_diffusion - step_trunk})
-        if hasattr(self.diffusion_module, "consume_perf_stats"):
+        if precomputed_diffusion_time is None:
+            time_tracker.update({"diffusion": step_diffusion - step_trunk})
+        else:
+            time_tracker.update(precomputed_diffusion_time)
+        if (
+            precomputed_diffusion_time is None
+            and hasattr(self.diffusion_module, "consume_perf_stats")
+        ):
             time_tracker.update(self.diffusion_module.consume_perf_stats())
 
         # Distogram logits: log contact_probs only, to reduce the dimension
@@ -774,14 +1107,23 @@ class Protenix(nn.Module):
             confidence_head_time = stream_timing["confidence_head"]
             summary_time = stream_timing["summary_confidence"]
             contact_time = time_tracker["contact_probs"]
+            model_forward_time = step_contact_probs - step_st + confidence_head_time
+            model_forward_with_summary = step_summary - step_st
+            if precomputed_diffusion_time is not None:
+                model_forward_time = (
+                    time_tracker["pairformer"]
+                    + time_tracker["diffusion"]
+                    + contact_time
+                    + confidence_head_time
+                )
+                model_forward_with_summary = model_forward_time + summary_time
             time_tracker.update(
                 {
                     "confidence_head": confidence_head_time,
                     "confidence": contact_time + confidence_head_time,
-                    "model_forward": step_contact_probs - step_st
-                    + confidence_head_time,
+                    "model_forward": model_forward_time,
                     "summary_confidence": summary_time,
-                    "model_forward_with_summary": step_summary - step_st,
+                    "model_forward_with_summary": model_forward_with_summary,
                     "confidence_summary_stream": True,
                 }
             )
@@ -808,11 +1150,19 @@ class Protenix(nn.Module):
 
         _sync_cuda_for_timing(sync_timings)
         step_confidence = time.time()
+        confidence_head_time = step_confidence - step_contact_probs
+        confidence_time = step_confidence - step_diffusion
+        model_forward_time = step_confidence - step_st
+        if precomputed_diffusion_time is not None:
+            confidence_time = time_tracker["contact_probs"] + confidence_head_time
+            model_forward_time = (
+                time_tracker["pairformer"] + time_tracker["diffusion"] + confidence_time
+            )
         time_tracker.update(
             {
-                "confidence_head": step_confidence - step_contact_probs,
-                "confidence": step_confidence - step_diffusion,
-                "model_forward": step_confidence - step_st,
+                "confidence_head": confidence_head_time,
+                "confidence": confidence_time,
+                "model_forward": model_forward_time,
             }
         )
 
@@ -865,10 +1215,16 @@ class Protenix(nn.Module):
         )
         _sync_cuda_for_timing(sync_timings)
         step_summary = time.time()
+        summary_confidence_time = step_summary - step_before_summary
+        model_forward_with_summary = step_summary - step_st
+        if precomputed_diffusion_time is not None:
+            model_forward_with_summary = (
+                time_tracker["model_forward"] + summary_confidence_time
+            )
         time_tracker.update(
             {
-                "summary_confidence": step_summary - step_before_summary,
-                "model_forward_with_summary": step_summary - step_st,
+                "summary_confidence": summary_confidence_time,
+                "model_forward_with_summary": model_forward_with_summary,
             }
         )
 
