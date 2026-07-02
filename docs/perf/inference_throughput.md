@@ -207,6 +207,48 @@ The `token_pad_eff` log field is the quick health check for mixed-length
 batches.  Values near 90-100% mean most pairformer work is on real tokens;
 values much lower than that mean batches are still mixing lengths too broadly.
 
+Mixed-token full-diffusion profile: commit `fdedb00`, job `95439`
+(`runs/var_token_nstep200_profile_20260702_153834`) used 32 shuffled poly-A
+proteins spanning 40-220 tokens, `--batch_size 8`, `N_sample=1`, full
+`N_step=200`, confidence enabled, no MSA/template, and synchronized timing plus
+diffusion CUDA-event subranges.  The CLI length-sorted the campaign into four
+padded-token trunk batches:
+
+| token range | `token_pad_eff` | predict sec | pairformer | diffusion | diffusion transformer | atom encoder | atom decoder |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 40-76 | 76.3% | 48.55 | 4.69 | 42.99 | 26.39 | 7.38 | 6.53 |
+| 88-124 | 85.5% | 47.23 | 2.68 | 43.97 | 27.38 | 7.37 | 6.56 |
+| 136-172 | 89.5% | 47.63 | 2.99 | 43.78 | 27.45 | 7.24 | 6.48 |
+| 184-220 | 91.8% | 49.81 | 4.68 | 44.33 | 27.90 | 7.27 | 6.50 |
+
+Totals: predict `193.22s`, diffusion `175.07s`, diffusion transformer
+`109.11s`, atom encoder `29.26s`, atom decoder `26.07s`, pairformer `15.03s`,
+dump `0.60s`.  Warm predict throughput was only `0.166 records/s` because the
+diffusion tail still runs per record after the shared trunk.  This makes the
+next optimization boundary clear: for the many-sequence, low-sample workload,
+more pairformer fusion is no longer the main lever; batching or fusing the
+diffusion tail is.
+
+The first low-risk sub-boundary is the token-level diffusion transformer, not
+fully padded atom attention.  Fake atom padding is unsafe without an atom
+attention key mask because zero fake values still change local-attention softmax
+denominators.  Commit `4c9bad4` therefore only adds dormant token-mask plumbing
+through `DiffusionTransformer` and a hotspot screen,
+`scripts/perf/diffusion_transformer_batch_probe.py`.  Job `95448`
+(`runs/diffusion_transformer_batch_probe_20260702_154757`) compared 8 exact
+sequential transformer calls with one padded masked batch on one H100:
+
+| lengths | sequential median | padded masked batch median | isolated speedup | valid-prefix max abs diff |
+| --- | ---: | ---: | ---: | ---: |
+| 40,40,52,52,64,64,76,76 | 173.70 ms | 25.08 ms | 6.93x | 0.0033 |
+| 88,88,100,100,112,112,124,124 | 186.36 ms | 26.60 ms | 7.01x | 0.0036 |
+| 184,184,196,196,208,208,220,220 | 193.38 ms | 27.51 ms | 7.03x | 0.0034 |
+
+This isolated screen does not prove an end-to-end win, but it strongly supports
+the next implementation: keep atom encoder/decoder ragged and exact, batch only
+the token diffusion transformer inside each diffusion step, then crop back to
+each record before atom decoding.
+
 A follow-up branch tried to merge source JSONs before MSA/template preprocessing
 so preprocessing would run once for the transient campaign file instead of once
 per source file.  That cleaned up generated JSON siblings but did not materially
