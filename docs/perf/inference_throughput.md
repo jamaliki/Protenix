@@ -642,6 +642,57 @@ throughput optimization.  The safe lower-precision candidates exist, but either
 they are too small in the real path or the full lower-precision route is slower
 than the current FP32+TF32 policy.
 
+## Post-QKV kernel screens
+
+After promoting the CUEQ q/k/v layout producer, the B64/B96 pairformer block
+profile was rerun on `main` (`6962922`).  At B96/N245, one block is about
+100.1 ms.  Triangle attention remains the largest target, but the character of
+the bottleneck changed:
+
+| block subrange | B96 mean ms | block share |
+| --- | ---: | ---: |
+| starting triangle attention | 21.94 | 21.9% |
+| ending triangle attention | 21.89 | 21.9% |
+| pair transition | 20.42 | 20.4% |
+| outgoing triangle multiplication | 13.61 | 13.6% |
+| incoming triangle multiplication | 13.53 | 13.5% |
+
+Nsight Compute on one B64 starting triangle-attention module showed 34 launches.
+The remaining time is concentrated in the vendor attention path and the two
+layout/gate kernels we already exposed:
+
+| launch family | launches | total ms | interpretation |
+| --- | ---: | ---: | --- |
+| cuDNN FMHA/SDPA inside CUEQ | 1 | 6.07 | main compute kernel |
+| CUEQ/nvjet transforms | 12 | 2.78 | wrapper/layout work around cuDNN |
+| Triton q/k/v layout producer | 1 | 2.06 | 85% DRAM, near memory roof |
+| Triton gate/flatten epilogue | 1 | 0.96 | 91% DRAM |
+| LayerNorm | 1 | 0.81 | material, memory-heavy |
+| small GEMMs | 4 | 0.56 | not the bottleneck |
+
+This profile motivated an opt-in fused triangle-attention prototype on branch
+`codex/protenix-fused-triangle-attention-prototype`.  The prototype reads the
+fused qkv projection, applies the triangular key bias/mask, multiplies by the
+sigmoid gate, and writes the flattened output directly.  Small N64 start/end
+screens were numerically sane (`max_abs_error=0.00195`), but the schedule was
+not competitive:
+
+| B16/N245 screen | CUEQ default | fused Triton prototype | decision |
+| --- | ---: | ---: | --- |
+| tile 16 module forward | 4.26 ms | 6.22 ms | reject |
+| tile 32 module forward | 4.24 ms | 7.78 ms | reject |
+
+The boundary is still attractive, but the implementation needs a vendor-quality
+CuTe/CUTLASS/CUEQ extension.  A simple Triton FlashAttention-style clone creates
+too many small programs and loses the cuDNN schedule faster than it saves q/k/v
+layout and epilogue traffic.
+
+CUEQ triangle-multiplication autotuning was also screened because triangle
+multiplication is now about 27% of the B64/B96 block.  `CUEQ_TRITON_TUNING=ONDEMAND`
+improved each triangle-multiplication module by about 3%, but only moved total
+B64 block time from 65.79 ms to 65.57 ms (+0.34%).  That is below promotion
+threshold and not worth depending on a per-shape external tuning cache.
+
 ## Negative results worth remembering
 
 These failed because the real workload, not the isolated kernel, is the gate:
@@ -660,6 +711,8 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Custom Triton transition input GEMM+SiLU | synthetic +12%, but real transition input path slowed from 3.09 ms to 3.54 ms | custom GEMM screens must use real module weights/autocast; cuBLAS efficiency is the bottleneck to match |
 | Unguarded pairformer transition input fusion at B96 | failed before producing model output | the concatenated pair-transition activation is too large; keep the shape guard |
 | Custom Triton transition output GEMM+gate/residual | best tile 2.00 ms versus 1.51 ms for cuBLAS plus fused gate/residual | the output epilogue is still attractive, but only if implemented as a vendor-quality CuTe/CUTLASS epilogue |
+| Naive fused Triton triangle attention | correct at N64, but B16/N245 slowed from 4.24-4.26 ms to 6.22-7.78 ms | the right boundary still needs a vendor-quality CUEQ/CuTe schedule |
+| CUEQ triangle-multiplication ONDEMAND tuning | total B64 block +0.34%, below noise | the shipped/default schedule is close enough for this shape |
 | CUDA graph capture of the denoiser | slower in this setup | graph overhead/constraints can outweigh launch savings |
 
 The main learning point: isolated wins are hypotheses, not promotions.  A
