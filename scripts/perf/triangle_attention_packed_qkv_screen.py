@@ -97,9 +97,16 @@ def _packed_qkv_tri_attn_kernel(
             mask=key_offsets[:, None] < S,
             other=0.0,
         )
+        # TriangleAttention builds ``triangle_bias`` as [B, 1, H, I, J] and
+        # adds it to logits shaped [B, I, H, J_query, J_key].  The singleton
+        # dimension broadcasts over the fixed row ``n`` being updated, so the
+        # bias is indexed by (query, key), not by (row, key).  This is easy to
+        # get wrong because the production shapes have I == J == S.
         bias = tl.load(
-            bias_ptr + ((b * N + n) * S + key_offsets) * H + h,
-            mask=key_offsets < S,
+            bias_ptr
+            + ((b * N + offs_m[:, None]) * S + key_offsets[None, :]) * H
+            + h,
+            mask=(offs_m[:, None] < S) & (key_offsets[None, :] < S),
             other=0.0,
         ).to(tl.float32)
         key_mask = tl.load(
@@ -112,7 +119,7 @@ def _packed_qkv_tri_attn_kernel(
         )
 
         qk = tl.dot(q, tl.trans(k), input_precision=INPUT_PRECISION) * QK_SCALE
-        qk += bias[None, :] * bias_scale
+        qk += bias * bias_scale
         qk = tl.where(valid, qk, -1.0e6)
         qk = tl.where(offs_m[:, None] < S, qk, 0.0)
 
