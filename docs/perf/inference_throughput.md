@@ -708,7 +708,13 @@ sbatch scripts/perf/tokyo_transition_epilogue_hotspot.sbatch
 
 The wrapper writes a clean `$RUN_DIR/result.json` directly from the Python
 harness, so extension compile logs on stdout do not corrupt the machine-readable
-timing record.
+timing record.  The JSON also includes a small roofline sanity block under
+`problem`: GEMM FLOPs, lower-bound boundary bytes, effective GEMM TFLOP/s,
+standalone-epilogue bandwidth, removable projected store/reload bytes, and the
+ideal speedup from deleting only the current epilogue launch.  These are lower
+bounds, not replacements for Nsight Compute, but they keep the native-kernel
+gate honest: the candidate must beat the full baseline boundary, not just claim
+to remove memory traffic on paper.
 
 A candidate should only advance if this screen shows both acceptable BF16 parity
 and a win over the full baseline boundary, not merely over the elementwise

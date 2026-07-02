@@ -217,6 +217,127 @@ def max_mean_abs(
     }
 
 
+def tensor_nbytes(tensor: torch.Tensor) -> int:
+    return tensor.numel() * tensor.element_size()
+
+
+def boundary_byte_model(
+    fixture: dict[str, torch.Tensor],
+    output_bytes: int,
+) -> dict[str, int]:
+    b = fixture["b"]
+    weight = fixture["weight"]
+    gate = fixture["gate"]
+    residual = fixture["residual"]
+    projected_bytes = output_bytes
+
+    # These are lower bounds on HBM traffic, not profiler replacements.  They
+    # count each tensor once per logical boundary and intentionally ignore L2
+    # reuse, implicit autocast weight packing, and cuBLAS workspace.
+    epilogue_min_bytes = (
+        projected_bytes
+        + tensor_nbytes(gate)
+        + tensor_nbytes(residual)
+        + output_bytes
+    )
+    return {
+        "b": tensor_nbytes(b),
+        "weight_storage": tensor_nbytes(weight),
+        "gate": tensor_nbytes(gate),
+        "residual": tensor_nbytes(residual),
+        "projected": projected_bytes,
+        "output": output_bytes,
+        "baseline_boundary_min": (
+            tensor_nbytes(b)
+            + tensor_nbytes(weight)
+            + projected_bytes
+            + epilogue_min_bytes
+        ),
+        "fused_boundary_min": (
+            tensor_nbytes(b)
+            + tensor_nbytes(weight)
+            + tensor_nbytes(gate)
+            + tensor_nbytes(residual)
+            + output_bytes
+        ),
+        "standalone_epilogue_min": epilogue_min_bytes,
+        "projected_store_reload_removable": 2 * projected_bytes,
+    }
+
+
+def rate_metrics(
+    *,
+    gemm_flops: int,
+    byte_model: dict[str, int],
+    baseline_ms: float,
+    subranges: dict[str, float],
+) -> dict[str, Any]:
+    rates: dict[str, Any] = {}
+    gemm_ms = subranges.get("output_projection_gemm")
+    epilogue_ms = subranges.get("sigmoid_mul_add_epilogue")
+    if gemm_ms and gemm_ms > 0:
+        rates["gemm_effective_tflops"] = gemm_flops / (gemm_ms * 1e9)
+    if epilogue_ms and epilogue_ms > 0:
+        rates["epilogue_effective_bandwidth_tb_s"] = (
+            byte_model["standalone_epilogue_min"] / (epilogue_ms * 1e9)
+        )
+        rates["ideal_delete_epilogue_launch"] = {
+            "ms": baseline_ms - epilogue_ms,
+            "speedup": baseline_ms / max(baseline_ms - epilogue_ms, 1e-9),
+        }
+    if baseline_ms > 0:
+        rates["boundary_effective_tflops"] = gemm_flops / (baseline_ms * 1e9)
+        rates["boundary_effective_bandwidth_tb_s_lower_bound"] = (
+            byte_model["baseline_boundary_min"] / (baseline_ms * 1e9)
+        )
+    return rates
+
+
+def problem_metrics(
+    fixture: dict[str, torch.Tensor],
+    reference: torch.Tensor,
+    baseline_ms: float,
+    subranges: dict[str, float],
+) -> dict[str, Any]:
+    b = fixture["b"]
+    weight = fixture["weight"]
+    gate = fixture["gate"]
+    residual = fixture["residual"]
+    samples, tokens, hidden = b.shape
+    output_channels = weight.shape[0]
+    rows = samples * tokens
+    output_elements = rows * output_channels
+    output_bytes = output_elements * reference.element_size()
+    gemm_flops = 2 * rows * output_channels * hidden
+    byte_model = boundary_byte_model(fixture, output_bytes)
+
+    return {
+        "shape": {
+            "m_rows": rows,
+            "n_output": output_channels,
+            "k_hidden": hidden,
+            "samples": samples,
+            "tokens": tokens,
+            "gate_batch": gate.shape[0],
+        },
+        "dtypes": {
+            "b": str(b.dtype),
+            "weight_storage": str(weight.dtype),
+            "gate": str(gate.dtype),
+            "residual": str(residual.dtype),
+            "output": str(reference.dtype),
+        },
+        "gemm_flops": gemm_flops,
+        "bytes_lower_bound": byte_model,
+        **rate_metrics(
+            gemm_flops=gemm_flops,
+            byte_model=byte_model,
+            baseline_ms=baseline_ms,
+            subranges=subranges,
+        ),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples", type=int, default=1280)
@@ -284,6 +405,7 @@ def main() -> None:
         },
         "candidate": candidate_row,
         "device": torch.cuda.get_device_name(),
+        "problem": problem_metrics(fixture, reference, baseline_ms, subranges),
         "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
         "peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
         "torch": {"version": torch.__version__, "cuda": torch.version.cuda},
