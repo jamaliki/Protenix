@@ -1177,6 +1177,9 @@ class Protenix(nn.Module):
 
             token_mask = _make_token_mask(token_counts, max_tokens, device)
             if z_pair_padded is not None:
+                # Batched conditioning has already produced one padded
+                # [B, N, N, C] pair tensor.  Reusing it avoids a redundant
+                # slice/list/restack cycle on every diffusion step.
                 if self.enable_efficient_fusion:
                     z_batch = permute_final_dims(
                         dm.normalize(z_pair_padded.to(dtype=transformer_dtype)),
@@ -1184,23 +1187,24 @@ class Protenix(nn.Module):
                     ).contiguous()
                 else:
                     z_batch = z_pair_padded.to(dtype=transformer_dtype)
-            elif self.enable_efficient_fusion:
-                z_pairs_for_transformer = [
-                    permute_final_dims(
-                        dm.normalize(z_pair.to(dtype=transformer_dtype)),
-                        [2, 0, 1],
-                    ).contiguous()
-                    for z_pair in z_pairs
-                ]
             else:
-                z_pairs_for_transformer = [
-                    z_pair.to(dtype=transformer_dtype) for z_pair in z_pairs
-                ]
-            z_batch = _stack_padded_token_pairs(
-                z_pairs_for_transformer,
-                max_tokens=max_tokens,
-                channel_first=self.enable_efficient_fusion,
-            )
+                if self.enable_efficient_fusion:
+                    z_pairs_for_transformer = [
+                        permute_final_dims(
+                            dm.normalize(z_pair.to(dtype=transformer_dtype)),
+                            [2, 0, 1],
+                        ).contiguous()
+                        for z_pair in z_pairs
+                    ]
+                else:
+                    z_pairs_for_transformer = [
+                        z_pair.to(dtype=transformer_dtype) for z_pair in z_pairs
+                    ]
+                z_batch = _stack_padded_token_pairs(
+                    z_pairs_for_transformer,
+                    max_tokens=max_tokens,
+                    channel_first=self.enable_efficient_fusion,
+                )
 
             with dm._profile_block("transformer"), torch.profiler.record_function(
                 "protenix/batched_token_diffusion_transformer"
