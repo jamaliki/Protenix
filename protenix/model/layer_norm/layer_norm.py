@@ -64,8 +64,8 @@ except ImportError:
         "on",
     }:
         warnings.warn(
-            "PROTENIX_DISABLE_FAST_LAYER_NORM=1; using "
-            "torch.nn.functional.layer_norm.",
+            "PROTENIX_DISABLE_FAST_LAYER_NORM=1; using the Triton/PyTorch "
+            "LayerNorm fallback.",
             RuntimeWarning,
         )
         fast_layer_norm_cuda_v2 = None
@@ -86,7 +86,8 @@ except ImportError:
             error_summary = str(exc).splitlines()[0] if str(exc) else repr(exc)
             warnings.warn(
                 "fast_layer_norm_cuda_v2 could not be built; falling back to "
-                f"torch.nn.functional.layer_norm. Original error: {error_summary}",
+                "the Triton/PyTorch LayerNorm fallback. Original error: "
+                f"{error_summary}",
                 RuntimeWarning,
             )
             fast_layer_norm_cuda_v2 = None

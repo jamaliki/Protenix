@@ -189,6 +189,10 @@ Directory inputs are campaign-aware in this branch:
   fusion are enabled by default when Triton is installed.  They preserve the
   high-quality GEMM/CUEQ kernels and remove measured layout-copy traffic around
   them.  If Triton is missing, the code falls back safely but runs slower.
+- When the shipped CUDA LayerNorm extension cannot build, the BF16/FP16
+  inference fallback uses a narrow Triton LayerNorm by default.  FP32,
+  training, CPU, non-contiguous tensors, and unsupported feature widths still
+  fall back to PyTorch; set `PROTENIX_TRITON_LAYER_NORM=0` to disable it.
 
 Measured one-H100 gates, `N_step=200`, confidence enabled, and normal CIF/JSON
 dumping:
@@ -199,7 +203,7 @@ dumping:
 | One combined JSON with 32 same-shape records | 361.8 s runner time | 69.3 s runner time | 5.2x after initialization |
 | 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.9 s summed predict, 0.943 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.70x predict, 5.69x throughput |
-| 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 73.3 s, 2.18 generated samples/s at `--batch_size 16` with flattened sample lanes and BF16 full attention | 2.90x over the old branch boundary |
+| 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 58.3 s, 2.74 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, and Triton LayerNorm fallback | 3.64x over the old branch boundary |
 
 Quick sanity check: a good campaign run should log messages like
 `Predicting 32 same-shape (auto) input(s)` or
@@ -263,6 +267,9 @@ configuration measured about `9.18-9.21` samples/sec per GPU at
 - Keep `-d bf16`, `--trimul_kernel cuequivariance`,
   `--triatt_kernel cuequivariance`, `--enable_cache true`,
   `--enable_fusion true`, and `--enable_tf32 true` unless you are debugging.
+- Leave the LayerNorm policy at its default `auto` setting for BF16/FP16
+  inference.  It uses Triton only when the faster C++ extension is unavailable
+  and only for the low-precision path that moved the end-to-end H100 gate.
 - Throughput comes from filling the GPU.  For campaign inference, prioritize
   length-sorted compatible trunk batches over more Python processes; `auto` will
   still use the faster full-model batch when atom shapes happen to match exactly.

@@ -538,7 +538,9 @@ a clean absolute comparison to older fast-layernorm runs.
    `PROTENIX_ATTENTION_FORCE_FP32=0` and
    `PROTENIX_RANK5_FULL_ATTENTION_BF16=1`.
 
-Results parsed with `scripts/perf/parse_batch_gate_log.py --samples-per-input 5`:
+Results from the sample-axis gate, parsed with
+`scripts/perf/parse_batch_gate_log.py --samples-per-input 5`, plus the later
+promoted LayerNorm gate:
 
 | case | predict sec | input records/s | generated samples/s | pairformer | diffusion | diffusion transformer | confidence | decision |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
@@ -546,6 +548,7 @@ Results parsed with `scripts/perf/parse_batch_gate_log.py --samples-per-input 5`
 | flat sample lanes, FP32 attention | 76.81 | 0.417 | 2.083 | 23.44 | 43.49 | 26.59 | 8.32 | promoted mechanism |
 | flat sample lanes, BF16 attention | 73.34 | 0.436 | 2.182 | 21.88 | 39.99 | 23.14 | 9.94 | best robust setting |
 | explicit sample axis, BF16 attention | 72.50 | 0.441 | 2.207 | 22.07 | 44.26 | 27.45 | 4.58 | not promoted beyond opt-in |
+| flat sample lanes, BF16 attention, Triton LayerNorm fallback | 58.34 | 0.549 | 2.743 | 16.45 | 37.15 | - | 2.50 | promoted low-precision fallback |
 
 The large, trustworthy movement is the flattened low-sample diffusion boundary:
 `212.51s -> 73.34s` predict (`2.90x`) and `0.753 -> 2.182` generated samples/s
@@ -559,6 +562,21 @@ movement is dominated by noisier confidence/pairformer differences.  Keep
 `PROTENIX_RANK5_FULL_ATTENTION_BF16=1` as diagnostic opt-ins until a custom
 attention/bias kernel beats the flattened BF16 boundary on the transformer
 itself.
+
+The next representative promotion was the Triton LayerNorm fallback.  The final
+`N_sample=5`, `N_step=200`, batch-16 gate was job `96155`
+(`runs/layer_norm_model_gate_n200_20260702_225403_f95fc13`) on one H100 with
+the same 32 mixed 40-220-token input.  Within the same job, forcing the fallback
+off gave `76.17s` predict and `2.101` generated samples/s, while forcing it on
+gave `58.34s` predict and `2.743` generated samples/s.  Relative to the old
+low-sample boundary this moves the practical mixed-sequence `N_sample=5`
+throughput from `0.753` to `2.743` generated samples/s (`3.64x`).  The movement
+was concentrated where expected: pairformer fell `24.25s -> 16.45s`,
+confidence fell `9.42s -> 2.50s`, and diffusion moved more modestly
+`41.06s -> 37.15s`.  The implementation therefore defaults Triton LayerNorm on
+only for FP16/BF16 no-grad CUDA inference when the C++ fast LayerNorm extension
+is unavailable; FP32 stays opt-in because several FP32 isolated shapes were
+slower.
 
 Launch-level follow-up: job `96110`
 (`runs/flat_bf16_batch_profile_20260702_221601_c8a532d`) proved the profiler
@@ -581,16 +599,19 @@ Top raw CUDA kernel classes in that short trace:
 | direct copy/cast kernel | 1099.9 | 35924 | 30.6 | more small traffic rather than one obvious math kernel |
 | fused gated dual-GEMM epilogue kernel | 1042.3 | 5760 | 181.0 | existing CUEQ-adjacent fused path is still material |
 
-Decision: the next kernel experiment should not replace CUEQ wholesale.  The
-first bottleneck-backed candidate is a narrow inference-only Triton LayerNorm
+Decision: do not replace CUEQ wholesale from this trace.  The first
+bottleneck-backed candidate was a narrow inference-only Triton LayerNorm
 fallback for the case where the shipped CUDA LayerNorm extension cannot compile.
-Commits `3b3629e` and `9437b62` add this behind
-`PROTENIX_TRITON_LAYER_NORM=1`, with safe fallbacks for training, CPU, missing
-Triton, non-contiguous tensors, and unsupported feature dimensions.  Main-queue
-job `96127` had an estimated start on July 4 and was cancelled; canary job
-`96143` is queued after the active `gpu-canary` allocation to run CUDA parity
-plus `scripts/perf/layer_norm_hotspot.py`.  Promote nothing until that hotspot
-and a paired model-level gate move samples/sec.
+Canary job `96143`
+(`runs/layer_norm_hotspot_20260702_224156_3b3629e`) showed mixed isolated
+microbenchmarks: BF16 large-row cases won up to `1.32x`, while some FP32 cases
+regressed.  Short model gate `96151`
+(`runs/layer_norm_model_gate_n20_20260702_225032_f95fc13`) then showed
+`40.09s -> 26.23s` predict (`1.53x`) for the N20 version of the mixed campaign.
+Representative N200 gate `96155` confirmed the end-to-end win above.  The
+candidate is promoted as an automatic BF16/FP16 inference fallback, with
+training, CPU, missing Triton, non-contiguous tensors, unsupported feature
+dimensions, and default FP32 all falling back to PyTorch.
 
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`
@@ -1786,11 +1807,13 @@ Production code touched by the throughput stack:
   Triton gate kernels with PyTorch fallbacks, including the 64-bit-indexed
   split-aware `silu(first_half) * second_half` consumer for concatenated
   transition projections.
-- `protenix/model/layer_norm/layer_norm.py`: dispatches to the experimental
-  Triton LayerNorm fallback only when the C++ fast LayerNorm extension is
-  unavailable and `PROTENIX_TRITON_LAYER_NORM=1`.
-- `protenix/model/layer_norm/layer_norm_triton.py`: opt-in inference-only
-  Triton LayerNorm screen target with conservative fallback guards.
+- `protenix/model/layer_norm/layer_norm.py`: dispatches to the Triton/PyTorch
+  LayerNorm fallback when the C++ fast LayerNorm extension is unavailable.
+- `protenix/model/layer_norm/layer_norm_triton.py`: low-precision
+  inference-only Triton LayerNorm fallback with conservative guards.  It is
+  automatic for FP16/BF16 no-grad CUDA tensors, opt-in for FP32 with
+  `PROTENIX_TRITON_LAYER_NORM=1`, and disabled with
+  `PROTENIX_TRITON_LAYER_NORM=0`.
 - `protenix/model/triangular/qkv_layout_triton.py`: inference-only CUEQ q/k/v
   layout producer for triangle attention; keeps the fused projection GEMM and
   CUEQ attention kernel unchanged while removing hidden contiguous-copy traffic.
@@ -1825,8 +1848,8 @@ Profiling and reproducibility helpers:
 - `scripts/perf/confidence_head_hotspot.py`: confidence pairformer screen.
 - `scripts/perf/confidence_precision_screen.py`: confidence precision/parity
   screen with real checkpoint weights and matmul dtype tracing.
-- `scripts/perf/layer_norm_hotspot.py`: isolated H100 screen for the opt-in
-  Triton LayerNorm candidate versus the current PyTorch fallback.
+- `scripts/perf/layer_norm_hotspot.py`: isolated H100 screen for the Triton
+  LayerNorm fallback versus the PyTorch fallback.
 - `scripts/perf/trace_aggregate.py`: compact profiler trace summarizer.
 
 ## If continuing from here
@@ -1834,9 +1857,9 @@ Profiling and reproducibility helpers:
 Do not expect another large gain from config changes.  The next proper
 same-output campaign should be one of:
 
-1. finish the queued Triton LayerNorm hotspot (`96143`) and, if it wins, run a
-   paired `N_sample=5`, `N_step=20`/`200` model gate with
-   `PROTENIX_TRITON_LAYER_NORM=0/1`;
+1. profile the post-LayerNorm default on the representative mixed
+   `N_sample=5`, `N_step=20` path and compare the new top kernels against the
+   pre-LayerNorm trace; LayerNorm should no longer be the largest class;
 2. a deliberate atom/trunk kernel-layout rewrite, especially around producers
    feeding attention kernels;
 3. a confidence-pairformer precision/tiling campaign with explicit numerical

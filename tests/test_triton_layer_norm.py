@@ -14,6 +14,7 @@ from protenix.model.layer_norm.layer_norm import FusedLayerNorm
 from protenix.model.layer_norm.layer_norm_triton import (
     triton_layer_norm,
     triton_layer_norm_available,
+    triton_layer_norm_enabled,
 )
 
 
@@ -27,6 +28,18 @@ class TestTritonLayerNorm(unittest.TestCase):
         x = torch.randn(2, 4)
         with mock.patch.dict(os.environ, {"PROTENIX_TRITON_LAYER_NORM": "1"}):
             self.assertIsNone(triton_layer_norm(x, torch.Size([4]), None, None, 1e-5))
+
+    def test_auto_policy_defaults_to_low_precision_only(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(triton_layer_norm_enabled(torch.bfloat16))
+            self.assertTrue(triton_layer_norm_enabled(torch.float16))
+            self.assertFalse(triton_layer_norm_enabled(torch.float32))
+
+        with mock.patch.dict(os.environ, {"PROTENIX_TRITON_LAYER_NORM": "1"}):
+            self.assertTrue(triton_layer_norm_enabled(torch.float32))
+
+        with mock.patch.dict(os.environ, {"PROTENIX_TRITON_LAYER_NORM": "0"}):
+            self.assertFalse(triton_layer_norm_enabled(torch.bfloat16))
 
     @unittest.skipUnless(
         torch.cuda.is_available() and triton_layer_norm_available(),
@@ -80,13 +93,12 @@ class TestTritonLayerNorm(unittest.TestCase):
         torch.cuda.is_available() and triton_layer_norm_available(),
         "CUDA + Triton required",
     )
-    def test_fused_layer_norm_uses_triton_in_inference(self):
+    def test_fused_layer_norm_uses_triton_by_default_for_bf16_inference(self):
         torch.manual_seed(11)
         module = FusedLayerNorm(128).cuda()
         x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
         with mock.patch("protenix.model.layer_norm.layer_norm.fast_layer_norm_cuda_v2", None):
-            env = {"PROTENIX_TRITON_LAYER_NORM": "1"}
-            with mock.patch.dict(os.environ, env):
+            with mock.patch.dict(os.environ, {}, clear=True):
                 with torch.no_grad():
                     actual = module(x)
                     expected = F.layer_norm(

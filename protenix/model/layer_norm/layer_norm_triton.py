@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Opt-in Triton LayerNorm for inference-only GPU profiling.
+"""Triton LayerNorm fallback for low-precision inference.
 
 The built-in CUDA LayerNorm extension is fastest when it builds, but current
 Tokyo profiling runs use PyTorch's generic ``native_layer_norm`` fallback
@@ -22,10 +22,9 @@ launches near the top of the trace.
 
 This file is deliberately narrow: it implements only forward inference for a
 contiguous tensor normalized over its last dimension.  Training, CPU, missing
-Triton, non-contiguous inputs, and large/unprofiled feature dimensions all fall
-back to PyTorch.  That keeps the model semantics safe while letting us test
-whether a shape-specialized kernel removes enough launch and memory traffic to
-matter end to end.
+Triton, non-contiguous inputs, FP32-by-default, and large/unprofiled feature
+dimensions all fall back to PyTorch.  That keeps the model semantics safe while
+using the representative H100 speedup for the BF16/FP16 inference path.
 """
 
 from __future__ import annotations
@@ -44,21 +43,28 @@ except ImportError:  # pragma: no cover - Triton is optional for CPU installs.
 
 
 _FALSE_ENV_VALUES = {"0", "false", "off", "no"}
+_AUTO_ENV_VALUES = {"", "auto", "default"}
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
+_DEFAULT_DTYPES = {torch.float16, torch.bfloat16}
 _DEFAULT_MAX_COLS = 2048
 
 
-def _env_flag_enabled(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
+def triton_layer_norm_enabled(dtype: torch.dtype) -> bool:
+    """Return whether the Triton LayerNorm path is enabled for ``dtype``.
+
+    ``PROTENIX_TRITON_LAYER_NORM`` is intentionally a three-state switch:
+
+    - unset/``auto``: use Triton only for FP16/BF16 inference, where the model
+      gates showed a representative speedup and the FP32 microbenchmarks did
+      not show reliable wins;
+    - false values such as ``0``/``off``: disable the candidate completely;
+    - any other value, including ``1``: force it for every supported dtype.
+    """
+
+    value = os.getenv("PROTENIX_TRITON_LAYER_NORM")
+    if value is None or value.lower() in _AUTO_ENV_VALUES:
+        return dtype in _DEFAULT_DTYPES
     return value.lower() not in _FALSE_ENV_VALUES
-
-
-def triton_layer_norm_enabled() -> bool:
-    """Return whether the experimental Triton LayerNorm path is requested."""
-
-    return _env_flag_enabled("PROTENIX_TRITON_LAYER_NORM", default=False)
 
 
 def triton_layer_norm_available() -> bool:
@@ -130,8 +136,6 @@ def triton_layer_norm(
     erase the exact traffic win this kernel is meant to measure.
     """
 
-    if not triton_layer_norm_enabled():
-        return None
     if not triton_layer_norm_available():
         return None
     if torch.is_grad_enabled():
@@ -139,6 +143,8 @@ def triton_layer_norm(
     if len(normalized_shape) != 1:
         return None
     if input.dtype not in _SUPPORTED_DTYPES:
+        return None
+    if not triton_layer_norm_enabled(input.dtype):
         return None
     if not input.is_cuda or not input.is_contiguous():
         return None
