@@ -334,8 +334,12 @@ class Transition(nn.Module):
             x = x.reshape(-1, dim_size)
             chunk_num = 1 if size < 3200 else 8
             chunks = torch.chunk(x, chunk_num, dim=-2)
-            outputs = torch.empty(
-                (x.shape[0], self.c_in), dtype=x.dtype, device=x.device
+            outputs = (
+                None
+                if chunk_num == 1
+                else torch.empty(
+                    (x.shape[0], self.c_in), dtype=x.dtype, device=x.device
+                )
             )
             start = 0
             for chunk in chunks:
@@ -347,9 +351,17 @@ class Transition(nn.Module):
                 b *= a
                 del a
                 b = self.linear_no_bias(b)
+                if outputs is None:
+                    # Most inference shapes, including B64/N245 pairformer,
+                    # use a single chunk.  Returning the projection directly
+                    # avoids copying a full activation into an identical-sized
+                    # staging buffer before the caller consumes it.
+                    outputs = b
+                    break
                 outputs[start : start + b.shape[0]] = b
                 start += b.shape[0]
                 del b
+            assert outputs is not None
             outputs = outputs.reshape(*other_dims, self.c_in)
             return outputs
 
