@@ -35,13 +35,30 @@ class TestCampaignJsonBatching(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             first = os.path.join(tmpdir, "b.json")
             second = os.path.join(tmpdir, "a.json")
+            source = os.path.join(tmpdir, "source.json")
+            generated_msa = os.path.join(tmpdir, "source-update-msa.json")
+            generated_template = os.path.join(tmpdir, "source-final-updated.json")
+            standalone_generated = os.path.join(tmpdir, "only-update-msa.json")
             ignored = os.path.join(tmpdir, "notes.txt")
             _write_json(first, [{"name": "b", "sequences": []}])
             _write_json(second, [{"name": "a", "sequences": []}])
+            _write_json(source, [{"name": "source", "sequences": []}])
+            _write_json(generated_msa, [{"name": "source-msa", "sequences": []}])
+            _write_json(
+                generated_template,
+                [{"name": "source-template", "sequences": []}],
+            )
+            _write_json(
+                standalone_generated,
+                [{"name": "standalone", "sequences": []}],
+            )
             with open(ignored, "w", encoding="utf-8") as f:
                 f.write("not json")
 
-            self.assertEqual(resolve_inference_jsons(tmpdir), [second, first])
+            self.assertEqual(
+                resolve_inference_jsons(tmpdir),
+                [second, first, standalone_generated, source],
+            )
 
     def test_seed_grouping_preserves_json_seed_policy(self):
         with tempfile.TemporaryDirectory() as tmpdir:

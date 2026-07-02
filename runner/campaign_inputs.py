@@ -30,12 +30,33 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+_GENERATED_JSON_SUFFIXES = ("-update-msa", "-final-updated")
+
+
+def _has_source_json(path: Path, all_jsons: set[Path]) -> bool:
+    """Return true when ``path`` is a generated preprocessing sibling.
+
+    MSA/template preprocessing writes files such as ``foo-update-msa.json`` next
+    to ``foo.json``.  Directory campaigns should not infer both, otherwise a
+    rerun or paired benchmark silently duplicates work.  If the generated file
+    is the only JSON present, keep it: users may intentionally point a directory
+    at preprocessed inputs.
+    """
+    for suffix in _GENERATED_JSON_SUFFIXES:
+        if path.stem.endswith(suffix):
+            source = path.with_name(f"{path.stem[: -len(suffix)]}{path.suffix}")
+            return source in all_jsons
+    return False
+
 
 def resolve_inference_jsons(json_file: str) -> list[str]:
     """Resolve a JSON file or directory into a deterministic list of JSON files."""
     path = Path(json_file)
     if path.is_dir():
-        jsons = sorted(str(file) for file in path.rglob("*.json") if file.is_file())
+        all_jsons = {file for file in path.rglob("*.json") if file.is_file()}
+        jsons = sorted(
+            str(file) for file in all_jsons if not _has_source_json(file, all_jsons)
+        )
         if not jsons:
             raise RuntimeError(f"Can not read a valid json file in {json_file}")
         return jsons
