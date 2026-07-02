@@ -169,7 +169,9 @@ def packed_qkv_projection(module: TriangleAttention, x: torch.Tensor) -> torch.T
 def packed_forward(module: TriangleAttention, x: torch.Tensor, mask: torch.Tensor, args):
     x = module.layer_norm(x)
     qkv = packed_qkv_projection(module, x)
-    bias = module.linear(x).contiguous()
+    # Match the CUEQ path: the triangle bias is deliberately promoted to FP32
+    # before attention even when activations are BF16.
+    bias = module.linear(x).float().contiguous()
     batch, rows, cols, _ = x.shape
     out = torch.empty(
         batch,
@@ -220,6 +222,12 @@ def max_abs_error(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(finite.max().item()) if finite.numel() else float("nan")
 
 
+def mean_abs_error(a: torch.Tensor, b: torch.Tensor) -> float:
+    diff = (a.float() - b.float()).abs()
+    finite = diff[torch.isfinite(diff)]
+    return float(finite.mean().item()) if finite.numel() else float("nan")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", type=int, default=245)
@@ -265,6 +273,7 @@ def main() -> None:
         "packed_qkv_ms": packed_ms,
         "speedup_vs_cueq": cueq_ms / packed_ms,
         "max_abs_error": max_abs_error(cueq_out, packed_out),
+        "mean_abs_error": mean_abs_error(cueq_out, packed_out),
         "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
         "peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
         "torch": {"version": torch.__version__, "cuda": torch.version.cuda},
