@@ -13,7 +13,7 @@
 # limitations under the License.
 # Copyright 2021 AlQuraishi Laboratory
 
-
+import os
 from abc import ABC, abstractmethod
 from functools import partial, partialmethod
 from typing import List, Optional
@@ -23,6 +23,14 @@ import torch.nn as nn
 
 from protenix.model.triangular.layers import Attention, LayerNorm, OpenfoldLinear
 from protenix.model.utils import chunk_layer, is_fp16_enabled, permute_final_dims
+
+
+_FALSE_ENV_VALUES = {"0", "false", "off", "no"}
+
+
+def cueq_bool_mask_enabled() -> bool:
+    value = os.getenv("PROTENIX_CUEQ_BOOL_MASK", "1")
+    return value.lower() not in _FALSE_ENV_VALUES
 
 
 def kernel_triangular_mult(
@@ -684,8 +692,18 @@ class TriangleAttention(nn.Module):
         # [*, I, J, C_in]
         x = self.layer_norm(x)
 
-        # [*, I, 1, 1, J]
-        mask_bias = (self.inf * (mask - 1))[..., :, None, None, :]
+        # CUEQ consumes a boolean mask, while the PyTorch/DeepSpeed paths
+        # consume an additive attention bias.  The old CUEQ path built the
+        # additive `-inf` tensor and then immediately compared it back to bool
+        # inside Attention.forward.  At high many-sequence batches that is a
+        # large extra temporary and an extra launch per triangle-attention
+        # module, so feed CUEQ the mask in its native representation.
+        if triangle_attention == "cuequivariance" and cueq_bool_mask_enabled():
+            # [*, I, 1, 1, J]
+            mask_bias_or_bool = (mask == 1)[..., :, None, None, :]
+        else:
+            # [*, I, 1, 1, J]
+            mask_bias_or_bool = (self.inf * (mask - 1))[..., :, None, None, :]
 
         # [*, H, I, J]
         triangle_bias = permute_final_dims(self.linear(x), (2, 0, 1))
@@ -693,7 +711,7 @@ class TriangleAttention(nn.Module):
         # [*, 1, H, I, J]
         triangle_bias = triangle_bias.unsqueeze(-4)
 
-        biases = [mask_bias, triangle_bias]
+        biases = [mask_bias_or_bool, triangle_bias]
 
         if chunk_size is not None:
             x = self._chunk(

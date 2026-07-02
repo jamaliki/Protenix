@@ -530,8 +530,13 @@ class Attention(nn.Module):
             #         N to be a multiple of 8 for the forward pass; pad the sequence if necessary.
             #         Currently, this feature is supported only for cu13 builds.
             scale = 1.0 / math.sqrt(self.c_hidden)
+            mask_or_bias = biases[0]
+            if mask_or_bias.dtype == torch.bool:
+                mask = mask_or_bias
+            else:
+                mask = (mask_or_bias == 0).bool()
             o = cuequivariance_triangular_attn(
-                q, k, v, biases[1].float(), (biases[0] == 0).bool(), scale
+                q, k, v, biases[1].float(), mask, scale
             )
             # cuequivariance returns a tensor unless return_aux=True.  Indexing
             # with ``[0]`` silently drops the sequence-batch dimension for B>1,

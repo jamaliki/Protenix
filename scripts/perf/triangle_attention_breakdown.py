@@ -33,7 +33,10 @@ from protenix.model.triangular.qkv_layout_triton import (
     triton_cueq_qkv_layout_available,
     triton_cueq_qkv_layout_enabled,
 )
-from protenix.model.triangular.triangular import TriangleAttention
+from protenix.model.triangular.triangular import (
+    TriangleAttention,
+    cueq_bool_mask_enabled,
+)
 from protenix.model.utils import permute_final_dims
 
 T = TypeVar("T")
@@ -127,11 +130,18 @@ def manual_cueq_forward(
     # first builds the additive -inf mask used by the torch/deepspeed paths and
     # then compares it back to zero.  If this is material, it is a good fusion
     # or specialization boundary.
-    mask_bias = timed(
-        "mask_bias_materialize",
-        lambda: (module.inf * (mask - 1))[..., :, None, None, :],
-        events,
-    )
+    if cueq_bool_mask_enabled():
+        mask_for_attention = timed(
+            "mask_bool_direct",
+            lambda: (mask == 1)[..., :, None, None, :],
+            events,
+        )
+    else:
+        mask_bias = timed(
+            "mask_bias_materialize",
+            lambda: (module.inf * (mask - 1))[..., :, None, None, :],
+            events,
+        )
 
     triangle_bias_linear = timed(
         "triangle_bias_linear",
@@ -155,17 +165,18 @@ def manual_cueq_forward(
         lambda: triangle_bias.float(),
         events,
     )
-    mask_bool = timed(
-        "mask_bool_from_bias",
-        lambda: (mask_bias == 0).bool(),
-        events,
-    )
+    if not cueq_bool_mask_enabled():
+        mask_for_attention = timed(
+            "mask_bool_from_bias",
+            lambda: (mask_bias == 0).bool(),
+            events,
+        )
 
     scale = 1.0 / math.sqrt(module.c_hidden)
     o = timed(
         "cueq_attention",
         lambda: cuequivariance_triangular_attn(
-            q, k, v, triangle_bias_fp32, mask_bool, scale
+            q, k, v, triangle_bias_fp32, mask_for_attention, scale
         ),
         events,
     )
@@ -213,12 +224,16 @@ def layout_probe(
         mask = mask.transpose(-1, -2)
 
     x = module.layer_norm(x)
-    mask_bias = (module.inf * (mask - 1))[..., :, None, None, :]
+    if cueq_bool_mask_enabled():
+        mask_for_attention = (mask == 1)[..., :, None, None, :]
+    else:
+        mask_bias = (module.inf * (mask - 1))[..., :, None, None, :]
+        mask_for_attention = (mask_bias == 0).bool()
     triangle_bias = permute_final_dims(module.linear(x), (2, 0, 1)).unsqueeze(-4)
     q, k, v = module.mha._prep_qkv(x, x, apply_scale=False)
     scale = 1.0 / math.sqrt(module.c_hidden)
     heads_first = cuequivariance_triangular_attn(
-        q, k, v, triangle_bias.float(), (mask_bias == 0).bool(), scale
+        q, k, v, triangle_bias.float(), mask_for_attention, scale
     )
     if isinstance(heads_first, tuple):
         heads_first = heads_first[0]
@@ -231,6 +246,7 @@ def layout_probe(
             triton_triangle_attention_epilogue_enabled()
         ),
         "cueq_qkv_layout_enabled": triton_cueq_qkv_layout_enabled(),
+        "cueq_bool_mask_enabled": cueq_bool_mask_enabled(),
         "cueq_qkv_layout_available": triton_cueq_qkv_layout_available(),
         "triton_available": triton_fused_elementwise_available(),
         "helper_returned": fused is not None,
