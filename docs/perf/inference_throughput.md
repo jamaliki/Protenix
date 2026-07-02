@@ -370,6 +370,38 @@ gate (job `95654`, `runs/chunked_trunk_gate_20260702_172016`) produced
 `33.81s`.  That is inside run noise and not a legitimate complexity trade, so
 the prototype was reverted in commit `adf02e5`.
 
+Actual-shape pairformer hotspot screens on current `main` (`11a7d9d`) confirm
+that the remaining trunk work is a kernel problem, not another batching problem.
+Job `95663`
+(`runs/pairformer_block_actual_shapes_20260702_172840`) replayed one
+`PairformerBlock` at the B20/B12 token buckets seen in the mixed campaign:
+
+| shape | block ms | triangle attention | pair transition | triangle multiplication | token/single |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| B20, N=148 | 8.16 | 40.4% | 19.3% | 29.3% | 7.0% |
+| B12, N=220 | 10.50 | 43.7% | 19.7% | 26.5% | 6.1% |
+| B16, N=220 | 13.71 | 44.3% | 20.1% | 25.8% | 5.8% |
+
+Job `95666`
+(`runs/triangle_attention_actual_shapes_20260702_173005`) then split the
+triangle-attention module at those same shapes.  The promoted Triton q/k/v
+layout producer and triangle-attention gate epilogue were active.  The main
+CUEQ attention kernel is still the largest single launch family, but only about
+half of the module time:
+
+| shape/module | module forward ms | CUEQ attention | layernorm | qkv projection | gate/flatten/output family |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| B20, N=148, starting | 1.53 | 1.14 ms | 0.15 ms | 0.20 ms | ~0.60 ms |
+| B20, N=148, ending | 1.70 | 1.15 ms | 0.29 ms | 0.18 ms | ~0.61 ms |
+| B12, N=220, starting | 2.15 | 1.64 ms | 0.18 ms | 0.23 ms | ~0.73 ms |
+| B12, N=220, ending | 2.36 | 1.63 ms | 0.37 ms | 0.23 ms | ~0.74 ms |
+
+Interpretation: the next legitimate pairformer kernel target has to either
+improve the CUEQ attention schedule itself or fuse the surrounding layernorm,
+projection, gate, flatten, and output-projection work while preserving the
+current CUEQ attention throughput.  A slower "mega-kernel" attention mainloop
+would lose, as the earlier CUTLASS transition-output experiment did.
+
 A follow-up branch tried to merge source JSONs before MSA/template preprocessing
 so preprocessing would run once for the transient campaign file instead of once
 per source file.  That cleaned up generated JSON siblings but did not materially
