@@ -44,16 +44,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Keep the screen focused on the transition boundary, not optional layernorm
-# extension setup.  The boundary under test does not depend on layernorm.
+# Keep the screen focused on the transition boundary, not layernorm setup.
 os.environ.setdefault("LAYERNORM_TYPE", "normal")
 
-
 TensorFn = Callable[[], torch.Tensor]
-CandidateFn = Callable[
-    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    torch.Tensor,
-]
+CandidateFn = Callable[..., torch.Tensor]
 
 
 @contextmanager
@@ -203,7 +198,16 @@ def baseline_subranges(
     return out, {name: start.elapsed_time(end) for name, start, end in events}
 
 
-def max_mean_abs(reference: torch.Tensor, candidate: torch.Tensor) -> dict[str, float | int]:
+def call_candidate(candidate: CandidateFn, fixture: dict[str, torch.Tensor]) -> torch.Tensor:
+    return candidate(
+        fixture["b"], fixture["weight"], fixture["gate"], fixture["residual"]
+    )
+
+
+def max_mean_abs(
+    reference: torch.Tensor,
+    candidate: torch.Tensor,
+) -> dict[str, float | int]:
     diff = (candidate.float() - reference.float()).abs()
     finite = diff[torch.isfinite(diff)]
     return {
@@ -261,7 +265,7 @@ def main() -> None:
         candidate_row: dict[str, Any] | None = None
         if candidate is not None:
             candidate_out, candidate_ms = cuda_time(
-                lambda: candidate(**fixture),
+                lambda: call_candidate(candidate, fixture),
                 warmup=args.warmup,
                 iters=args.iters,
             )
