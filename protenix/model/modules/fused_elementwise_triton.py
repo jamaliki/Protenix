@@ -375,6 +375,26 @@ def triton_silu_mul(x: torch.Tensor, y: torch.Tensor) -> Optional[torch.Tensor]:
     return out
 
 
+def triton_silu_mul_inplace_y(
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Overwrite ``y`` with ``silu(x) * y`` when the inference fast path is safe.
+
+    Pair-transition's large-batch fallback already holds both input projections
+    ``x`` and ``y``.  Allocating a third activation just to fuse SiLU and multiply
+    can erase the memory benefit, so this helper keeps the original in-place
+    memory model while reducing two memory-bound ATen launches to one Triton
+    launch.
+    """
+    if not _can_use_triton(x, y):
+        return None
+    _silu_mul_kernel[_grid(y.numel())](
+        x, y, y, y.numel(), block_size=_BLOCK_SIZE, num_warps=4
+    )
+    return y
+
+
 def triton_silu_mul_split(
     x: torch.Tensor,
     split_size: int,
