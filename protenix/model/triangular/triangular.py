@@ -663,6 +663,7 @@ class TriangleAttention(nn.Module):
         chunk_size: Optional[int] = None,
         triangle_attention: str = "torch",
         inplace_safe: bool = False,
+        starting: Optional[bool] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -677,7 +678,9 @@ class TriangleAttention(nn.Module):
                 x.shape[:-1],
             )
 
-        if not self.starting:
+        is_starting = self.starting if starting is None else starting
+
+        if not is_starting:
             x = x.transpose(-2, -3)
             mask = mask.transpose(-1, -2)
 
@@ -711,7 +714,7 @@ class TriangleAttention(nn.Module):
                 triangle_attention=triangle_attention,
             )
 
-        if not self.starting:
+        if not is_starting:
             x = x.transpose(-2, -3)
 
         return x

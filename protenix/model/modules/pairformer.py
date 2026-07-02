@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # pylint: disable=C0114
+import os
 from functools import partial
 from typing import Any, Optional
 
@@ -37,6 +38,25 @@ from protenix.model.utils import (
     pad_at_dim,
     sample_msa_feature_dict_random_without_replacement,
 )
+
+
+def internal_ending_triangle_attention_enabled() -> bool:
+    """Use the ending-attention module transpose instead of outer tensor copies.
+
+    The default inference layout computes ending triangle attention by
+    transposing the full pair tensor, running a starting-attention module, then
+    transposing back.  This opt-in path asks the same module to apply the
+    semantic ending transpose internally, so we can screen whether avoiding
+    those two full ``contiguous()`` copies is faster on the target H100 shape.
+    It is restricted to the ``inplace_safe`` inference branch; the training
+    branch keeps the original layout/dropout behavior.
+    """
+    return os.getenv("PROTENIX_INTERNAL_ENDING_TRIANGLE_ATTENTION", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
 
 
 class PairformerBlock(nn.Module):
@@ -157,15 +177,25 @@ class PairformerBlock(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
-            z = z.transpose(-2, -3).contiguous()
-            z += self.tri_att_end(
-                z,
-                mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
-                triangle_attention=triangle_attention,
-                inplace_safe=inplace_safe,
-                chunk_size=chunk_size,
-            )
-            z = z.transpose(-2, -3).contiguous()
+            if internal_ending_triangle_attention_enabled():
+                z += self.tri_att_end(
+                    z,
+                    mask=pair_mask,
+                    triangle_attention=triangle_attention,
+                    inplace_safe=inplace_safe,
+                    chunk_size=chunk_size,
+                    starting=False,
+                )
+            else:
+                z = z.transpose(-2, -3).contiguous()
+                z += self.tri_att_end(
+                    z,
+                    mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
+                    triangle_attention=triangle_attention,
+                    inplace_safe=inplace_safe,
+                    chunk_size=chunk_size,
+                )
+                z = z.transpose(-2, -3).contiguous()
             z += self.pair_transition(z)
         else:
             tmu_update = self.tri_mul_out(
