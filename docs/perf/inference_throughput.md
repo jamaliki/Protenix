@@ -673,14 +673,18 @@ output-boundary tensors, times the baseline `linear_b(b)` plus promoted
 `fn(b, weight, gate, residual) -> out`.  Use it before touching model code:
 
 ```bash
-LAYERNORM_TYPE=normal \
-PROTENIX_TRITON_FUSED_ELEMENTWISE=1 \
-/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/env-boltz2/bin/python \
-  scripts/perf/transition_output_epilogue_hotspot.py \
-  --samples 1280 \
-  --tokens 245 \
-  --compute-dtype bfloat16 \
-  --candidate /path/to/native_epilogue_candidate.py:transition_output_epilogue
+PROTENIX_REPO=/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile \
+PROTENIX_RUN_NAME=transition_epilogue_baseline_$(date -u +%Y%m%d_%H%M%S) \
+sbatch scripts/perf/tokyo_transition_epilogue_hotspot.sbatch
+```
+
+To test a native extension candidate, pass the candidate function as an
+environment variable:
+
+```bash
+CANDIDATE=/path/to/native_epilogue_candidate.py:transition_output_epilogue \
+PROTENIX_RUN_NAME=transition_epilogue_candidate_$(date -u +%Y%m%d_%H%M%S) \
+sbatch scripts/perf/tokyo_transition_epilogue_hotspot.sbatch
 ```
 
 A candidate should only advance if this screen shows both acceptable BF16 parity
@@ -1044,6 +1048,8 @@ Profiling and reproducibility helpers:
   for CUEQ triangle attention and its layout/epilogue boundaries.
 - `scripts/perf/transition_output_epilogue_hotspot.py`: transition output-GEMM
   epilogue screen and candidate-injection harness for native CuTe/CUTLASS work.
+- `scripts/perf/tokyo_transition_epilogue_hotspot.sbatch`: Tokyo one-H100
+  wrapper for the transition epilogue screen, including CUDA/CUTLASS env setup.
 - `scripts/perf/confidence_head_hotspot.py`: confidence pairformer screen.
 - `scripts/perf/confidence_precision_screen.py`: confidence precision/parity
   screen with real checkpoint weights and matmul dtype tracing.
