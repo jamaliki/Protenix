@@ -70,6 +70,15 @@ def _extension():
     if _EXT is not None:
         return _EXT
 
+    arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    if arch_list is None:
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
+    elif "9.0a" not in arch_list and "90a" not in arch_list:
+        raise RuntimeError(
+            "CUTLASS GMMA kernels require a Hopper arch-specific build; "
+            "set TORCH_CUDA_ARCH_LIST=9.0a"
+        )
+
     cutlass_include = os.environ.get("CUTLASS_INCLUDE_DIR")
     if not cutlass_include:
         raise RuntimeError("CUTLASS_INCLUDE_DIR must point at CUTLASS/CuTe headers")
