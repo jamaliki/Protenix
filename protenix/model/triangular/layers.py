@@ -361,9 +361,13 @@ class Attention(nn.Module):
 
         self.sigmoid = nn.Sigmoid()
 
-    def _prep_qkv(
-        self, q_x: torch.Tensor, kv_x: torch.Tensor, apply_scale: bool = True
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _prep_qkv_gate(
+        self,
+        q_x: torch.Tensor,
+        kv_x: torch.Tensor,
+        apply_scale: bool = True,
+        include_gate: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         # [*, Q/K/V, H * C_hidden]
         if (
             q_x is kv_x
@@ -373,6 +377,14 @@ class Attention(nn.Module):
             and self.linear_q.precision is None
             and self.linear_k.precision is None
             and self.linear_v.precision is None
+            and (
+                not include_gate
+                or (
+                    self.linear_g is not None
+                    and self.linear_g.bias is None
+                    and self.linear_g.precision is None
+                )
+            )
         ):
             # Triangle attention is self-attention: q, k, and v are three
             # projections of the same normalized pair tensor.  A single wider
@@ -380,6 +392,13 @@ class Attention(nn.Module):
             # rereads of a very large [B, N, N, C] activation.
             d = q_x.dtype
             weights = [self.linear_q.weight, self.linear_k.weight, self.linear_v.weight]
+            if include_gate:
+                # The cuequivariance epilogue immediately needs the gate in
+                # contiguous [..., Q, H*C] layout.  Folding it into the same
+                # self-projection GEMM avoids one more read of the large pair
+                # tensor and one more cuBLAS launch while preserving exactly
+                # the original linear projections.
+                weights.append(self.linear_g.weight)
             if d is torch.bfloat16:
                 with torch.amp.autocast("cuda", enabled=False):
                     qkv = nn.functional.linear(
@@ -387,11 +406,14 @@ class Attention(nn.Module):
                     )
             else:
                 qkv = nn.functional.linear(q_x, torch.cat(weights))
-            q, k, v = qkv.chunk(3, dim=-1)
+            parts = qkv.split(self.c_hidden * self.no_heads, dim=-1)
+            q, k, v = parts[:3]
+            gate = parts[3] if include_gate else None
         else:
             q = self.linear_q(q_x)
             k = self.linear_k(kv_x)
             v = self.linear_v(kv_x)
+            gate = self.linear_g(q_x) if include_gate and self.linear_g is not None else None
 
         # [*, Q/K, H, C_hidden]
         q = q.view(q.shape[:-1] + (self.no_heads, -1))
@@ -406,6 +428,14 @@ class Attention(nn.Module):
         if apply_scale:
             q /= math.sqrt(self.c_hidden)
 
+        return q, k, v, gate
+
+    def _prep_qkv(
+        self, q_x: torch.Tensor, kv_x: torch.Tensor, apply_scale: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q, k, v, _ = self._prep_qkv_gate(
+            q_x=q_x, kv_x=kv_x, apply_scale=apply_scale, include_gate=False
+        )
         return q, k, v
 
     def _wrap_up(self, o: torch.Tensor, q_x: torch.Tensor) -> torch.Tensor:
@@ -424,7 +454,12 @@ class Attention(nn.Module):
 
         return o
 
-    def _wrap_up_heads_first(self, o: torch.Tensor, q_x: torch.Tensor) -> torch.Tensor:
+    def _wrap_up_heads_first(
+        self,
+        o: torch.Tensor,
+        q_x: torch.Tensor,
+        gate: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Output epilogue for cuequivariance's ``[..., H, Q, C]`` layout.
 
         The generic path transposes cuequivariance output to ``[..., Q, H, C]``,
@@ -436,7 +471,8 @@ class Attention(nn.Module):
         original mathematically identical path.
         """
         if self.linear_g is not None:
-            gate = self.linear_g(q_x)
+            if gate is None:
+                gate = self.linear_g(q_x)
             gated = triton_sigmoid_mul_heads_first(gate, o)
             if gated is not None:
                 return self.linear_o(gated)
@@ -485,8 +521,11 @@ class Attention(nn.Module):
             biases = []
 
         # DeepSpeed attention kernel applies scaling internally
-        q, k, v = self._prep_qkv(
-            q_x, kv_x, apply_scale=triangle_attention in ["torch", "triattention"]
+        q, k, v, gate = self._prep_qkv_gate(
+            q_x,
+            kv_x,
+            apply_scale=triangle_attention in ["torch", "triattention"],
+            include_gate=triangle_attention == "cuequivariance",
         )
 
         if q.shape[-2] <= 16:
@@ -530,7 +569,7 @@ class Attention(nn.Module):
                 # Squeeze only that overload; real B>1 sequence batches must
                 # be preserved for independent multi-target inference.
                 o = o.squeeze(0)
-            return self._wrap_up_heads_first(o, q_x)
+            return self._wrap_up_heads_first(o, q_x, gate=gate)
         else:
             o = _attention(q, k, v, biases)
             o = o.transpose(-2, -3)
