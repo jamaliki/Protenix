@@ -26,6 +26,12 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+# This harness runs in the inference environment used on Sandpit Tokyo, where
+# the optional fast-layernorm extension may not already be built.  Use PyTorch's
+# normal LayerNorm by default so the profiler measures pair-transition fusion
+# boundaries rather than one-time extension compilation or CUDA_HOME setup.
+os.environ.setdefault("LAYERNORM_TYPE", "normal")
+
 from protenix.model.modules.fused_elementwise_triton import triton_silu_mul_split
 from protenix.model.modules.primitives import Transition
 
@@ -155,29 +161,34 @@ def manual_timed(
     *,
     fused_input: bool,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
-    flat, prefix_shape = flat_view(x)
-    y = event_time("layernorm", lambda: module.layernorm1(flat), events)
-    if fused_input:
-        projected = event_time(
-            "wide_input_projection",
-            lambda: F.linear(y, module._input_projection_params()),
-            events,
-        )
-        hidden = module.n * module.c_in
-        b = event_time(
-            "split_silu_mul",
-            lambda: _split_silu_mul_required(projected, hidden),
-            events,
-        )
-    else:
-        a = event_time("input_projection_a", lambda: module.linear_no_bias_a(y), events)
-        a = event_time("silu_a", lambda: F.silu(a, inplace=True), events)
-        b = event_time("input_projection_b", lambda: module.linear_no_bias_b(y), events)
-        b = event_time("multiply", lambda: b.mul_(a), events)
-    out = event_time("output_projection", lambda: module.linear_no_bias(b), events)
-    out = out.reshape(*prefix_shape, module.c_in)
-    torch.cuda.synchronize()
+    with torch.inference_mode():
+        events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        flat, prefix_shape = flat_view(x)
+        y = event_time("layernorm", lambda: module.layernorm1(flat), events)
+        if fused_input:
+            projected = event_time(
+                "wide_input_projection",
+                lambda: F.linear(y, module._input_projection_params()),
+                events,
+            )
+            hidden = module.n * module.c_in
+            b = event_time(
+                "split_silu_mul",
+                lambda: _split_silu_mul_required(projected, hidden),
+                events,
+            )
+        else:
+            a = event_time(
+                "input_projection_a", lambda: module.linear_no_bias_a(y), events
+            )
+            a = event_time("silu_a", lambda: F.silu(a, inplace=True), events)
+            b = event_time(
+                "input_projection_b", lambda: module.linear_no_bias_b(y), events
+            )
+            b = event_time("multiply", lambda: b.mul_(a), events)
+        out = event_time("output_projection", lambda: module.linear_no_bias(b), events)
+        out = out.reshape(*prefix_shape, module.c_in)
+        torch.cuda.synchronize()
     return out, {name: start.elapsed_time(end) for name, start, end in events}
 
 
