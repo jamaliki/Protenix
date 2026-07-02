@@ -53,10 +53,13 @@ def _read_lines(paths: list[Path]) -> list[str]:
         if path.is_file():
             lines.extend(path.read_text(errors="replace").splitlines())
         elif path.is_dir():
-            for child in sorted((path / "slurm_logs").glob("*")):
-                if child.is_file():
-                    lines.extend(child.read_text(errors="replace").splitlines())
-            for child in sorted(path.glob("*")):
+            log_dir = path / "slurm_logs"
+            children = (
+                sorted(log_dir.glob("*"))
+                if log_dir.is_dir()
+                else sorted(path.glob("*"))
+            )
+            for child in children:
                 if child.is_file():
                     lines.extend(child.read_text(errors="replace").splitlines())
         else:
