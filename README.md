@@ -102,20 +102,23 @@ protenix pred -i many_same_shape_inputs.json -o ./output --batch_size 32
 ```
 
 Only inputs whose feature tensors match exactly are stacked; different shapes
-are automatically kept in separate buckets rather than padded. On one H100 with
+are automatically kept in separate buckets rather than padded. When `-i` points
+to a directory of JSON files, the runner now merges the records into a transient
+campaign JSON before inference, so one-record-per-design campaigns can still
+fill exact-shape GPU batches while loading the model only once. On one H100 with
 32 repeated `7r6r` inputs, `N_sample=1`, `N_step=200`, and normal output
-dumping, this improved post-initialization runner time from `361.8s` to `69.3s`
-(`5.2x`). The same profiling loop found the trunk pairformer triangle-attention
-epilogue and CUEQ QKV layout conversion as useful memory boundaries. The
-guarded Triton epilogue fuses sigmoid gating, head-layout conversion, and
-flattening after the CUEQ attention kernel, while the QKV layout producer writes
-CUEQ's required `[..., I, H, J, D]` q/k/v tensors directly after the fused
-projection. Together these remove high-batch HBM traffic without replacing the
-vendor GEMM or CUEQ attention kernels. A separate guarded transition
-input-projection fusion remains opt-in for memory/batch-size experiments; when
-that wide projection is unsafe at larger batches, an in-place Triton fallback
-still fuses the memory-bound `SiLU(a) * b` transition activation without adding
-another giant temporary.
+dumping, exact-shape batching improved post-initialization runner time from
+`361.8s` to `69.3s` (`5.2x`). The same profiling loop found the trunk
+pairformer triangle-attention epilogue and CUEQ QKV layout conversion as useful
+memory boundaries. The guarded Triton epilogue fuses sigmoid gating,
+head-layout conversion, and flattening after the CUEQ attention kernel, while
+the QKV layout producer writes CUEQ's required `[..., I, H, J, D]` q/k/v tensors
+directly after the fused projection. Together these remove high-batch HBM
+traffic without replacing the vendor GEMM or CUEQ attention kernels. A separate
+guarded transition input-projection fusion remains opt-in for memory/batch-size
+experiments; when that wide projection is unsafe at larger batches, an in-place
+Triton fallback still fuses the memory-bound `SiLU(a) * b` transition activation
+without adding another giant temporary.
 
 For the recommended flags, reproduction commands, profiling scripts, and the
 negative results that shaped the implementation, see

@@ -104,7 +104,10 @@ The batching rule is intentionally conservative: only records whose feature
 tensor trees have exactly matching shapes and dtypes are stacked.  Ragged
 proteins are not padded into a shared batch because padding is not a proven
 semantic no-op for the triangular trunk.  If shapes differ, the runner keeps
-separate buckets and flushes each bucket independently.
+separate buckets and flushes each bucket independently.  Directory inputs are
+handled as one campaign: all preprocessed JSON records are merged into a
+short-lived file before inference so many one-record JSONs can still be packed
+into full exact-shape batches.
 
 Public CLI gates on one H100, repeated `7r6r` inputs, `N_sample=1`,
 `N_step=200`, confidence enabled, and normal CIF/JSON dumping:

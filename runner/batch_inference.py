@@ -46,6 +46,11 @@ from runner.inference import (
     InferenceRunner,
     update_gpu_compatible_configs,
 )
+from runner.campaign_inputs import (
+    group_inference_jsons_by_seed,
+    resolve_inference_jsons,
+    write_campaign_json,
+)
 from runner.msa_search import msa_search, update_infer_json
 from runner.rna_msa_search import update_rna_msa_info
 from runner.template_search import update_template_info
@@ -502,18 +507,7 @@ def inference_jsons(
         rna_central_database_path (Optional[str]): RNAcentral database path.
         nhmmer_n_cpu (Optional[int]): Number of CPUs for nhmmer.
     """
-    infer_jsons = []
-    if os.path.isdir(json_file):
-        infer_jsons = [
-            str(file) for file in Path(json_file).rglob("*") if file.is_file()
-        ]
-        if len(infer_jsons) == 0:
-            raise RuntimeError(f"Can not read a valid json file in {json_file}")
-    elif os.path.isfile(json_file):
-        infer_jsons = [json_file]
-    else:
-        raise RuntimeError(f"Can not read a special file: {json_file}")
-    infer_jsons = [file for file in infer_jsons if file.endswith(".json")]
+    infer_jsons = resolve_inference_jsons(json_file)
     logger.info(f"Will infer with {len(infer_jsons)} jsons")
     if len(infer_jsons) == 0:
         return
@@ -542,29 +536,66 @@ def inference_jsons(
         use_tfg_guidance=use_tfg_guidance,
     )
     configs = runner.configs
-    for _, infer_json in enumerate(tqdm.tqdm(infer_jsons)):
+    processed_jsons = []
+    for infer_json in tqdm.tqdm(infer_jsons):
         try:
-            configs["input_json_path"] = preprocess_input(
-                infer_json,
-                out_dir=out_dir,
-                use_msa=use_msa,
-                use_template=use_template,
-                use_rna_msa=use_rna_msa,
-                msa_server_mode=msa_server_mode,
-                hmmsearch_binary_path=hmmsearch_binary_path,
-                hmmbuild_binary_path=hmmbuild_binary_path,
-                seqres_database_path=seqres_database_path,
-                nhmmer_binary_path=nhmmer_binary_path,
-                hmmalign_binary_path=hmmalign_binary_path,
-                hmmbuild_rna_binary_path=hmmbuild_rna_binary_path,
-                ntrna_database_path=ntrna_database_path,
-                rfam_database_path=rfam_database_path,
-                rna_central_database_path=rna_central_database_path,
-                nhmmer_n_cpu=nhmmer_n_cpu,
+            processed_jsons.append(
+                preprocess_input(
+                    infer_json,
+                    out_dir=out_dir,
+                    use_msa=use_msa,
+                    use_template=use_template,
+                    use_rna_msa=use_rna_msa,
+                    msa_server_mode=msa_server_mode,
+                    hmmsearch_binary_path=hmmsearch_binary_path,
+                    hmmbuild_binary_path=hmmbuild_binary_path,
+                    seqres_database_path=seqres_database_path,
+                    nhmmer_binary_path=nhmmer_binary_path,
+                    hmmalign_binary_path=hmmalign_binary_path,
+                    hmmbuild_rna_binary_path=hmmbuild_rna_binary_path,
+                    ntrna_database_path=ntrna_database_path,
+                    rfam_database_path=rfam_database_path,
+                    rna_central_database_path=rna_central_database_path,
+                    nhmmer_n_cpu=nhmmer_n_cpu,
+                )
             )
-            infer_predict(runner, configs)
         except Exception as exc:
             infer_errors[infer_json] = str(exc)
+
+    try:
+        grouped_jsons = group_inference_jsons_by_seed(
+            processed_jsons, seeds, use_seeds_in_json
+        )
+    except Exception as exc:
+        grouped_jsons = {}
+        infer_errors[",".join(processed_jsons)] = str(exc)
+
+    for seed_key, group_jsons in grouped_jsons.items():
+        merged_json = cleanup_json = None
+        try:
+            configs["seeds"] = list(seed_key)
+            merged_json, cleanup_json = write_campaign_json(group_jsons, out_dir)
+            if cleanup_json is not None:
+                logger.info(
+                    "Merged %d JSON file(s) for campaign inference into %s",
+                    len(group_jsons),
+                    merged_json,
+                )
+            configs["input_json_path"] = merged_json
+            # Directory campaigns often contain one record per JSON.  Running
+            # each file separately reuses the model, but it prevents the
+            # exact-shape batcher from ever filling a GPU batch.  A transient
+            # merged JSON lets the existing conservative tensor-tree bucketing
+            # pack records across file boundaries without changing model inputs.
+            infer_predict(runner, configs)
+        except Exception as exc:
+            infer_errors[",".join(group_jsons)] = str(exc)
+        finally:
+            if cleanup_json is not None:
+                try:
+                    os.remove(cleanup_json)
+                except OSError:
+                    pass
     if len(infer_errors) > 0:
         logger.warning(f"Run inference failed: {infer_errors}")
 
