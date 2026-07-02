@@ -28,17 +28,15 @@ inference_configs = {
     "input_json_path": RequiredValue(str),
     "load_checkpoint_dir": os.path.join(PROTENIX_ROOT_DIR, "checkpoint"),
     "num_workers": 0,
-    # Number of same-shape JSON inputs to run in one model forward during
-    # inference.  The public runner keeps this at 1 by default; larger values
-    # are used only when all tensor feature shapes match exactly, so ragged
-    # padding cannot leak into model outputs.
+    # Number of compatible JSON inputs to run in one inference batch.  The
+    # public runner keeps this at 1 by default; larger values use the batching
+    # boundary selected below and never pad ragged records through the model.
     "inference_batch_size": 1,
-    # "exact" batches the whole model only when every feature tensor shape
-    # matches.  "token" is an explicit campaign-throughput mode for records
-    # with the same token/MSA/template trunk shape but different atom counts:
-    # atom-shaped work stays per-record, while the expensive token trunk is
-    # stacked across records.
-    "inference_batch_mode": "exact",
+    # "auto" first tries full-model exact-shape batching.  When same-length
+    # design records have different atom counts, it batches only the token trunk
+    # and leaves atom-shaped diffusion/confidence work per record.  "exact" and
+    # "token" force one boundary for debugging or benchmarking.
+    "inference_batch_mode": "auto",
     "use_msa": True,
     "enable_tf32": True,
     "enable_efficient_fusion": True,

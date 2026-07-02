@@ -75,13 +75,13 @@ export PROTENIX_TRITON_TRIANGLE_ATTENTION_EPILOGUE=0
 export PROTENIX_TRITON_CUEQ_QKV_LAYOUT=0
 ```
 
-### Many independent exact-shape inputs
+### Many independent inputs
 
 Protein-design campaigns often care less about one sequence with thousands of
 samples and more about many independent sequences with `N_sample=1-5`.  The
 model already supports a leading protein-batch dimension for same-shape feature
 tensors, but the public inference path historically ran one input per
-`runner.predict()` call.  The `pred` CLI now exposes exact-shape batching:
+`runner.predict()` call.  The `pred` CLI now exposes campaign batching:
 
 ```bash
 protenix pred \
@@ -100,14 +100,24 @@ protenix pred \
   --batch_size 32
 ```
 
-The batching rule is intentionally conservative: only records whose feature
-tensor trees have exactly matching shapes and dtypes are stacked.  Ragged
-proteins are not padded into a shared batch because padding is not a proven
-semantic no-op for the triangular trunk.  If shapes differ, the runner keeps
-separate buckets and flushes each bucket independently.  Directory inputs are
-handled as one campaign: all preprocessed JSON records are merged into a
-short-lived file before inference so many one-record JSONs can still be packed
-into full exact-shape batches.
+The default `--batch_mode auto` chooses the fastest safe boundary for each
+bucket:
+
+- If full feature tensor trees match, the whole model is run as one exact-shape
+  batch.  This is still the fastest path because diffusion and confidence are
+  batched too.
+- If token/MSA/template trunk shapes match but atom counts differ, only the
+  atom-independent trunk is batched.  The runner computes atom input embeddings
+  per record, stacks `s_inputs` and token-trunk features, runs one pairformer
+  trunk call, then finishes diffusion and confidence per original atom-shaped
+  record.
+
+This fixes the common same-length mutation campaign problem without padding fake
+atoms through atom attention or confidence reductions.  Ragged proteins are not
+padded into a shared full-model batch because padding is not a proven semantic
+no-op for the triangular trunk.  Directory inputs are handled as one campaign:
+all preprocessed JSON records are merged into a short-lived file before
+inference so many one-record JSONs can still fill batches.
 
 Public CLI gates on one H100, repeated `7r6r` inputs, `N_sample=1`,
 `N_step=200`, confidence enabled, and normal CIF/JSON dumping:
@@ -127,10 +137,11 @@ The real campaign shape is often a directory containing one JSON file per
 design.  That used to defeat batching because the runner called
 `infer_predict()` once per file.  The directory path now resolves the whole
 directory as one campaign, keeps JSONs with incompatible `modelSeeds` in
-separate transient merged files, and lets the existing exact-shape tensor-tree
-bucket decide what can actually stack.  Generated preprocessing siblings such
-as `foo-update-msa.json` are ignored when the source `foo.json` is present, so a
-rerun does not silently infer both the source and generated JSON.
+separate transient merged files, and lets the auto batcher decide whether each
+bucket can use full-model exact batching or same-token trunk batching.  Generated
+preprocessing siblings such as `foo-update-msa.json` are ignored when the source
+`foo.json` is present, so a rerun does not silently infer both the source and
+generated JSON.
 
 Paired directory-campaign gate, one H100, job `94948`, run directory
 `/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/campaign_json_batching_gate_20260702_112333_fair2`:
@@ -144,6 +155,23 @@ This is a `2.82x` end-to-end speedup for the practical one-file-per-design
 workflow.  Both variants still write generated MSA JSON siblings during
 preprocessing; the promoted change is about not treating those siblings as new
 inputs on directory reruns.
+
+Same-token trunk batching gate: job `95276`
+(`runs/same_token_batch_gate_20260702_144135`, commit `f26c607`) used two
+40-token proteins with different side-chain atom counts (`polyA_len40`:
+`N_atom=201`; `polyW_len40`: `N_atom=561`) and `--batch_size 2
+--batch_mode token`.  The log shows one shared trunk batch:
+
+```text
+Predicting 2 same-token-trunk input(s) [seed:101]: N_token 40, N_atom 201-561, N_msa 1
+```
+
+Both CIFs and summaries were produced.  A paired `--batch_mode exact` run
+(job `95280`) correctly fragmented into two singleton batches because the full
+feature trees had different atom shapes.  That pair is a functional gate, not a
+speed claim: the tiny shape is dominated by first-run compilation and model
+initialization.  Representative throughput gates should use larger same-token
+campaigns and warmed timing windows.
 
 A follow-up branch tried to merge source JSONs before MSA/template preprocessing
 so preprocessing would run once for the transient campaign file instead of once
@@ -1157,9 +1185,10 @@ Production code touched by the throughput stack:
 - `protenix/model/modules/confidence.py` and `protenix/model/protenix.py`:
   confidence-logit chunk iteration and streaming summary consumption.
 - `runner/inference.py`, `runner/batch_inference.py`, and
-  `configs/configs_inference.py`: public exact-shape inference batching.  The
-  runner stacks only identical feature tensor trees, splits predictions back to
-  one output per input, and leaves ragged shapes as separate buckets.
+  `configs/configs_inference.py`: public campaign inference batching.  The
+  runner uses full-model batches for identical feature tensor trees and
+  same-token trunk batches for variable-atom same-length records, then writes
+  one output per input.
 
 Profiling and reproducibility helpers:
 

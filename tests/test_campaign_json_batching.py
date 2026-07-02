@@ -19,7 +19,7 @@ import unittest
 
 import torch
 
-from runner.inference import _input_batch_signature
+from runner.inference import _effective_batch_mode, _input_batch_signature
 from runner.campaign_inputs import (
     group_inference_jsons_by_seed,
     load_inference_records,
@@ -139,6 +139,36 @@ class TestCampaignJsonBatching(unittest.TestCase):
         self.assertEqual(
             _input_batch_signature(short_atom, "token"),
             _input_batch_signature(long_atom, "token"),
+        )
+        self.assertEqual(
+            _input_batch_signature(short_atom, "auto"),
+            _input_batch_signature(long_atom, "auto"),
+        )
+
+    def test_auto_mode_prefers_full_batch_when_exact_shapes_match(self):
+        def make_data(n_atom: int) -> dict:
+            n_token = 4
+            return {
+                "input_feature_dict": {
+                    "residue_index": torch.zeros(n_token, dtype=torch.long),
+                    "token_bonds": torch.zeros(n_token, n_token),
+                    "ref_pos": torch.zeros(n_atom, 3),
+                    "atom_to_token_idx": torch.zeros(n_atom, dtype=torch.long),
+                    "bond_mask": torch.zeros(n_atom, n_atom),
+                }
+            }
+
+        same_a = make_data(20)
+        same_b = make_data(20)
+        ragged = make_data(23)
+
+        self.assertEqual(
+            _effective_batch_mode([(same_a, None), (same_b, None)], "auto"),
+            "exact",
+        )
+        self.assertEqual(
+            _effective_batch_mode([(same_a, None), (ragged, None)], "auto"),
+            "token",
         )
 
 

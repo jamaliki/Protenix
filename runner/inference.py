@@ -378,10 +378,10 @@ def _inference_batch_size(configs: Any) -> int:
 
 def _inference_batch_mode(configs: Any) -> str:
     """Return how records are allowed to share one inference batch."""
-    mode = str(configs.get("inference_batch_mode", "exact")).strip().lower()
-    if mode not in {"exact", "token"}:
-        logger.warning("Unknown inference_batch_mode=%r; using exact mode.", mode)
-        return "exact"
+    mode = str(configs.get("inference_batch_mode", "auto")).strip().lower()
+    if mode not in {"auto", "exact", "token"}:
+        logger.warning("Unknown inference_batch_mode=%r; using auto mode.", mode)
+        return "auto"
     return mode
 
 
@@ -468,9 +468,31 @@ def _token_trunk_signature(data: Mapping[str, Any]) -> Any:
 
 
 def _input_batch_signature(data: Mapping[str, Any], batch_mode: str) -> Any:
-    if batch_mode == "token":
+    if batch_mode in {"auto", "token"}:
         return _token_trunk_signature(data)
     return _input_feature_signature(data)
+
+
+def _effective_batch_mode(
+    items: list[tuple[dict[str, Any], Any]], batch_mode: str
+) -> str:
+    """Choose the fastest safe execution boundary for an already grouped batch.
+
+    ``auto`` is the practical campaign default.  It groups pending records by
+    token-trunk shape so same-length designs with different side-chain atom
+    counts can share the expensive pairformer.  If the full feature trees also
+    match exactly, we keep the older full-model batch path because it can batch
+    the diffusion/confidence tail too.
+    """
+    if len(items) <= 1 or batch_mode == "exact":
+        return "exact"
+    if batch_mode == "token":
+        return "token"
+
+    first_signature = _input_feature_signature(items[0][0])
+    if all(_input_feature_signature(data) == first_signature for data, _ in items[1:]):
+        return "exact"
+    return "token"
 
 
 def _stack_tree(items: list[Any]) -> Any:
@@ -605,7 +627,10 @@ def _describe_batch(
     first_data = items[0][0]
     names = [data["sample_name"] for data, _atom_array in items]
     atom_counts = [int(data["N_atom"].item()) for data, _atom_array in items]
-    batch_kind = "same-shape" if batch_mode == "exact" else "same-token-trunk"
+    effective_mode = _effective_batch_mode(items, batch_mode)
+    batch_kind = "same-shape" if effective_mode == "exact" else "same-token-trunk"
+    if batch_mode == "auto":
+        batch_kind = f"{batch_kind} (auto)"
     logger.info(
         "[Rank %s] Predicting %d %s input(s) [seed:%s]: "
         "N_token %s, N_atom %s-%s, N_msa %s, names=%s",
@@ -630,7 +655,7 @@ def _run_prediction_batch(
     first_data = items[0][0]
     n_token = int(first_data["N_token"].item())
     runner.update_model_configs(update_inference_configs(configs, n_token))
-    if len(items) > 1 and batch_mode == "token":
+    if _effective_batch_mode(items, batch_mode) == "token":
         return runner.predict_token_batch([data for data, _atom_array in items])
     batch_data = first_data if len(items) == 1 else _stack_prediction_inputs(items)
     return runner.predict(batch_data)

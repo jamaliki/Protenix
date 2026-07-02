@@ -307,7 +307,7 @@ def get_default_runner(
     use_seeds_in_json: bool = False,
     need_atom_confidence: bool = False,
     inference_batch_size: int = 1,
-    inference_batch_mode: str = "exact",
+    inference_batch_mode: str = "auto",
     kalign_binary_path: Optional[str] = None,
     use_tfg_guidance: bool = False,
 ) -> InferenceRunner:
@@ -330,8 +330,8 @@ def get_default_runner(
         use_template (bool): Whether to use templates.
         use_rna_msa (bool): Whether to use RNA MSA.
         use_seeds_in_json (bool): Whether to use seeds defined in the JSON file.
-        inference_batch_size (int): Number of exact-shape inputs per model forward.
-        inference_batch_mode (str): Batching boundary: "exact" or "token".
+        inference_batch_size (int): Number of compatible inputs per model forward.
+        inference_batch_mode (str): Batching boundary: "auto", "exact", or "token".
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Whether to use TFG guidance.
 
@@ -462,7 +462,7 @@ def inference_jsons(
     use_seeds_in_json: bool = False,
     need_atom_confidence: bool = False,
     inference_batch_size: int = 1,
-    inference_batch_mode: str = "exact",
+    inference_batch_mode: str = "auto",
     kalign_binary_path: Optional[str] = None,
     use_tfg_guidance: bool = False,
     hmmsearch_binary_path: Optional[str] = None,
@@ -498,8 +498,8 @@ def inference_jsons(
         use_template (bool): Whether to use templates.
         use_rna_msa (bool): Whether to use RNA MSA.
         use_seeds_in_json (bool): Whether to use seeds from JSON.
-        inference_batch_size (int): Number of exact-shape inputs per model forward.
-        inference_batch_mode (str): Batching boundary: "exact" or "token".
+        inference_batch_size (int): Number of compatible inputs per model forward.
+        inference_batch_mode (str): Batching boundary: "auto", "exact", or "token".
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Use TFG guidance.
         hmmsearch_binary_path (Optional[str]): Path to hmmsearch binary.
@@ -590,10 +590,10 @@ def inference_jsons(
                 )
             configs["input_json_path"] = merged_json
             # Directory campaigns often contain one record per JSON.  Running
-            # each file separately reuses the model, but it prevents the
-            # exact-shape batcher from ever filling a GPU batch.  A transient
-            # merged JSON lets the existing conservative tensor-tree bucketing
-            # pack records across file boundaries without changing model inputs.
+            # each file separately reuses the model, but it prevents any GPU
+            # batch from filling.  A transient merged JSON lets the conservative
+            # bucketing logic pack records across file boundaries without
+            # changing model inputs.
             infer_predict(runner, configs)
         except Exception as exc:
             infer_errors[",".join(group_jsons)] = str(exc)
@@ -744,11 +744,12 @@ def protenix_cli() -> None:
 )
 @click.option(
     "--batch_mode",
-    type=click.Choice(["exact", "token"]),
-    default="exact",
+    type=click.Choice(["auto", "exact", "token"]),
+    default="auto",
     help=(
-        "'exact' batches only fully same-shaped feature trees. 'token' batches "
-        "the token trunk for same-token records with different atom counts."
+        "'auto' uses full-model same-shape batches when possible and token-trunk "
+        "batches for same-token records with different atom counts. 'exact' and "
+        "'token' force one boundary."
     ),
 )
 @click.option(
@@ -884,7 +885,7 @@ def predict(
         use_seeds_in_json (bool): Use seeds from JSON.
         need_atom_confidence (bool): Compute atom-level confidence scores.
         batch_size (int): Number of compatible inputs per model forward.
-        batch_mode (str): Batching boundary, either "exact" or "token".
+        batch_mode (str): Batching boundary: "auto", "exact", or "token".
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Use TFG guidance.
         hmmsearch_binary_path (Optional[str]): Path to hmmsearch binary.
