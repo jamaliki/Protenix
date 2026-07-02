@@ -9,6 +9,7 @@
 #include <cutlass/epilogue/fusion/sm90_callbacks_tma_warpspecialized.hpp>
 #include <cutlass/epilogue/thread/activation.h>
 #include <cutlass/gemm/collective/collective_builder.hpp>
+#include <cutlass/gemm/dispatch_policy.hpp>
 #include <cutlass/gemm/device/gemm_universal_adapter.h>
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/gemm/kernel/tile_scheduler.hpp>
@@ -83,7 +84,7 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     TileShape,
     ClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::collective::KernelTmaWarpSpecialized>::CollectiveOp;
+    cutlass::gemm::KernelTmaWarpSpecialized>::CollectiveOp;
 
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     Shape<int, int, int, int>,
