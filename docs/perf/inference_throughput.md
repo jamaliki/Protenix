@@ -389,6 +389,39 @@ therefore rejects the branch.  The likely mechanism is that `torch.addmm` with
 nonzero beta does not beat the existing `F.linear` plus simple in-place residual
 add for these shapes, even though it is algebraically equivalent.
 
+A follow-up branch, `codex/triangle-output-epilogue-hotspot`, tried the same
+discipline on the triangle-attention output boundary.  CUEQ returns heads in a
+heads-first layout, then the inference path applies `sigmoid(gate)`, flattens
+heads, runs `linear_o`, and adds the block residual.  The prototype fused the
+gate/layout/flatten/output-projection/residual boundary in one Triton matmul
+kernel while leaving the CUEQ attention kernel itself unchanged.  The isolated
+boundary looked real:
+
+| shape | existing epilogue boundary | fused Triton boundary | isolated speedup | parity |
+| --- | ---: | ---: | ---: | --- |
+| B20, N=148 | 0.310 ms | 0.240 ms | 1.29x | max abs 0.03125 |
+| B12, N=220 | 0.406 ms | 0.315 ms | 1.29x | max abs 0.03125 |
+| B16, N=220 | 0.538 ms | 0.419 ms | 1.29x | max abs 0.03125 |
+
+But the integrated `PairformerBlock` screen was only about `1.02x` at the
+actual mixed-campaign shapes, and the representative full gate did not clear
+the promotion bar.  Job `95758`
+(`runs/tri_output_epilogue_full_b16_n200_20260702_183509`, commit `8d5eafb`)
+ran the same 32-protein, 40-220-token, `N_sample=1`, `N_step=200` B16 workload
+with the candidate off and on in one Slurm allocation:
+
+| setting | predict sec sum | records/s by predict | pairformer | diffusion | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| output epilogue off | 37.20 | 0.860 | 15.59 | 18.00 | 2.48 | control |
+| output epilogue on | 35.92 | 0.891 | 15.50 | 17.07 | 2.23 | reject |
+
+The paired total moved by about `1.04x`, but that run was slower than the
+promoted `33.93s` main gate and the movement was not cleanly concentrated in
+the intended pairformer subtotal.  Decision: keep the branch as an audit trail
+only.  Do not merge the default-off model path; fusing a true GEMM boundary is
+not worth carrying unless the representative gate moves for the intended
+reason.
+
 A batch-size follow-up on commit `7de6bdf` screened fixed B16/B20/B24/B32 with
 conditioning batching enabled (job `95646`,
 `runs/batchsize_screen_cond_b16_32_20260702_171044`).  The node was slower than
@@ -1448,6 +1481,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Unguarded pairformer transition input fusion at B96 | failed before producing model output | the concatenated pair-transition activation is too large; keep the shape guard |
 | Scoped pairformer transition elementwise fusion | isolated pair-transition subrange improved 18-19%, but the full representative gate showed pairformer flat/slower | subrange wins must be rejected when the measured full-workload subtotal does not move |
 | Pairformer transition residual via `torch.addmm(beta=1)` | exact parity, but actual-shape blocks were neutral/slower (`0.997-0.999x`) and sometimes used more memory | preserving the library GEMM is necessary but not sufficient; the epilogue path still has to beat `F.linear` plus a simple add |
+| Triangle-attention output projection epilogue | isolated boundary improved about `1.29x` and block screens about `1.02x`, but the full B16 mixed-token gate was noisy and did not cleanly move pairformer or beat the promoted main gate | do not carry default-off fused GEMM paths unless the representative subtotal moves for the intended mechanism |
 | Custom Triton transition output GEMM+gate/residual | best tile 2.00 ms versus 1.51 ms for cuBLAS plus fused gate/residual | the output epilogue is still attractive, but only if implemented as a vendor-quality CuTe/CUTLASS epilogue |
 | Naive fused Triton triangle attention | correct at N64, but B16/N245 slowed from 4.24-4.26 ms to 6.22-7.78 ms | the right boundary still needs a vendor-quality CUEQ/CuTe schedule |
 | Replacing CUEQ triangle attention with existing `triattention` or torch backends | actual-shape one-block screens were slower: TriAttention `1.11-1.15x` slower, torch about `1.9-2.3x` slower | keep CUEQ; target its layout/wrapper/epilogue boundaries instead |
