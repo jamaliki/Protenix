@@ -20,6 +20,7 @@ import urllib.request
 from argparse import Namespace
 from collections.abc import Mapping as MappingABC
 from contextlib import nullcontext
+from numbers import Number
 from os.path import exists as opexists, join as opjoin
 from typing import Any, Mapping
 
@@ -73,6 +74,8 @@ class InferenceRunner(object):
 
     def __init__(self, configs: Any) -> None:
         self.configs = configs
+        self.last_log_dict = {}
+        self.last_batch_time_summary = None
         self.init_env()
         self.init_basics()
         self.init_model()
@@ -224,6 +227,8 @@ class InferenceRunner(object):
             else nullcontext()
         )
 
+        self.last_log_dict = {}
+        self.last_batch_time_summary = None
         data = to_device(data, self.device)
         with enable_amp:
             prediction, _, log_dict = self.model(
@@ -263,6 +268,8 @@ class InferenceRunner(object):
                 )
             ]
 
+        self.last_log_dict = {}
+        self.last_batch_time_summary = None
         eval_precision = {
             "fp32": torch.float32,
             "bf16": torch.bfloat16,
@@ -391,6 +398,11 @@ class InferenceRunner(object):
                 log_dicts.append(log_dict)
 
         self.last_log_dict = log_dicts[-1] if log_dicts else {}
+        self.last_batch_time_summary = _summarize_model_time_dicts(
+            [log_dict["time"] for log_dict in log_dicts if "time" in log_dict],
+            item_count=len(data_items),
+            source="token-trunk-batch",
+        )
         return predictions
 
     def print(self, msg: str) -> None:
@@ -971,6 +983,134 @@ def _prediction_items(
     )
 
 
+_MODEL_TIME_KEYS = (
+    "model_forward_with_summary",
+    "model_forward",
+    "pairformer",
+    "diffusion",
+    "diffusion_conditioning_sec",
+    "diffusion_atom_encoder_sec",
+    "diffusion_transformer_sec",
+    "diffusion_atom_decoder_sec",
+    "diffusion_input_scale_sec",
+    "diffusion_output_rescale_sec",
+    "contact_probs",
+    "confidence",
+    "confidence_head",
+    "summary_confidence",
+    "permutation",
+)
+
+
+def _timing_seconds(value: Any) -> float | None:
+    """Convert scalar timing leaves to seconds, ignoring flags and strings.
+
+    Protenix time dictionaries are intentionally lightweight: normal inference
+    records Python floats, while multi-seed paths may merge scalars into small
+    arrays.  This helper keeps logging tolerant without depending on numpy here.
+    """
+    if isinstance(value, bool):
+        return None
+    dtype = getattr(value, "dtype", None)
+    if dtype is not None and str(dtype) in {"bool", "bool_", "torch.bool"}:
+        return None
+    if isinstance(value, Number):
+        return float(value)
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return None
+        return float(value.detach().sum().cpu().item())
+    if hasattr(value, "sum"):
+        try:
+            return float(value.sum())
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _summarize_model_time_dicts(
+    time_dicts: list[Mapping[str, Any]],
+    item_count: int,
+    source: str,
+) -> dict[str, Any] | None:
+    totals: dict[str, float] = {}
+    for time_dict in time_dicts:
+        for key, value in time_dict.items():
+            seconds = _timing_seconds(value)
+            if seconds is None:
+                continue
+            totals[key] = totals.get(key, 0.0) + seconds
+    if not totals:
+        return None
+    per_input = {
+        key: value / max(1, item_count)
+        for key, value in totals.items()
+    }
+    return {
+        "source": source,
+        "items": item_count,
+        "total": totals,
+        "per_input": per_input,
+    }
+
+
+def _format_time_fields(values: Mapping[str, float], denominator: float | None) -> str:
+    fields = []
+    for key in _MODEL_TIME_KEYS:
+        if key not in values:
+            continue
+        seconds = values[key]
+        if denominator and denominator > 0:
+            fields.append(f"{key}={seconds:.3f}s/{100.0 * seconds / denominator:.1f}%")
+        else:
+            fields.append(f"{key}={seconds:.3f}s")
+    extra_keys = sorted(set(values) - set(_MODEL_TIME_KEYS))
+    for key in extra_keys:
+        fields.append(f"{key}={values[key]:.3f}s")
+    return ", ".join(fields)
+
+
+def _log_model_time_summary(
+    runner: InferenceRunner,
+    batch_size: int,
+    predict_sec: float,
+) -> None:
+    summary = getattr(runner, "last_batch_time_summary", None)
+    if summary is None:
+        log_dict = getattr(runner, "last_log_dict", {})
+        if isinstance(log_dict, MappingABC) and isinstance(
+            log_dict.get("time"), MappingABC
+        ):
+            # In the exact same-shape path the model sees one leading batch
+            # dimension, so the time dict is already the whole batch.  Dividing
+            # by batch_size gives the per-record throughput view we care about.
+            summary = _summarize_model_time_dicts(
+                [log_dict["time"]],
+                item_count=batch_size,
+                source="exact-model-batch",
+            )
+    if summary is None:
+        return
+
+    total = summary["total"]
+    per_input = summary["per_input"]
+    logger.info(
+        "[Rank %s] Batch model timing total (%s, %d input(s), predict %.2fs): %s",
+        DIST_WRAPPER.rank,
+        summary["source"],
+        summary["items"],
+        predict_sec,
+        _format_time_fields(total, denominator=predict_sec),
+    )
+    if batch_size > 1:
+        logger.info(
+            "[Rank %s] Batch model timing per input (%s): %s",
+            DIST_WRAPPER.rank,
+            summary["source"],
+            _format_time_fields(per_input, denominator=None),
+        )
+
+
 def _predict_and_dump_items(
     runner: InferenceRunner,
     configs: Any,
@@ -996,6 +1136,7 @@ def _predict_and_dump_items(
             # normal dumped inference.
             torch.cuda.synchronize()
         predict_sec = time.perf_counter() - predict_start
+        _log_model_time_summary(runner, batch_size, predict_sec)
     except Exception as exc:
         _fallback_to_singletons(
             runner, configs, items, seed, num_data, batch_mode, exc

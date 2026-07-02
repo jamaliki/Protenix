@@ -26,6 +26,7 @@ from runner.inference import (
     _pad_token_trunk_tree,
     _queue_batch_signature,
     _run_prediction_batch,
+    _summarize_model_time_dicts,
 )
 from runner.campaign_inputs import (
     estimate_record_token_count,
@@ -330,6 +331,29 @@ class TestCampaignJsonBatching(unittest.TestCase):
         )
         self.assertIs(runner.predicted, data)
         self.assertEqual(len(runner.configs_seen), 1)
+
+    def test_model_time_summary_reports_batch_total_and_per_input(self):
+        summary = _summarize_model_time_dicts(
+            [
+                {
+                    "pairformer": 0.25,
+                    "diffusion": 1.0,
+                    "confidence_summary_stream": True,
+                },
+                {
+                    "pairformer": 0.25,
+                    "diffusion": 1.5,
+                },
+            ],
+            item_count=2,
+            source="token-trunk-batch",
+        )
+
+        self.assertEqual(summary["source"], "token-trunk-batch")
+        self.assertAlmostEqual(summary["total"]["pairformer"], 0.5)
+        self.assertAlmostEqual(summary["total"]["diffusion"], 2.5)
+        self.assertAlmostEqual(summary["per_input"]["diffusion"], 1.25)
+        self.assertNotIn("confidence_summary_stream", summary["total"])
 
 
 if __name__ == "__main__":
