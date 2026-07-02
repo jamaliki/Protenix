@@ -18,6 +18,7 @@ import time
 import traceback
 import urllib.request
 from argparse import Namespace
+from collections.abc import Mapping as MappingABC
 from contextlib import nullcontext
 from os.path import exists as opexists, join as opjoin
 from typing import Any, Mapping
@@ -256,6 +257,282 @@ class InferenceRunner(object):
         self.model.configs = new_configs
 
 
+def _inference_batch_size(configs: Any) -> int:
+    """Return the requested exact-shape inference batch size."""
+    try:
+        value = int(configs.get("inference_batch_size", 1))
+    except Exception:
+        value = 1
+    return max(1, value)
+
+
+def _tensor_tree_signature(value: Any) -> Any:
+    """Shape/dtype signature used to batch only exactly compatible inputs.
+
+    Padding variable-length proteins is not generally equivalent for this model:
+    several triangular operations can let padded tokens affect the valid region.
+    Exact tensor-tree matching is deliberately conservative. It gives the GPU a
+    leading batch dimension only when every model input already has the same
+    physical shape.
+    """
+    if isinstance(value, torch.Tensor):
+        return ("tensor", tuple(value.shape), str(value.dtype))
+    if isinstance(value, MappingABC):
+        return (
+            "dict",
+            tuple((key, _tensor_tree_signature(value[key])) for key in sorted(value)),
+        )
+    if isinstance(value, (list, tuple)):
+        return (
+            type(value).__name__,
+            tuple(_tensor_tree_signature(item) for item in value),
+        )
+    return ("value", type(value).__name__, repr(value))
+
+
+def _input_feature_signature(data: Mapping[str, Any]) -> Any:
+    return _tensor_tree_signature(data["input_feature_dict"])
+
+
+def _stack_tree(items: list[Any]) -> Any:
+    """Stack a homogeneous tensor tree along a new leading protein-batch axis."""
+    first = items[0]
+    if isinstance(first, torch.Tensor):
+        return torch.stack(items, dim=0)
+    if isinstance(first, MappingABC):
+        return {key: _stack_tree([item[key] for item in items]) for key in first}
+    if isinstance(first, list):
+        return [
+            _stack_tree([item[index] for item in items])
+            for index in range(len(first))
+        ]
+    if isinstance(first, tuple):
+        return tuple(
+            _stack_tree([item[index] for item in items])
+            for index in range(len(first))
+        )
+    return first
+
+
+def _stack_prediction_inputs(items: list[tuple[dict[str, Any], Any]]) -> dict[str, Any]:
+    return {
+        "input_feature_dict": _stack_tree(
+            [data["input_feature_dict"] for data, _atom_array in items]
+        )
+    }
+
+
+def _batched_prediction_n_sample(
+    prediction: Mapping[str, Any],
+    batch_size: int,
+    default_n_sample: int,
+) -> int:
+    coordinate = prediction.get("coordinate")
+    if (
+        isinstance(coordinate, torch.Tensor)
+        and coordinate.ndim >= 4
+        and coordinate.shape[0] == batch_size
+    ):
+        return int(coordinate.shape[1])
+    summary = prediction.get("summary_confidence")
+    if isinstance(summary, list) and len(summary) % batch_size == 0:
+        return max(1, len(summary) // batch_size)
+    return max(1, default_n_sample)
+
+
+def _slice_prediction_value(
+    key: str,
+    value: Any,
+    batch_index: int,
+    batch_size: int,
+    n_sample: int,
+) -> Any:
+    """Take one protein from a batched prediction tree.
+
+    Tensor predictions carry the protein batch as their leading dimension.
+    Confidence summaries are flattened by ``compute_full_data_and_summary`` as
+    ``batch * N_sample`` dictionaries, so they need a sample-sized list slice.
+    """
+    if key in {"summary_confidence", "full_data"} and isinstance(value, list):
+        if len(value) % batch_size == 0:
+            per_item = len(value) // batch_size
+        else:
+            per_item = n_sample
+        start = batch_index * per_item
+        return value[start : start + per_item]
+    if isinstance(value, torch.Tensor):
+        if value.ndim > 0 and value.shape[0] == batch_size:
+            return value[batch_index]
+        return value
+    if isinstance(value, MappingABC):
+        return {
+            sub_key: _slice_prediction_value(
+                sub_key, sub_value, batch_index, batch_size, n_sample
+            )
+            for sub_key, sub_value in value.items()
+        }
+    return value
+
+
+def _split_batched_prediction(
+    prediction: Mapping[str, Any],
+    batch_size: int,
+    default_n_sample: int,
+) -> list[dict[str, Any]]:
+    n_sample = _batched_prediction_n_sample(prediction, batch_size, default_n_sample)
+    return [
+        {
+            key: _slice_prediction_value(
+                key, value, batch_index, batch_size, n_sample
+            )
+            for key, value in prediction.items()
+        }
+        for batch_index in range(batch_size)
+    ]
+
+
+def _write_inference_error(
+    runner: InferenceRunner,
+    sample_name: str,
+    error_message: str,
+) -> None:
+    logger.error(error_message)
+    with open(opjoin(runner.error_dir, f"{sample_name}.txt"), "a", encoding="utf-8") as f:
+        f.write(error_message)
+
+
+def _dump_prediction(
+    runner: InferenceRunner,
+    data: Mapping[str, Any],
+    atom_array: Any,
+    seed: int,
+    prediction: Mapping[str, Any],
+) -> None:
+    runner.dumper.dump(
+        dataset_name="",
+        pdb_id=data["sample_name"],
+        seed=seed,
+        pred_dict=prediction,
+        atom_array=atom_array,
+        entity_poly_type={
+            k: v for k, v in data["entity_poly_type"].items() if v != "non-polymer"
+        },
+    )
+
+
+def _describe_batch(items: list[tuple[dict[str, Any], Any]], seed: int) -> None:
+    first_data = items[0][0]
+    names = [data["sample_name"] for data, _atom_array in items]
+    logger.info(
+        "[Rank %s] Predicting %d same-shape input(s) [seed:%s]: "
+        "N_token %s, N_atom %s, N_msa %s, names=%s",
+        DIST_WRAPPER.rank,
+        len(items),
+        seed,
+        int(first_data["N_token"].item()),
+        int(first_data["N_atom"].item()),
+        int(first_data["N_msa"].item()),
+        ",".join(names[:4]) + ("..." if len(names) > 4 else ""),
+    )
+
+
+def _run_prediction_batch(
+    runner: InferenceRunner,
+    configs: Any,
+    items: list[tuple[dict[str, Any], Any]],
+) -> Mapping[str, Any]:
+    first_data = items[0][0]
+    n_token = int(first_data["N_token"].item())
+    runner.update_model_configs(update_inference_configs(configs, n_token))
+    batch_data = first_data if len(items) == 1 else _stack_prediction_inputs(items)
+    return runner.predict(batch_data)
+
+
+def _fallback_to_singletons(
+    runner: InferenceRunner,
+    configs: Any,
+    items: list[tuple[dict[str, Any], Any]],
+    seed: int,
+    num_data: int,
+    exc: Exception,
+) -> None:
+    if len(items) == 1:
+        data = items[0][0]
+        error_message = (
+            f"[Rank {DIST_WRAPPER.rank}] {data['sample_name']} failed: {exc}\n"
+            f"{traceback.format_exc()}"
+        )
+        _write_inference_error(runner, data["sample_name"], error_message)
+        torch.cuda.empty_cache()
+        return
+
+    logger.warning(
+        "Batched prediction of %d same-shape inputs failed; falling back "
+        "to singleton inference. Error: %s",
+        len(items),
+        exc,
+    )
+    torch.cuda.empty_cache()
+    for item in items:
+        _predict_and_dump_items(runner, configs, [item], seed, num_data)
+
+
+def _prediction_items(
+    prediction: Mapping[str, Any],
+    configs: Any,
+    batch_size: int,
+) -> list[Mapping[str, Any]]:
+    if batch_size == 1:
+        return [prediction]
+    return _split_batched_prediction(
+        prediction,
+        batch_size=batch_size,
+        default_n_sample=int(configs.sample_diffusion.N_sample),
+    )
+
+
+def _predict_and_dump_items(
+    runner: InferenceRunner,
+    configs: Any,
+    items: list[tuple[dict[str, Any], Any]],
+    seed: int,
+    num_data: int,
+) -> None:
+    """Run one exact-shape batch, split outputs, and dump per input."""
+    if not items:
+        return
+
+    batch_size = len(items)
+    _describe_batch(items, seed)
+    start = time.time()
+    try:
+        prediction = _run_prediction_batch(runner, configs, items)
+    except Exception as exc:
+        _fallback_to_singletons(runner, configs, items, seed, num_data, exc)
+        return
+
+    predictions = _prediction_items(prediction, configs, batch_size)
+    for prediction_i, (data, atom_array) in zip(predictions, items):
+        _dump_prediction(runner, data, atom_array, seed, prediction_i)
+        logger.info(
+            "[Rank %s] %s [seed:%s] succeeded in batched forward. "
+            "Results saved to %s",
+            DIST_WRAPPER.rank,
+            data["sample_name"],
+            seed,
+            configs.dump_dir,
+        )
+    logger.info(
+        "[Rank %s] Finished %d/%d input(s) [seed:%s] in %.2fs.",
+        DIST_WRAPPER.rank,
+        batch_size,
+        num_data,
+        seed,
+        time.time() - start,
+    )
+    torch.cuda.empty_cache()
+
+
 def progress_callback(block_num: int, block_size: int, total_size: int) -> None:
     """Callback for tracking download progress."""
     downloaded = block_num * block_size
@@ -459,64 +736,51 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
     for seed in seeds:
         seed_everything(seed=seed, deterministic=configs.deterministic)
         t1_start = time.time()
+        batch_size = _inference_batch_size(configs)
+        pending: dict[Any, list[tuple[dict[str, Any], Any]]] = {}
+
+        def flush_signature(signature: Any) -> None:
+            items = pending.pop(signature, [])
+            _predict_and_dump_items(
+                runner=runner,
+                configs=configs,
+                items=items,
+                seed=seed,
+                num_data=num_data,
+            )
+
         for batch in dataloader:
-            sample_name = "unknown"
-            try:
-                t2_start = time.time()
-                data, atom_array, data_error_message = batch[0]
-                sample_name = data["sample_name"]
+            for data, atom_array, data_error_message in batch:
+                sample_name = data.get("sample_name", "unknown")
+                try:
+                    if len(data_error_message) > 0:
+                        _write_inference_error(
+                            runner,
+                            sample_name,
+                            f"Data error for {sample_name}: {data_error_message}",
+                        )
+                        continue
 
-                if len(data_error_message) > 0:
-                    logger.error(f"Data error for {sample_name}: {data_error_message}")
-                    with open(
-                        opjoin(runner.error_dir, f"{sample_name}.txt"),
-                        "a",
-                        encoding="utf-8",
-                    ) as f:
-                        f.write(data_error_message)
-                    continue
+                    logger.info(
+                        f"[Rank {DIST_WRAPPER.rank} ({data['sample_index'] + 1}/{num_data})] "
+                        f"{sample_name} [seed:{seed}]: "
+                        f"N_asym {data['N_asym'].item()}, N_token {data['N_token'].item()}, "
+                        f"N_atom {data['N_atom'].item()}, N_msa {data['N_msa'].item()}"
+                    )
+                    signature = _input_feature_signature(data)
+                    pending.setdefault(signature, []).append((data, atom_array))
+                    if len(pending[signature]) >= batch_size:
+                        flush_signature(signature)
+                except Exception as e:
+                    error_message = (
+                        f"[Rank {DIST_WRAPPER.rank}] {sample_name} failed: {e}\n"
+                        f"{traceback.format_exc()}"
+                    )
+                    _write_inference_error(runner, sample_name, error_message)
+                    torch.cuda.empty_cache()
 
-                logger.info(
-                    f"[Rank {DIST_WRAPPER.rank} ({data['sample_index'] + 1}/{num_data})] "
-                    f"{sample_name} [seed:{seed}]: "
-                    f"N_asym {data['N_asym'].item()}, N_token {data['N_token'].item()}, "
-                    f"N_atom {data['N_atom'].item()}, N_msa {data['N_msa'].item()}"
-                )
-                new_configs = update_inference_configs(configs, data["N_token"].item())
-                runner.update_model_configs(new_configs)
-                prediction = runner.predict(data)
-                runner.dumper.dump(
-                    dataset_name="",
-                    pdb_id=sample_name,
-                    seed=seed,
-                    pred_dict=prediction,
-                    atom_array=atom_array,
-                    entity_poly_type={
-                        k: v
-                        for k, v in data["entity_poly_type"].items()
-                        if v != "non-polymer"
-                    },
-                )
-                t2_end = time.time()
-                logger.info(
-                    f"[Rank {DIST_WRAPPER.rank}] {sample_name} [seed:{seed}] succeeded. "
-                    f"Model forward time: {t2_end - t2_start:.2f}s. "
-                    f"Results saved to {configs.dump_dir}"
-                )
-                torch.cuda.empty_cache()
-            except Exception as e:
-                error_message = (
-                    f"[Rank {DIST_WRAPPER.rank}] {sample_name} failed: {e}\n"
-                    f"{traceback.format_exc()}"
-                )
-                logger.error(error_message)
-                with open(
-                    opjoin(runner.error_dir, f"{sample_name}.txt"),
-                    "a",
-                    encoding="utf-8",
-                ) as f:
-                    f.write(error_message)
-                torch.cuda.empty_cache()
+        for signature in list(pending):
+            flush_signature(signature)
         t1_end = time.time()
         logger.info(
             f"[Rank {DIST_WRAPPER.rank}] Seed {seed} completed in {t1_end - t1_start:.2f}s."

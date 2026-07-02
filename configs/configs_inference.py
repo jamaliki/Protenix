@@ -28,6 +28,11 @@ inference_configs = {
     "input_json_path": RequiredValue(str),
     "load_checkpoint_dir": os.path.join(PROTENIX_ROOT_DIR, "checkpoint"),
     "num_workers": 0,
+    # Number of same-shape JSON inputs to run in one model forward during
+    # inference.  The public runner keeps this at 1 by default; larger values
+    # are used only when all tensor feature shapes match exactly, so ragged
+    # padding cannot leak into model outputs.
+    "inference_batch_size": 1,
     "use_msa": True,
     "enable_tf32": True,
     "enable_efficient_fusion": True,
