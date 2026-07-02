@@ -27,6 +27,9 @@ inference_configs = {
     "sorted_by_ranking_score": True,
     "input_json_path": RequiredValue(str),
     "load_checkpoint_dir": os.path.join(PROTENIX_ROOT_DIR, "checkpoint"),
+    # CPU workers for JSON-to-feature conversion.  Keep 0 for the historical
+    # single-record path; throughput runs with many inputs can raise this to
+    # prepare the next exact-shape bucket while the GPU is busy.
     "num_workers": 0,
     # Number of same-shape JSON inputs to run in one model forward during
     # inference.  The public runner keeps this at 1 by default; larger values

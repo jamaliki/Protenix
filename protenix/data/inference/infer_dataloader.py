@@ -57,12 +57,27 @@ def get_inference_dataloader(configs: Any) -> DataLoader:
         rank=DIST_WRAPPER.rank,
         shuffle=False,
     )
+    num_workers = max(0, int(configs.get("num_workers", 0)))
+    dataloader_kwargs = {
+        "num_workers": num_workers,
+    }
+    if num_workers > 0:
+        # In throughput runs the GPU consumes one exact-shape bucket while the
+        # CPU prepares the next inputs.  Persistent workers avoid paying process
+        # startup for every seed, and prefetching keeps the main process from
+        # becoming the serialization point before a batched model forward.
+        dataloader_kwargs.update(
+            {
+                "persistent_workers": True,
+                "prefetch_factor": 2,
+            }
+        )
     dataloader = DataLoader(
         dataset=inference_dataset,
         batch_size=1,
         sampler=sampler,
         collate_fn=collate_fn_identity,
-        num_workers=configs.num_workers,
+        **dataloader_kwargs,
     )
     return dataloader
 
