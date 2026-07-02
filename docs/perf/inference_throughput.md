@@ -182,7 +182,17 @@ earlier row can be mutated by a later stage and point to the wrong boundary.
 in a larger zero-padded tensor, while `*_invalid_region_sensitivity` compares
 zero-padded and random-invalid padded tensors with the same mask.  The former
 finds physical-length-dependent numerical drift; the latter would find a real
-mask leak.
+mask leak.  `scripts/perf/pairformer_padding_mechanism.py` is the smaller
+primitive-level reproducer for the same question: it runs triangle
+multiplication, triangle attention, a per-cell pair transition, and
+token attention independently so the first bad boundary is not hidden by the
+rest of the block.  From the repository root:
+
+```bash
+PYTHONPATH=$PWD python scripts/perf/pairformer_padding_mechanism.py \
+  --short-tokens 245 --full-tokens 384
+```
+
 With the fixed diagnostic, one padded 245-token block inside a 384-token tensor
 is almost exact in FP32, but the valid-region difference grows through a full
 stack.  On a 48-block random pairformer stack:
