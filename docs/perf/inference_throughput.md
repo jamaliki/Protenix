@@ -419,6 +419,35 @@ control.  Status: queued as job `95925`
 (`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/diffusion_transformer_sample_axis_20260702_203922`),
 dependent on the raw masked SDPA probe (`afterany:95919`).
 
+Implementation candidate `40e51f8` adds the corresponding model path behind
+two opt-in flags:
+
+```bash
+export PROTENIX_DIFFUSION_TRANSFORMER_SAMPLE_AXIS=1
+export PROTENIX_RANK5_FULL_ATTENTION_BF16=1
+```
+
+The first flag keeps the low-sample diffusion transformer activation as
+`[record, sample, token, channel]` and passes the token key mask as
+`[record, 1, token]`, so the projected pair and padding bias can be consumed as
+`[record, 1, head, token, token]` instead of being materialized once per sample.
+The second flag relaxes Protenix's conservative rank-5 FP32 attention policy
+only for **full** token attention (`Q == K`); atom local attention still stays on
+its original guarded path.  This is deliberately not default-on yet: it changes
+the fusion boundary and needs a GPU gate before promotion.  Remote CPU checks in
+the `env-boltz2` environment passed the sample-invariant and explicit
+sample-axis parity tests plus the ragged-batch helper tests.
+
+Candidate gate status: queued from isolated checkout
+`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_sampleaxis_40e51f8`.
+Smoke job `95935`
+(`runs/sample_axis_ns2_smoke_20260702_204806`, `N_sample=2`, `N_step=1`) runs
+the real model path with both flags enabled.  Representative paired job `95936`
+(`runs/sample_axis_ns5_pair_b16_n200_20260702_204806`, `afterok:95935`)
+compares the current flattened sample-lane path against the explicit
+sample-axis path on the 32 mixed 40-220-token proteins with `N_sample=5`,
+`N_step=200`, `--batch_size 16`, confidence enabled, no MSA/template.
+
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`
 (`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/fusion_flags_pair_b16_n200_20260702_170343`)
