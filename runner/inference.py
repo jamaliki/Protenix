@@ -269,11 +269,14 @@ def _inference_batch_size(configs: Any) -> int:
 def _tensor_tree_signature(value: Any) -> Any:
     """Shape/dtype signature used to batch only exactly compatible inputs.
 
-    Padding variable-length proteins is not generally equivalent for this model:
-    several triangular operations can let padded tokens affect the valid region.
-    Exact tensor-tree matching is deliberately conservative. It gives the GPU a
+    Padding variable-length proteins changes the physical reduction lengths seen
+    by attention and triangular kernels.  Even when masks prevent padded values
+    from leaking into the valid region, different reduction schedules introduce
+    tiny floating-point differences that are amplified by the 48-block trunk.
+    Exact tensor-tree matching is deliberately conservative: it gives the GPU a
     leading batch dimension only when every model input already has the same
-    physical shape.
+    physical shape, so batching is a throughput optimization rather than a
+    numerical change.
     """
     if isinstance(value, torch.Tensor):
         return ("tensor", tuple(value.shape), str(value.dtype))

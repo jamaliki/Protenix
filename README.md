@@ -134,8 +134,11 @@ should be split by target/feature shape before inference.
 The batching rule is deliberately conservative.  The runner stacks only records
 whose featurized tensor trees have exactly matching shapes and dtypes.  It does
 not pad ragged proteins into one trunk batch, because padding the triangular
-pairformer is not a proven semantic no-op.  Token count, atom count, MSA depth,
-templates, RNA settings, and ligand features can all change the feature shapes.
+pairformer changes the physical reduction lengths seen by attention and
+triangular kernels.  Masks stop padded values from leaking, but the different
+kernel schedules can still introduce tiny floating-point changes that compound
+through the 48-block trunk.  Token count, atom count, MSA depth, templates, RNA
+settings, and ligand features can all change the feature shapes.
 
 Directory inputs are campaign-aware in this branch:
 

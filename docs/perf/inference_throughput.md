@@ -186,11 +186,32 @@ stack.  On a 48-block random pairformer stack:
 | FP32 CUEQ, 245 -> 384 tokens | 0.0120 | 0.0775 | 0.0060 | 0.0653 |
 | BF16 CUEQ, 245 -> 384 tokens | 0.2359 | 1.4375 | 0.1676 | 1.6094 |
 
-The mechanism is length-dependent numerical drift through masked triangular
-reductions, not obvious unmasked padded-token leakage in the first block.  It
-is still enough to make padded mixed-shape batching a numerical-change feature,
-not a safe default throughput optimization.  The runner therefore keeps exact
-tensor-tree batching and leaves shape-heterogeneous records in separate buckets.
+The mechanism is length-dependent numerical drift, not padded-token leakage.  A
+focused mechanism screen compared three cases for both triangle multiplication
+and token attention: true 245-token tensors, the same valid 245-token crop from a
+384-token tensor, and a 384-token tensor where the invalid padded region was
+changed from zeros to random values.  Changing invalid padded values produced
+exactly zero valid-region change.  Changing the physical kernel length from 245
+to 384, however, produced small valid-region differences even though the padded
+lanes were masked or zeroed:
+
+| isolated op | comparison | dtype/kernel | max abs valid diff | note |
+| --- | --- | --- | ---: | --- |
+| outgoing triangle multiplication | padded zeros vs random invalid padded values | FP32/BF16, torch/CUEQ | 0 | no invalid-token leakage |
+| outgoing triangle multiplication | 245-token physical tensor vs 384-token padded tensor | FP32 torch/CUEQ | 7.46e-05 / 1.01e-04 | length-dependent reduction schedule |
+| outgoing triangle multiplication | 245-token physical tensor vs 384-token padded tensor | BF16 torch/CUEQ | 0.0078125 / 0.015625 | one-to-two BF16 ulps at first boundary |
+| token attention | padded zeros vs random invalid padded values | FP32/BF16 SDPA | 0 | no invalid-token leakage |
+| token attention | 245-token physical tensor vs 384-token padded tensor | FP32 SDPA | about 9e-05 | length-dependent SDPA schedule |
+| token attention | 245-token physical tensor vs 384-token padded tensor | BF16 SDPA | 0.000488 | small first-boundary drift |
+
+So zeroing or masking harder is not the fix; the masks already block padded
+content.  The problem is that cuDNN SDPA, CUEQ, and related matmul reductions are
+not bitwise invariant to padded physical length.  The 48 residual pairformer
+blocks then amplify those small differences into material output drift.  Padded
+mixed-shape batching should therefore be treated as an explicit numerical-change
+feature that needs end-to-end structure/designability validation, not as a safe
+default throughput optimization.  The runner keeps exact tensor-tree batching and
+leaves shape-heterogeneous records in separate buckets.
 
 ## Reproducing the benchmark
 
