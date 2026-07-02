@@ -112,7 +112,10 @@ flattening after the CUEQ attention kernel, while the QKV layout producer writes
 CUEQ's required `[..., I, H, J, D]` q/k/v tensors directly after the fused
 projection. Together these remove high-batch HBM traffic without replacing the
 vendor GEMM or CUEQ attention kernels. A separate guarded transition
-input-projection fusion remains opt-in for memory/batch-size experiments.
+input-projection fusion remains opt-in for memory/batch-size experiments; when
+that wide projection is unsafe at larger batches, an in-place Triton fallback
+still fuses the memory-bound `SiLU(a) * b` transition activation without adding
+another giant temporary.
 
 For the recommended flags, reproduction commands, profiling scripts, and the
 negative results that shaped the implementation, see

@@ -35,6 +35,7 @@ from protenix.model.modules.fused_elementwise_triton import (
     fused_sigmoid_mul_add,
     triton_fused_elementwise_available,
     triton_fused_elementwise_enabled,
+    triton_silu_mul_inplace_y,
     triton_silu_mul_split,
 )
 
@@ -412,9 +413,13 @@ class Transition(nn.Module):
                 b = self._fused_input_projection(y)
                 if b is None:
                     a = self.linear_no_bias_a(y)
-                    a = F.silu(a, True)
                     b = self.linear_no_bias_b(y)
-                    b *= a
+                    fused_b = triton_silu_mul_inplace_y(a, b)
+                    if fused_b is None:
+                        a = F.silu(a, True)
+                        b *= a
+                    else:
+                        b = fused_b
                     del a
                 del y
                 b = self.linear_no_bias(b)
