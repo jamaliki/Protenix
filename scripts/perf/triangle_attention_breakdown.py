@@ -19,6 +19,11 @@ from typing import Callable, Iterator, TypeVar
 
 import torch
 
+from protenix.model.modules.fused_elementwise_triton import (
+    triton_fused_elementwise_available,
+    triton_fused_elementwise_enabled,
+    triton_sigmoid_mul_heads_first,
+)
 from protenix.model.triangular.layers import (
     cuequivariance_triangular_attn,
     flatten_final_dims,
@@ -189,6 +194,45 @@ def module_forward(
     return module(x, mask=mask, triangle_attention="cuequivariance")
 
 
+def layout_probe(
+    module: TriangleAttention,
+    x_in: torch.Tensor,
+    mask_in: torch.Tensor,
+) -> dict[str, object]:
+    x = x_in
+    mask = mask_in
+    if not module.starting:
+        x = x.transpose(-2, -3)
+        mask = mask.transpose(-1, -2)
+
+    x = module.layer_norm(x)
+    mask_bias = (module.inf * (mask - 1))[..., :, None, None, :]
+    triangle_bias = permute_final_dims(module.linear(x), (2, 0, 1)).unsqueeze(-4)
+    q, k, v = module.mha._prep_qkv(x, x, apply_scale=False)
+    scale = 1.0 / math.sqrt(module.c_hidden)
+    heads_first = cuequivariance_triangular_attn(
+        q, k, v, triangle_bias.float(), (mask_bias == 0).bool(), scale
+    )[0]
+    gate = module.mha.linear_g(x)
+    fused = triton_sigmoid_mul_heads_first(gate, heads_first)
+
+    return {
+        "triton_enabled": triton_fused_elementwise_enabled(),
+        "triton_available": triton_fused_elementwise_available(),
+        "helper_returned": fused is not None,
+        "gate_shape": list(gate.shape),
+        "gate_stride": list(gate.stride()),
+        "gate_contiguous": gate.is_contiguous(),
+        "gate_dtype": str(gate.dtype),
+        "heads_first_shape": list(heads_first.shape),
+        "heads_first_stride": list(heads_first.stride()),
+        "heads_first_contiguous": heads_first.is_contiguous(),
+        "heads_first_dtype": str(heads_first.dtype),
+        "fused_shape": None if fused is None else list(fused.shape),
+        "fused_stride": None if fused is None else list(fused.stride()),
+    }
+
+
 def cuda_time(fn: Callable[[], torch.Tensor], iters: int) -> float:
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -244,6 +288,7 @@ def main() -> None:
         reference = module_forward(module, x, mask)
         split, _ = manual_cueq_forward(module, x, mask)
         parity = max_abs_error(reference, split)
+        layout = layout_probe(module, x, mask)
 
         for _ in range(args.warmup):
             module_forward(module, x, mask)
@@ -261,6 +306,7 @@ def main() -> None:
         "args": vars(args),
         "manual_total_ms": total_ms,
         "module_forward_ms": module_forward_ms,
+        "layout_probe": layout,
         "mean_ms": mean_ms,
         "percent": {name: 100.0 * value / total_ms for name, value in mean_ms.items()},
         "parity_max_abs_error": parity,
