@@ -21,14 +21,19 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 
-from protenix.model.triangular.layers import Attention, LayerNorm, OpenfoldLinear
+from protenix.model.triangular.layers import (
+    Attention,
+    LayerNorm,
+    OpenfoldLinear,
+    cueq_dense_pair_mask_enabled,
+)
 from protenix.model.utils import chunk_layer, is_fp16_enabled, permute_final_dims
 
 
 def kernel_triangular_mult(
     x: torch.Tensor,
     direction: str,
-    mask: torch.Tensor,
+    mask: Optional[torch.Tensor],
     norm_in_weight: torch.Tensor,
     norm_in_bias: torch.Tensor,
     p_in_weight: torch.Tensor,
@@ -492,10 +497,17 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
         # Therefore, we include a check here: if c != c_z, we fall back to using plain PyTorch.
         # This situation may occur in our template module.
         if triangle_multiplicative == "cuequivariance" and (self.c_z == self.c_hidden):
+            cueq_mask = mask
+            if cueq_dense_pair_mask_enabled():
+                # Dense many-sequence inference batches do not need mask
+                # traffic. CUEQ treats ``mask=None`` as "all pairs valid".
+                cueq_mask = None
+            elif cueq_mask is None:
+                cueq_mask = z.new_ones(z.shape[:-1])[None]
             update = kernel_triangular_mult(
                 z[None],
                 direction="outgoing" if self._outgoing else "incoming",
-                mask=z.new_ones(z.shape[:-1])[None] if mask is None else mask,
+                mask=cueq_mask,
                 norm_in_weight=self.layer_norm_in.weight,
                 norm_in_bias=self.layer_norm_in.bias,
                 p_in_weight=torch.cat(
@@ -671,7 +683,12 @@ class TriangleAttention(nn.Module):
         Returns:
             [*, I, J, C_in] output tensor
         """
-        if mask is None:
+        dense_cueq = (
+            triangle_attention == "cuequivariance"
+            and chunk_size is None
+            and cueq_dense_pair_mask_enabled()
+        )
+        if mask is None and not dense_cueq:
             # [*, I, J]
             mask = x.new_ones(
                 x.shape[:-1],
@@ -679,13 +696,18 @@ class TriangleAttention(nn.Module):
 
         if not self.starting:
             x = x.transpose(-2, -3)
-            mask = mask.transpose(-1, -2)
+            if mask is not None:
+                mask = mask.transpose(-1, -2)
 
         # [*, I, J, C_in]
         x = self.layer_norm(x)
 
-        # [*, I, 1, 1, J]
-        mask_bias = (self.inf * (mask - 1))[..., :, None, None, :]
+        # [*, I, 1, 1, J]. In dense CUEQ mode this stays None so the wrapper
+        # can pass ``mask=None`` to the kernel instead of materializing a large
+        # all-zero bias and then converting it back to bool.
+        mask_bias = (
+            None if dense_cueq else (self.inf * (mask - 1))[..., :, None, None, :]
+        )
 
         # [*, H, I, J]
         triangle_bias = permute_final_dims(self.linear(x), (2, 0, 1))

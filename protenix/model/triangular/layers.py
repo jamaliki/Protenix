@@ -45,6 +45,23 @@ def _prod(nums: Union[List[int], Tuple[int, ...], torch.Size]) -> int:
     return out
 
 
+def cueq_dense_pair_mask_enabled() -> bool:
+    """Return true when the caller has guaranteed that all pair tokens are valid.
+
+    CUEQ's triangle kernels accept ``mask=None`` as the dense all-valid case.
+    That avoids building a zero mask-bias tensor and then converting it back to
+    a bool mask.  We keep this as an explicit contract rather than checking
+    ``torch.all(mask)`` here, because a runtime mask scan would add GPU work and
+    can erase the traffic we are trying to remove.
+    """
+    return os.getenv("PROTENIX_CUEQ_DENSE_PAIR_MASK", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
 def _calculate_fan(
     linear_weight_shape: Union[torch.Size, Tuple[int, ...]], fan: str = "fan_in"
 ) -> Union[int, float]:
@@ -514,8 +531,9 @@ class Attention(nn.Module):
             #         N to be a multiple of 8 for the forward pass; pad the sequence if necessary.
             #         Currently, this feature is supported only for cu13 builds.
             scale = 1.0 / math.sqrt(self.c_hidden)
+            mask = None if biases[0] is None else (biases[0] == 0).bool()
             o = cuequivariance_triangular_attn(
-                q, k, v, biases[1].float(), (biases[0] == 0).bool(), scale
+                q, k, v, biases[1].float(), mask, scale
             )
             # cuequivariance returns a tensor unless return_aux=True.  Indexing
             # with ``[0]`` silently drops the sequence-batch dimension for B>1,
@@ -655,7 +673,7 @@ def cuequivariance_triangular_attn(
     k: torch.Tensor,
     v: torch.Tensor,
     bias: torch.Tensor,
-    mask: torch.Tensor,
+    mask: Optional[torch.Tensor],
     scale: float,
 ) -> torch.Tensor:
     from cuequivariance_torch.primitives.triangle import triangle_attention
