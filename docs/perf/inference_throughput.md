@@ -519,11 +519,14 @@ Finished 2/2 input(s) ... in 9.56s
 Because fallback escalation was enabled, that job would have failed if the
 batch path silently fell back to singleton inference.
 
-The representative paired gate is queued as job `96081`
+The representative paired gate completed as job `96081`
 (`runs/sample_axis_b16s5_gate_20260702_215232_9eb2197`) on `gpu-canary`.  It
-uses the same 32 mixed 40-220-token proteins with `N_sample=5`, `N_step=200`,
-`--batch_size 16`, confidence enabled, no MSA/template, and compares four cases
-on one H100:
+used the same 32 mixed 40-220-token proteins with `N_sample=5`, `N_step=200`,
+`--batch_size 16`, confidence enabled, no MSA/template, and compared four cases
+on one H100.  This canary used `PROTENIX_DISABLE_FAST_LAYER_NORM=1` because the
+CUDA-13 fast-layernorm extension still fails to compile against the current
+PyTorch headers, so treat this as a strong within-job relative gate rather than
+a clean absolute comparison to older fast-layernorm runs.
 
 1. `old_low_sample_boundary`: `PROTENIX_BATCH_DIFFUSION_MAX_SAMPLES=1`,
    default full-attention FP32 policy.
@@ -534,6 +537,28 @@ on one H100:
 4. `explicit_sample_axis_bf16attn`: explicit sample-axis path with both
    `PROTENIX_ATTENTION_FORCE_FP32=0` and
    `PROTENIX_RANK5_FULL_ATTENTION_BF16=1`.
+
+Results parsed with `scripts/perf/parse_batch_gate_log.py --samples-per-input 5`:
+
+| case | predict sec | input records/s | generated samples/s | pairformer | diffusion | diffusion transformer | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| old low-sample boundary | 212.51 | 0.151 | 0.753 | 26.87 | 171.86 | 103.36 | 12.36 | baseline for this gate |
+| flat sample lanes, FP32 attention | 76.81 | 0.417 | 2.083 | 23.44 | 43.49 | 26.59 | 8.32 | promoted mechanism |
+| flat sample lanes, BF16 attention | 73.34 | 0.436 | 2.182 | 21.88 | 39.99 | 23.14 | 9.94 | best robust setting |
+| explicit sample axis, BF16 attention | 72.50 | 0.441 | 2.207 | 22.07 | 44.26 | 27.45 | 4.58 | not promoted beyond opt-in |
+
+The large, trustworthy movement is the flattened low-sample diffusion boundary:
+`212.51s -> 73.34s` predict (`2.90x`) and `0.753 -> 2.182` generated samples/s
+for `N_sample=5`.  Allowing full token attention to remain BF16
+(`PROTENIX_ATTENTION_FORCE_FP32=0`) adds a smaller `1.05x` over the flattened
+FP32-attention path.  The explicit rank-5 sample-axis path is not a promoted
+default despite the best total time (`72.50s`, another `1.2%`): the targeted
+diffusion-transformer subrange got slower (`23.14s -> 27.45s`) and the total
+movement is dominated by noisier confidence/pairformer differences.  Keep
+`PROTENIX_DIFFUSION_TRANSFORMER_SAMPLE_AXIS=1` and
+`PROTENIX_RANK5_FULL_ATTENTION_BF16=1` as diagnostic opt-ins until a custom
+attention/bias kernel beats the flattened BF16 boundary on the transformer
+itself.
 
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`

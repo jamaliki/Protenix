@@ -126,6 +126,15 @@ For tightly bucketed or same-shape 245-token `7r6r`-like inputs, `32-64` is the
 practical knee: larger batches consume much more memory but add little
 throughput.  If you hit OOM, try `--batch_size 8`.
 
+For the common low-sample campaign range (`N_sample=1-5`), leave
+`PROTENIX_BATCH_DIFFUSION_MAX_SAMPLES` at its default `5` so the diffusion tail
+can batch records and samples together.  For maximum throughput on H100, also
+set `PROTENIX_ATTENTION_FORCE_FP32=0`; this lets full token attention stay in
+BF16/cuDNN instead of upcasting q/k/v to FP32.  Do not enable
+`PROTENIX_DIFFUSION_TRANSFORMER_SAMPLE_AXIS=1` by default yet: it is useful for
+kernel experiments, but the full gate did not show a robust win over the
+flattened BF16 path.
+
 Do not set the experimental Triton elementwise/residual/transition flags for
 this mixed-campaign path unless you are running a new benchmark.  On the B16
 mixed-length gate they slowed the representative predict section from `41.6s`
@@ -181,8 +190,8 @@ Directory inputs are campaign-aware in this branch:
   high-quality GEMM/CUEQ kernels and remove measured layout-copy traffic around
   them.  If Triton is missing, the code falls back safely but runs slower.
 
-Measured one-H100 gates with repeated `7r6r` inputs, `N_sample=1`,
-`N_step=200`, confidence enabled, and normal CIF/JSON dumping:
+Measured one-H100 gates, `N_step=200`, confidence enabled, and normal CIF/JSON
+dumping:
 
 | input layout | old behavior | optimized behavior | speedup |
 | --- | ---: | ---: | ---: |
@@ -190,6 +199,7 @@ Measured one-H100 gates with repeated `7r6r` inputs, `N_sample=1`,
 | One combined JSON with 32 same-shape records | 361.8 s runner time | 69.3 s runner time | 5.2x after initialization |
 | 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.9 s summed predict, 0.943 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.70x predict, 5.69x throughput |
+| 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 73.3 s, 2.18 generated samples/s at `--batch_size 16` with flattened sample lanes and BF16 full attention | 2.90x over the old branch boundary |
 
 Quick sanity check: a good campaign run should log messages like
 `Predicting 32 same-shape (auto) input(s)` or
@@ -199,7 +209,8 @@ look for `Predicting ... padded-token-trunk (auto)` plus a high
 `token-trunk+diffusion-token-atom-batch` for the newest mixed-token fast path
 or `token-trunk+diffusion-transformer-batch` if atom batching has been disabled.
 If it only reads `token-trunk-batch`, check whether
-`PROTENIX_BATCH_DIFFUSION_TRANSFORMER=0`, `N_sample>1`, or guidance disabled the
+`PROTENIX_BATCH_DIFFUSION_TRANSFORMER=0`,
+`N_sample > PROTENIX_BATCH_DIFFUSION_MAX_SAMPLES`, or guidance disabled the
 diffusion sharing path.  If atom timings stay large, check
 `PROTENIX_BATCH_ATOM_TRANSFORMER=0` or cache-disabled runs.  If you only see
 singleton predictions, the inputs are not sharing a compatible trunk boundary or
