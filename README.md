@@ -76,23 +76,31 @@ For a complete list of supported models, please refer to [Supported Models](docs
 
 For detailed instructions on installation, data preprocessing, inference, and training, please refer to the [Training and Inference Instructions](docs/training_inference_instructions.md). We recommend users refer to [inference_demo.sh](inference_demo.sh) for detailed inference methods and input explanations.
 
-### ⚡ H100 Inference Throughput Optimisation
+### ⚡ H100 inference throughput guide for this branch
 
-This branch contains H100-oriented inference optimisations for two high-throughput
-workloads. The goal is higher **per-GPU throughput** while keeping the normal
-confidence outputs enabled.
+This branch is optimized for **per-GPU inference throughput**, not minimum
+single-job latency.  The measured fast paths keep the normal confidence outputs
+enabled.  Use this source checkout, or an editable install from it; an older
+`protenix` package from PyPI will not include these branch-specific changes.
 
-| workload | best entry point | main speedup mechanism |
+```bash
+git clone git@github.com:jamaliki/Protenix.git
+cd Protenix
+pip install -e .
+```
+
+Pick the path that matches your workload:
+
+| workload | best way to run it | what provides the speedup |
 | --- | --- | --- |
-| Many independent designs, usually `N_sample=1-5` | Put all designs in one JSON file or one input directory and use `--batch_size 32` | Stack same-shape inputs into one model forward instead of launching one forward per JSON file |
-| Many samples for one design, e.g. `N_sample=1280-2560` | Use a large `-e/--sample` value with the fast-path environment flags below | Avoid sample-chunking overhead and use BF16/Triton/streamed-confidence paths |
+| Many independent designs, usually `N_sample=1-5` | Put JSONs in one input directory, or combine records into one top-level JSON list, and use `--batch_size 32` | Same-shape records are stacked into one model forward; pairformer triangle-attention layout fusions reduce trunk overhead |
+| Many samples for one design, e.g. `N_sample=1280-2560` | Use one input with a large `-e/--sample` value and the large-sample flags below | Diffusion, atom attention, elementwise gates, and confidence summary avoid repeated work and excess HBM traffic |
 
-#### Fast path for many independent designs
+#### Recommended path: many independent designs
 
-This is the recommended path for protein-design campaigns that generate many
-small independent structure-prediction jobs. Do **not** run a shell loop over
-one JSON at a time. Put the files in a directory, or combine records into one
-top-level JSON list, and let the runner batch compatible records:
+This is the protein-design campaign path.  Do **not** run a shell loop that
+invokes `protenix pred` once per JSON.  Put the one-record JSON files in a
+directory and let the runner fill exact-shape batches:
 
 ```bash
 export PROTENIX_BF16_DIFFUSION_CORE=1
@@ -117,38 +125,46 @@ protenix pred \
   --batch_size 32
 ```
 
-How to get the full benefit:
+Use `--batch_size 32` as the H100 default.  For 245-token `7r6r`-like inputs,
+`32-64` is the practical knee: larger batches consume much more memory but add
+little throughput.  If you hit OOM, try `--batch_size 16` or `8`; if the log
+shows many small batches, your campaign is probably shape-heterogeneous and
+should be split by target/feature shape before inference.
 
-- Use `--batch_size 32` as the default on H100. For 245-token `7r6r`-like
-  inputs, `32-64` is the practical knee; larger batches used much more memory
-  with little extra throughput.
-- Batch records with the same tensor shapes. The runner only stacks records
-  whose featurized tensor trees match exactly. Different shapes are processed in
-  separate buckets rather than padded, because padding the triangular trunk is
-  not guaranteed to be a semantic no-op. Token count, atom count, MSA depth, and
-  template/RNA settings can all affect the post-featurization shape.
-- Directory input is now campaign-aware. If `-i` points to a directory of
-  one-record JSON files, the runner merges compatible records into a transient
-  campaign JSON before inference, so the model can fill exact-shape batches
-  while still producing normal per-design outputs.
-- Reruns are safe: generated preprocessing siblings such as
-  `foo-update-msa.json` are ignored when the source `foo.json` is present.
-  This prevents a second directory run from silently inferring both files.
-- Keep `cuequivariance` triangle kernels, BF16 dtype, cache, fusion, and TF32
-  enabled unless you are debugging numerical or dependency issues.
-- Triton-backed CUEQ QKV layout conversion and triangle-attention epilogue
-  fusion are enabled by default when Triton is installed. If Triton is missing,
-  the code falls back safely but the throughput will be lower.
+The batching rule is deliberately conservative.  The runner stacks only records
+whose featurized tensor trees have exactly matching shapes and dtypes.  It does
+not pad ragged proteins into one trunk batch, because padding the triangular
+pairformer is not a proven semantic no-op.  Token count, atom count, MSA depth,
+templates, RNA settings, and ligand features can all change the feature shapes.
 
-Measured gates on one H100 with repeated `7r6r` inputs, `N_step=200`, confidence
-enabled, and normal CIF/JSON dumping:
+Directory inputs are campaign-aware in this branch:
 
-| input layout | previous behavior | optimized behavior | speedup |
+- `-i ./campaign_jsons` is resolved as one campaign, not as many independent
+  CLI calls.
+- Compatible records are merged into transient campaign JSONs for inference,
+  while outputs are still written per design.
+- Generated preprocessing siblings such as `foo-update-msa.json` are ignored
+  when `foo.json` is present, so rerunning a directory does not silently infer
+  both the source and generated JSON.
+- Triton-backed CUEQ q/k/v layout conversion and triangle-attention epilogue
+  fusion are enabled by default when Triton is installed.  They preserve the
+  high-quality GEMM/CUEQ kernels and remove measured layout-copy traffic around
+  them.  If Triton is missing, the code falls back safely but runs slower.
+
+Measured one-H100 gates with repeated `7r6r` inputs, `N_sample=1`,
+`N_step=200`, confidence enabled, and normal CIF/JSON dumping:
+
+| input layout | old behavior | optimized behavior | speedup |
 | --- | ---: | ---: | ---: |
 | 32 one-record JSON files in a directory | 342.7 s, 0.093 seq/s | 121.5 s, 0.263 seq/s | 2.82x end to end |
 | One combined JSON with 32 same-shape records | 361.8 s runner time | 69.3 s runner time | 5.2x after initialization |
 
-#### Fast path for many samples from one design
+Quick sanity check: a good campaign run should log messages like
+`Predicting 32 same-shape input(s)`.  If you only see singleton predictions,
+the inputs are not sharing feature shapes or you are not using this branch's
+runner.
+
+#### Fast path: many samples from one design
 
 For inference-time scaling on one input, use a large sample count and the
 large-sample fast-path flags:
@@ -187,12 +203,28 @@ protenix pred \
 On the representative one-H100 `7r6r` benchmark, the optimized large-sample
 configuration measured about `9.18-9.21` samples/sec per GPU at
 `N_sample=2560`, compared with `0.528` samples/sec for the original default
-`N_sample=5` setting. If memory is tight, start with `-e 1280` before trying
+`N_sample=5` setting.  Start with `-e 1280` if memory is tight, then try
 `-e 2560`.
 
-For full reproduction commands, profiling scripts, implementation details, and
-negative results that shaped these defaults, see
-[docs/perf/inference_throughput.md](docs/perf/inference_throughput.md). The
+#### Practical rules for maximum speedup
+
+- Keep `-d bf16`, `--trimul_kernel cuequivariance`,
+  `--triatt_kernel cuequivariance`, `--enable_cache true`,
+  `--enable_fusion true`, and `--enable_tf32 true` unless you are debugging.
+- Throughput comes from filling the GPU.  For campaign inference, prioritize
+  large same-shape buckets over more Python processes.
+- Do not chase very large `--batch_size` values.  For low-sample campaigns the
+  pairformer trunk becomes the bottleneck, so memory rises faster than
+  throughput beyond the `32-64` range on the profiled 245-token case.
+- Keep confidence enabled when comparing against the numbers above.  Disabling
+  confidence changes the workload and makes the throughput numbers
+  non-comparable.
+- The first run may include Triton/JIT and model-loading overhead.  Compare
+  sustained campaign throughput or use the benchmark harness when measuring.
+
+For reproduction commands, profiling scripts, implementation notes, roofline
+and bottleneck analysis, and negative results that shaped these defaults, see
+[docs/perf/inference_throughput.md](docs/perf/inference_throughput.md).  The
 benchmark and hotspot tools live under [scripts/perf](scripts/perf/).
 
 
