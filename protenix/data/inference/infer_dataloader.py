@@ -66,6 +66,10 @@ def get_inference_dataloader(configs: Any) -> DataLoader:
         # CPU prepares the next inputs.  Persistent workers avoid paying process
         # startup for every seed, and prefetching keeps the main process from
         # becoming the serialization point before a batched model forward.
+        # Large feature dictionaries can exhaust the default file-descriptor
+        # based tensor-sharing path ("received 0 items of ancdata").  File-system
+        # sharing is slower to set up but robust for these inference tensors.
+        torch.multiprocessing.set_sharing_strategy("file_system")
         dataloader_kwargs.update(
             {
                 "persistent_workers": True,
