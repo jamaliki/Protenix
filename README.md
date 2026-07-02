@@ -132,14 +132,16 @@ little throughput.  If you hit OOM, try `--batch_size 16` or `8`.
 The default `--batch_mode auto` is deliberately conservative but usable for real
 sequence-design campaigns.  If all featurized tensor shapes match, the whole
 model runs as one exact-shape batch.  If atom counts differ, only the expensive
-pairformer trunk is batched; atom input embedding, diffusion, and confidence
-stay per record with their original ragged atom tensors.  If token counts also
-differ, the runner pads only token-trunk tensors inside a length-sorted batch,
-passes a real pair mask through template/MSA/pairformer blocks, then crops the
-valid `s`/`z` trunk outputs before the atom-shaped tail.  This is the practical
-mixed-sequence path for protein design campaigns.  It is not bitwise identical
-to singleton inference because BF16/TF32 reductions run at a different physical
-length, but padded values are masked from model attention/reduction paths.  Use
+pairformer trunk is batched while atom-local work stays per record with its
+original ragged atom tensors.  If token counts also differ, the runner pads only
+token-shaped tensors inside a length-sorted batch, passes real masks through
+template/MSA/pairformer blocks and the token-level diffusion transformer, then
+crops back to valid tokens before ragged atom decoding and confidence.  This is
+the practical mixed-sequence path for protein design campaigns: fake atoms are
+never padded through atom attention, and fake tokens are masked before token
+attention can read them.  It is not bitwise identical to singleton inference
+because BF16/TF32 reductions run at a different physical length, but padded
+values are masked from model attention/reduction paths.  Use
 `--batch_mode exact --batch_size 1` when exact singleton reproducibility
 matters.  See `docs/perf/inference_throughput.md` for the padding deep dive and
 reproduction commands.
@@ -176,13 +178,19 @@ Measured one-H100 gates with repeated `7r6r` inputs, `N_sample=1`,
 | 32 one-record JSON files in a directory | 342.7 s, 0.093 seq/s | 121.5 s, 0.263 seq/s | 2.82x end to end |
 | One combined JSON with 32 same-shape records | 361.8 s runner time | 69.3 s runner time | 5.2x after initialization |
 | 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
+| 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s predict, 0.166 warm records/s | 95.3 s predict, 0.344 warm records/s with batched diffusion-transformer | 2.03x predict, 2.07x warm throughput |
 
 Quick sanity check: a good campaign run should log messages like
 `Predicting 32 same-shape (auto) input(s)` or
 `Predicting 32 same-token-trunk (auto) input(s)`.  For mixed sequence lengths,
 look for `Predicting ... padded-token-trunk (auto)` plus a high
-`token_pad_eff`.  If you only see singleton predictions, the inputs are not
-sharing a compatible trunk boundary or you are not using this branch's runner.
+`token_pad_eff`.  The model timing source should read
+`token-trunk+diffusion-transformer-batch` for the newer mixed-token fast path.
+If it only reads `token-trunk-batch`, check whether
+`PROTENIX_BATCH_DIFFUSION_TRANSFORMER=0`, `N_sample>1`, or guidance disabled the
+diffusion-transformer sharing path.  If you only see singleton predictions, the
+inputs are not sharing a compatible trunk boundary or you are not using this
+branch's runner.
 
 #### Fast path: many samples from one design
 

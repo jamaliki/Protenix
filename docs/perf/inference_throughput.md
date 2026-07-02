@@ -249,6 +249,39 @@ the next implementation: keep atom encoder/decoder ragged and exact, batch only
 the token diffusion transformer inside each diffusion step, then crop back to
 each record before atom decoding.
 
+Mixed-token batched diffusion-transformer gate: commit `bffbc94`, job `95569`
+(`runs/mixed_token_batched_diff_n200_20260702_160545`) implemented that exact
+boundary.  The sampler still runs diffusion conditioning, atom encoder, atom
+decoder, confidence, and output dumping per record at true atom shape, but it
+pads and masks the token activations immediately around the 24-block diffusion
+transformer once per denoising step.  The timing source changes from
+`token-trunk-batch` to `token-trunk+diffusion-transformer-batch`, which is the
+quick log check that the mixed-token fast path is active.
+
+Same input and flags as job `95439`, still `N_sample=1`, `N_step=200`,
+confidence enabled, synchronized timing, and no MSA/template:
+
+| token range | predict sec | diffusion | diffusion transformer | atom encoder | atom decoder |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 40-76 | 25.54 | 19.51 | 4.15 | 6.75 | 5.87 |
+| 88-124 | 22.35 | 19.42 | 4.11 | 6.74 | 5.88 |
+| 136-172 | 22.74 | 19.23 | 4.09 | 6.67 | 5.81 |
+| 184-220 | 24.71 | 19.51 | 4.13 | 6.90 | 5.81 |
+
+Totals: predict `95.34s`, diffusion `77.67s`, diffusion transformer `16.48s`,
+atom encoder `27.06s`, atom decoder `23.36s`, pairformer `15.22s`, dump
+`0.61s`.  Relative to the immediately preceding mixed-token profile, this is
+`2.03x` lower total predict time and `2.07x` higher warm predict throughput
+(`0.166 -> 0.344 records/s`).  The targeted diffusion-transformer hotspot moved
+by `6.62x` (`109.11s -> 16.48s`); after that win, the ragged atom
+encoder/decoder plus remaining pairformer work are the next large terms.
+
+This is why mixed token counts are supportable despite the original limitation:
+the model can operate on variable lengths, but every padded boundary must prove
+that fake entries are masked before softmax/reduction.  Token attention now has
+that mask.  Atom-local attention still does not, so full atom padding remains
+deliberately avoided rather than silently wrong.
+
 A follow-up branch tried to merge source JSONs before MSA/template preprocessing
 so preprocessing would run once for the transient campaign file instead of once
 per source file.  That cleaned up generated JSON siblings but did not materially
