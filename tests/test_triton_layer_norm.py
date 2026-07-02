@@ -44,27 +44,37 @@ class TestTritonLayerNorm(unittest.TestCase):
                         weight = torch.randn(shape[-1], device="cuda")
                         bias = torch.randn(shape[-1], device="cuda")
                         with torch.no_grad():
-                            actual = triton_layer_norm(
-                                x,
-                                torch.Size([shape[-1]]),
-                                weight,
-                                bias,
-                                1e-5,
-                            )
-                            expected = F.layer_norm(
-                                x,
-                                torch.Size([shape[-1]]),
-                                weight.to(dtype=dtype),
-                                bias.to(dtype=dtype),
-                                1e-5,
-                            )
-                        self.assertIsNotNone(actual)
-                        torch.testing.assert_close(
-                            actual,
-                            expected,
-                            atol=3e-2 if dtype is torch.bfloat16 else 2e-5,
-                            rtol=3e-2 if dtype is torch.bfloat16 else 2e-5,
-                        )
+                            for use_weight, use_bias in (
+                                (True, True),
+                                (True, False),
+                                (False, True),
+                                (False, False),
+                            ):
+                                weight_arg = weight if use_weight else None
+                                bias_arg = bias if use_bias else None
+                                actual = triton_layer_norm(
+                                    x,
+                                    torch.Size([shape[-1]]),
+                                    weight_arg,
+                                    bias_arg,
+                                    1e-5,
+                                )
+                                expected = F.layer_norm(
+                                    x,
+                                    torch.Size([shape[-1]]),
+                                    None
+                                    if weight_arg is None
+                                    else weight_arg.to(dtype=dtype),
+                                    None if bias_arg is None else bias_arg.to(dtype=dtype),
+                                    1e-5,
+                                )
+                                self.assertIsNotNone(actual)
+                                torch.testing.assert_close(
+                                    actual,
+                                    expected,
+                                    atol=3e-2 if dtype is torch.bfloat16 else 2e-5,
+                                    rtol=3e-2 if dtype is torch.bfloat16 else 2e-5,
+                                )
 
     @unittest.skipUnless(
         torch.cuda.is_available() and triton_layer_norm_available(),

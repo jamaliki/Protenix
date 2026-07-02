@@ -166,10 +166,15 @@ def triton_layer_norm(
     n_rows = input.numel() // n_cols
     output = torch.empty_like(input)
     num_warps = 4 if block_size <= 1024 else 8
+    # Triton still expects pointer-typed arguments even when the corresponding
+    # constexpr branch does not load them.  Reuse ``input`` as a harmless dummy
+    # pointer for absent affine parameters.
+    weight_ptr = input if weight is None else weight
+    bias_ptr = input if bias is None else bias
     _layer_norm_kernel[(n_rows,)](
         input,
-        weight,
-        bias,
+        weight_ptr,
+        bias_ptr,
         output,
         n_cols,
         eps,
