@@ -561,13 +561,36 @@ attention/bias kernel beats the flattened BF16 boundary on the transformer
 itself.
 
 Launch-level follow-up: job `96110`
-(`runs/flat_bf16_batch_profile_20260702_221601_c8a532d`) profiles the best
-robust flattened BF16 setting with `N_sample=5`, `N_step=20`, `--batch_size 16`,
-and a PyTorch CUDA trace.  It was submitted to `gpu-canary` after the gate and
-is expected to write `rank0_batch_trace.json`, `rank0_batch_top_cuda.txt`, and
-`trace_aggregate.json`.  Use that trace to decide whether the next real kernel
-target is diffusion-transformer attention, pairformer/CUEQ layout traffic, or
-confidence-head work.
+(`runs/flat_bf16_batch_profile_20260702_221601_c8a532d`) proved the profiler
+wrapper needed to catch `SystemExit` before exporting artifacts.  Corrected job
+`96111`
+(`runs/flat_bf16_batch_profile_fixed_20260702_222402_b4a1f78`) completed on
+`gpu-canary`.  It profiled the robust flattened BF16 setting with `N_sample=5`,
+`N_step=20`, `--batch_size 16`, confidence enabled, no MSA/template, and
+fast-LayerNorm disabled to match the current CUDA 13/PyTorch 2.11 runtime.  The
+job wrote a 2.0 GB Chrome trace, `rank0_batch_top_cuda.txt`, and
+`trace_aggregate.json`.
+
+Top raw CUDA kernel classes in that short trace:
+
+| kernel class | self CUDA ms | calls | avg us | interpretation |
+| --- | ---: | ---: | ---: | --- |
+| PyTorch `vectorized_layer_norm_kernel` | 5692.5 | 21192 | 268.6 | largest raw kernel class after the C++ fast LayerNorm extension fails to build |
+| cuDNN SDPA FMHA | 1861.3 | 2400 | 775.5 | vendor attention is material but already strong |
+| BF16 copy/cast kernel | 1665.7 | 65366 | 25.5 | dtype/layout traffic remains significant |
+| direct copy/cast kernel | 1099.9 | 35924 | 30.6 | more small traffic rather than one obvious math kernel |
+| fused gated dual-GEMM epilogue kernel | 1042.3 | 5760 | 181.0 | existing CUEQ-adjacent fused path is still material |
+
+Decision: the next kernel experiment should not replace CUEQ wholesale.  The
+first bottleneck-backed candidate is a narrow inference-only Triton LayerNorm
+fallback for the case where the shipped CUDA LayerNorm extension cannot compile.
+Commits `3b3629e` and `9437b62` add this behind
+`PROTENIX_TRITON_LAYER_NORM=1`, with safe fallbacks for training, CPU, missing
+Triton, non-contiguous tensors, and unsupported feature dimensions.  Main-queue
+job `96127` had an estimated start on July 4 and was cancelled; canary job
+`96143` is queued after the active `gpu-canary` allocation to run CUDA parity
+plus `scripts/perf/layer_norm_hotspot.py`.  Promote nothing until that hotspot
+and a paired model-level gate move samples/sec.
 
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`
@@ -1763,6 +1786,11 @@ Production code touched by the throughput stack:
   Triton gate kernels with PyTorch fallbacks, including the 64-bit-indexed
   split-aware `silu(first_half) * second_half` consumer for concatenated
   transition projections.
+- `protenix/model/layer_norm/layer_norm.py`: dispatches to the experimental
+  Triton LayerNorm fallback only when the C++ fast LayerNorm extension is
+  unavailable and `PROTENIX_TRITON_LAYER_NORM=1`.
+- `protenix/model/layer_norm/layer_norm_triton.py`: opt-in inference-only
+  Triton LayerNorm screen target with conservative fallback guards.
 - `protenix/model/triangular/qkv_layout_triton.py`: inference-only CUEQ q/k/v
   layout producer for triangle attention; keeps the fused projection GEMM and
   CUEQ attention kernel unchanged while removing hidden contiguous-copy traffic.
@@ -1797,6 +1825,8 @@ Profiling and reproducibility helpers:
 - `scripts/perf/confidence_head_hotspot.py`: confidence pairformer screen.
 - `scripts/perf/confidence_precision_screen.py`: confidence precision/parity
   screen with real checkpoint weights and matmul dtype tracing.
+- `scripts/perf/layer_norm_hotspot.py`: isolated H100 screen for the opt-in
+  Triton LayerNorm candidate versus the current PyTorch fallback.
 - `scripts/perf/trace_aggregate.py`: compact profiler trace summarizer.
 
 ## If continuing from here
@@ -1804,12 +1834,15 @@ Profiling and reproducibility helpers:
 Do not expect another large gain from config changes.  The next proper
 same-output campaign should be one of:
 
-1. a deliberate atom/trunk kernel-layout rewrite, especially around producers
+1. finish the queued Triton LayerNorm hotspot (`96143`) and, if it wins, run a
+   paired `N_sample=5`, `N_step=20`/`200` model gate with
+   `PROTENIX_TRITON_LAYER_NORM=0/1`;
+2. a deliberate atom/trunk kernel-layout rewrite, especially around producers
    feeding attention kernels;
-2. a confidence-pairformer precision/tiling campaign with explicit numerical
+3. a confidence-pairformer precision/tiling campaign with explicit numerical
    acceptance criteria;
-3. vendor-quality fused epilogues for specific matmul-adjacent patterns.
+4. vendor-quality fused epilogues for specific matmul-adjacent patterns.
 
-All three are larger kernel-engineering projects.  They should start with a
+The larger kernel-engineering projects should start with a
 fresh profile, an isolated hotspot screen, and a full same-output N1280/N2560
 gate before promotion.
