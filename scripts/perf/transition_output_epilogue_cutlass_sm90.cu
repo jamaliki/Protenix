@@ -167,7 +167,7 @@ void check_inputs(
 
 }  // namespace
 
-torch::Tensor forward(
+torch::Tensor transition_output_epilogue_forward(
     torch::Tensor b,
     torch::Tensor weight,
     torch::Tensor gate,
@@ -217,5 +217,5 @@ torch::Tensor forward(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("forward", &forward, "Transition output epilogue CUTLASS SM90 candidate");
+  m.def("forward", &transition_output_epilogue_forward, "Transition output epilogue CUTLASS SM90 candidate");
 }
