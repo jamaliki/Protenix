@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import List, Optional, Union
 
 import click
-import tqdm
 from Bio import SeqIO
 
 from configs.configs_base import configs as configs_base
@@ -536,64 +535,60 @@ def inference_jsons(
         use_tfg_guidance=use_tfg_guidance,
     )
     configs = runner.configs
-    processed_jsons = []
-    for infer_json in tqdm.tqdm(infer_jsons):
-        try:
-            processed_jsons.append(
-                preprocess_input(
-                    infer_json,
-                    out_dir=out_dir,
-                    use_msa=use_msa,
-                    use_template=use_template,
-                    use_rna_msa=use_rna_msa,
-                    msa_server_mode=msa_server_mode,
-                    hmmsearch_binary_path=hmmsearch_binary_path,
-                    hmmbuild_binary_path=hmmbuild_binary_path,
-                    seqres_database_path=seqres_database_path,
-                    nhmmer_binary_path=nhmmer_binary_path,
-                    hmmalign_binary_path=hmmalign_binary_path,
-                    hmmbuild_rna_binary_path=hmmbuild_rna_binary_path,
-                    ntrna_database_path=ntrna_database_path,
-                    rfam_database_path=rfam_database_path,
-                    rna_central_database_path=rna_central_database_path,
-                    nhmmer_n_cpu=nhmmer_n_cpu,
-                )
-            )
-        except Exception as exc:
-            infer_errors[infer_json] = str(exc)
-
     try:
         grouped_jsons = group_inference_jsons_by_seed(
-            processed_jsons, seeds, use_seeds_in_json
+            infer_jsons, seeds, use_seeds_in_json
         )
     except Exception as exc:
         grouped_jsons = {}
-        infer_errors[",".join(processed_jsons)] = str(exc)
+        infer_errors[",".join(infer_jsons)] = str(exc)
 
     for seed_key, group_jsons in grouped_jsons.items():
         merged_json = cleanup_json = None
+        cleanup_jsons = []
         try:
             configs["seeds"] = list(seed_key)
             merged_json, cleanup_json = write_campaign_json(group_jsons, out_dir)
             if cleanup_json is not None:
+                cleanup_jsons.append(cleanup_json)
                 logger.info(
                     "Merged %d JSON file(s) for campaign inference into %s",
                     len(group_jsons),
                     merged_json,
                 )
-            configs["input_json_path"] = merged_json
-            # Directory campaigns often contain one record per JSON.  Running
-            # each file separately reuses the model, but it prevents the
-            # exact-shape batcher from ever filling a GPU batch.  A transient
-            # merged JSON lets the existing conservative tensor-tree bucketing
-            # pack records across file boundaries without changing model inputs.
+            processed_json = preprocess_input(
+                merged_json,
+                out_dir=out_dir,
+                use_msa=use_msa,
+                use_template=use_template,
+                use_rna_msa=use_rna_msa,
+                msa_server_mode=msa_server_mode,
+                hmmsearch_binary_path=hmmsearch_binary_path,
+                hmmbuild_binary_path=hmmbuild_binary_path,
+                seqres_database_path=seqres_database_path,
+                nhmmer_binary_path=nhmmer_binary_path,
+                hmmalign_binary_path=hmmalign_binary_path,
+                hmmbuild_rna_binary_path=hmmbuild_rna_binary_path,
+                ntrna_database_path=ntrna_database_path,
+                rfam_database_path=rfam_database_path,
+                rna_central_database_path=rna_central_database_path,
+                nhmmer_n_cpu=nhmmer_n_cpu,
+            )
+            if cleanup_json is not None and processed_json != merged_json:
+                cleanup_jsons.append(processed_json)
+            configs["input_json_path"] = processed_json
+            # Directory campaigns often contain one record per JSON.  Merging
+            # before preprocessing lets MSA/template/RNA updates run once per
+            # seed-compatible campaign rather than once per source file.  The
+            # existing conservative tensor-tree bucketing still decides which
+            # featurized records are safe to stack in the actual model forward.
             infer_predict(runner, configs)
         except Exception as exc:
             infer_errors[",".join(group_jsons)] = str(exc)
         finally:
-            if cleanup_json is not None:
+            for cleanup_path in cleanup_jsons:
                 try:
-                    os.remove(cleanup_json)
+                    os.remove(cleanup_path)
                 except OSError:
                     pass
     if len(infer_errors) > 0:
