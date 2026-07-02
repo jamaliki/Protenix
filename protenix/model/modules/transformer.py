@@ -47,6 +47,26 @@ from protenix.model.utils import (
 )
 
 
+def _expand_mask_to_prefix(
+    mask: torch.Tensor,
+    target_prefix_shape: torch.Size,
+) -> torch.Tensor:
+    """Broadcast an atom/token mask over inserted sample axes.
+
+    Atom metadata is usually shaped ``[B, N_atom]`` while diffusion activations
+    can be ``[B, N_sample, N_atom, C]``.  The mask should be reused across the
+    sample axis, not interpreted as a second protein-batch dimension.
+    """
+    mask_prefix_shape = mask.shape[:-1]
+    if mask_prefix_shape == target_prefix_shape:
+        return mask
+    assert target_prefix_shape[: len(mask_prefix_shape)] == mask_prefix_shape
+    extra_shape = target_prefix_shape[len(mask_prefix_shape) :]
+    return mask.reshape(
+        *mask_prefix_shape, *((1,) * len(extra_shape)), mask.shape[-1]
+    ).expand(*target_prefix_shape, mask.shape[-1])
+
+
 def fused_transition_residual_enabled() -> bool:
     return os.getenv("PROTENIX_TRITON_FUSED_TRANSITION_RESIDUAL", "0").lower() not in {
         "0",
@@ -149,6 +169,7 @@ class AttentionPairBias(nn.Module):
         n_keys: int = 128,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
+        key_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Used by Algorithm 24, with beta_ij being the local mask. Used in AtomTransformer.
 
@@ -192,6 +213,25 @@ class AttentionPairBias(nn.Module):
             bias = permute_final_dims(
                 bias, [3, 0, 1, 2]
             )  # [..., n_heads, n_blocks, n_queries, n_keys]
+
+        if key_mask is not None:
+            # ``rearrange_to_dense_trunk`` masks only padding created after the
+            # physical atom length.  Batched ragged proteins additionally have
+            # fake atoms inside the shared max length.  Add a key bias in the
+            # same trunked layout so valid queries cannot read those fake keys.
+            expanded_mask = _expand_mask_to_prefix(key_mask, q.shape[:-2])
+            _q_mask, key_mask_trunked, _ = rearrange_qk_to_dense_trunk(
+                q=expanded_mask,
+                k=expanded_mask,
+                dim_q=-1,
+                dim_k=-1,
+                n_queries=n_queries,
+                n_keys=n_keys,
+                compute_mask=False,
+            )
+            del _q_mask
+            key_bias = (key_mask_trunked.to(dtype=bias.dtype) - 1) * 1e4
+            bias = bias + key_bias[..., None, :, None, :]
 
         # Line 11: Multi-head attention with attention bias & gating (and optionally local attention)
         q = self.attention(
@@ -303,6 +343,7 @@ class AttentionPairBias(nn.Module):
                 n_keys,
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
+                key_mask=token_mask,
             )
         else:
             a = self.standard_multihead_attention(
@@ -637,6 +678,7 @@ class AtomTransformer(nn.Module):
         p: torch.Tensor,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
+        atom_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -663,6 +705,7 @@ class AtomTransformer(nn.Module):
             n_keys=self.n_keys,
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
+            token_mask=atom_mask,
         )
 
 
@@ -1010,6 +1053,7 @@ class AtomAttentionEncoder(nn.Module):
         c_l: torch.Tensor = None,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
+        atom_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -1085,6 +1129,14 @@ class AtomAttentionEncoder(nn.Module):
         else:
             q_l = c_l.clone()
 
+        expanded_atom_mask = None
+        if atom_mask is not None:
+            expanded_atom_mask = _expand_mask_to_prefix(
+                atom_mask, c_l.shape[:-2]
+            ).to(dtype=c_l.dtype)
+            c_l = c_l * expanded_atom_mask[..., None]
+            q_l = q_l * expanded_atom_mask[..., None]
+
         # Add the combined single conditioning to the pair representation
         c_l_q, c_l_k, _ = rearrange_qk_to_dense_trunk(
             q=c_l,
@@ -1111,16 +1163,35 @@ class AtomAttentionEncoder(nn.Module):
 
         # Cross attention transformer
         q_l = self.atom_transformer(
-            q_l, c_l, p_lm, chunk_size=chunk_size
+            q_l, c_l, p_lm, chunk_size=chunk_size, atom_mask=atom_mask
         )  # [..., (N_sample), N_atom, c_atom]
+        if expanded_atom_mask is not None:
+            q_l = q_l * expanded_atom_mask[..., None]
 
         # Aggregate per-atom representation to per-token representation
-        a = aggregate_atom_to_token(
-            x_atom=F.relu(self.linear_no_bias_q(q_l)),
-            atom_to_token_idx=atom_to_token_idx,
-            n_token=n_token,
-            reduce="mean",
-        )  # [..., (N_sample), N_token, c_token]
+        atom_values = F.relu(self.linear_no_bias_q(q_l))
+        if expanded_atom_mask is None:
+            a = aggregate_atom_to_token(
+                x_atom=atom_values,
+                atom_to_token_idx=atom_to_token_idx,
+                n_token=n_token,
+                reduce="mean",
+            )  # [..., (N_sample), N_token, c_token]
+        else:
+            atom_values = atom_values * expanded_atom_mask[..., None]
+            atom_sum = aggregate_atom_to_token(
+                x_atom=atom_values,
+                atom_to_token_idx=atom_to_token_idx,
+                n_token=n_token,
+                reduce="sum",
+            )
+            atom_count = aggregate_atom_to_token(
+                x_atom=expanded_atom_mask[..., None],
+                atom_to_token_idx=atom_to_token_idx,
+                n_token=n_token,
+                reduce="sum",
+            ).clamp_min(1)
+            a = atom_sum / atom_count
         return a, q_l, c_l, p_lm
 
 
@@ -1182,6 +1253,7 @@ class AtomAttentionDecoder(nn.Module):
         p_skip: torch.Tensor,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
+        atom_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -1208,11 +1280,25 @@ class AtomAttentionDecoder(nn.Module):
             )  # [..., N_atom, c_atom]
             + q_skip
         )
+        expanded_atom_mask = None
+        if atom_mask is not None:
+            expanded_atom_mask = _expand_mask_to_prefix(atom_mask, q.shape[:-2]).to(
+                dtype=q.dtype
+            )
+            q = q * expanded_atom_mask[..., None]
+            c_skip = c_skip * expanded_atom_mask[..., None]
 
         # Cross attention transformer
         q = self.atom_transformer(
-            q, c_skip, p_skip, inplace_safe=inplace_safe, chunk_size=chunk_size
+            q,
+            c_skip,
+            p_skip,
+            inplace_safe=inplace_safe,
+            chunk_size=chunk_size,
+            atom_mask=atom_mask,
         )
+        if expanded_atom_mask is not None:
+            q = q * expanded_atom_mask[..., None]
 
         # Map to positions update
         r = self.linear_no_bias_out(self.layernorm_q(q))
