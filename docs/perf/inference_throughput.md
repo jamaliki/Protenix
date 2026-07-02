@@ -356,19 +356,19 @@ pair-bias layernorm/projection work.  The path is guarded by
 `PROTENIX_BATCH_DIFFUSION_MAX_SAMPLES` (default `5`) so large single-design
 sampling jobs do not accidentally multiply memory by the protein batch.
 
-Status: running, not promoted.  A shape smoke is queued as job `95868`
-(`N_sample=2`, `N_step=1`, `N_cycle=1`) and the representative paired gate is
-queued as job `95869` with `afterok:95868`.  The gate uses the same 32 mixed
-40-220-token proteins as job `95624`, `N_sample=5`, `N_step=200`,
-`--batch_size 16`, confidence enabled, no MSA/template, and compares
-`PROTENIX_BATCH_DIFFUSION_MAX_SAMPLES=1` versus `5` with
-`PROTENIX_BROADCAST_DIFFUSION_S=1` in both cases.  Earlier queued jobs `95841`
-and `95848` were canceled before running because their spooled scripts did not
-enable the fair broadcast-conditioning baseline.  Parse the completed gate with:
+Status: running, not promoted.  The first queued shape smoke/gate chain,
+jobs `95868`/`95869`, was canceled before running because later diagnostics
+found a real sample-axis shape bug and made the original gate untrustworthy.
+The representative gate still uses the same 32 mixed 40-220-token proteins as
+job `95624`, `N_sample=5`, `N_step=200`, `--batch_size 16`, confidence enabled,
+no MSA/template, and compares the old low-sample boundary against flattened and
+explicit-sample-axis variants.  Earlier queued jobs `95841` and `95848` were
+canceled before running because their spooled scripts did not enable the fair
+broadcast-conditioning baseline.  Parse the completed gate with:
 
 ```bash
 python scripts/perf/parse_batch_gate_log.py \
-  runs/ragged_ns5_pair_b16_n200_20260702_194627 \
+  runs/sample_axis_b16s5_gate_20260702_215232_9eb2197 \
   --samples-per-input 5
 ```
 
@@ -382,10 +382,11 @@ broadcast flatten without a copy, so the guard rejected the Triton kernel and
 fell back to the rank-5 PyTorch local-attention path.  Commit `506a418` keeps
 the compact bias and passes a `bias_sample_repeat` stride rule into the Triton
 kernel instead.  This is a kernel-boundary fix, not a promoted throughput claim
-yet: isolated hotspot job `95881`
-(`runs/local_attn_bcast_b16s5_20260702_200825`) measures the exact `B=16`,
-`N_sample=5`, broadcast-bias atom-attention shape before deciding whether the
-Triton atom-attention flags belong in the low-sample campaign stack.
+yet.  The first isolated hotspot job, `95881`
+(`runs/local_attn_bcast_b16s5_20260702_200825`), was canceled with the obsolete
+pre-fix queue.  Re-run this exact `B=16`, `N_sample=5`, broadcast-bias
+atom-attention shape only if the representative model gate shows atom-local
+attention remains a material low-sample campaign bottleneck.
 
 Commit `84f08ec` fixes the adjacent mask boundary.  Ragged atom batching also
 passes an atom key mask shaped `[record, atom]`; the old mask add expanded that
@@ -393,9 +394,10 @@ mask to q/k/v's full `[record, sample, atom]` prefix before adding it to the
 attention bias.  That was correct numerically but defeated the compact-bias
 kernel path by materializing the sample axis.  The mask now expands to the
 existing bias prefix, usually `[record, 1]`, so both pair bias and key mask stay
-sample-invariant.  Hotspot job `95891`
-(`runs/local_attn_masked_bcast_b16s5_20260702_201338`) times the more
-representative masked local-attention boundary.
+sample-invariant.  The corresponding masked hotspot job, `95891`
+(`runs/local_attn_masked_bcast_b16s5_20260702_201338`), was also canceled with
+the obsolete pre-fix queue; it remains the right isolated boundary if atom
+attention is still worth attacking after the model gate.
 
 The analogous token-attention question is whether we can avoid explicitly
 repeating the projected pair bias across diffusion samples.  The current
@@ -416,10 +418,12 @@ falls back to a slow path, the right next boundary is a custom token-attention
 kernel that indexes bias by `record = flat_batch // N_sample` without
 materializing repeated bias rows.
 
-Masked probe status: queued as job `95919`
+Masked probe status: superseded.  The queued job `95919`
 (`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/token_attn_bias_broadcast_masked_20260702_203322`),
-dependent on the representative `N_sample=5` gate (`afterany:95869`).  It
-uses `--valid-fraction 0.8` at `tokens=124` and `220`, so it measures the
+was canceled with the obsolete pre-fix dependency chain.  The same mechanism
+should be revisited only after the representative `N_sample=5` gate proves the
+model-level sample-axis path is worth promoting.  The intended probe uses
+`--valid-fraction 0.8` at `tokens=124` and `220`, so it measures the
 padding-mask case that actually matters for sorted mixed-token batches.
 
 `scripts/perf/diffusion_transformer_sample_axis_probe.py` is the corresponding
@@ -430,9 +434,9 @@ current flattened `[record * sample, token, channel]` block against a rank-5
 candidate that keeps `a` as `[record, sample, token, channel]` and keeps the
 diffusion conditioning `s` sample-invariant as `[record, 1, token, channel]`.
 It also includes the current Protenix rank-5 FP32-upcast policy as a rejection
-control.  Status: queued as job `95925`
+control.  Status: superseded.  The queued job `95925`
 (`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/diffusion_transformer_sample_axis_20260702_203922`),
-dependent on the raw masked SDPA probe (`afterany:95919`).
+was canceled with the obsolete pre-fix dependency chain.
 
 Implementation candidate `40e51f8` adds the corresponding model path behind
 two opt-in flags:
@@ -502,14 +506,24 @@ tests in `env-boltz2` pass for `tests.test_campaign_json_batching`,
 `tests.test_ragged_multisample_diffusion`, and `tests.test_diffusion_transformer`.
 Commit `cc5b7ee` also makes `PROTENIX_RAISE_ON_BATCH_FALLBACK=1` propagate past
 the outer per-record error handler, so diagnostic smokes now fail the Slurm job
-instead of writing an error file and exiting zero.  The corrected GPU smoke is
-queued as job `96061`
-(`runs/sample_axis_shape_fix_smoke_20260702_214538_cc5b7ee`) and must pass
-before any `N_sample=5` sample-axis timing can be trusted.
+instead of writing an error file and exiting zero.  The corrected GPU smoke,
+job `96061` (`runs/sample_axis_shape_fix_smoke_20260702_214538_cc5b7ee`),
+completed successfully with `PROTENIX_RAISE_ON_BATCH_FALLBACK=1` and logged a
+real two-record mixed-token batched forward:
 
-Once the smoke passes, the representative paired gate should use the same 32
-mixed 40-220-token proteins with `N_sample=5`, `N_step=200`, `--batch_size 16`,
-confidence enabled, no MSA/template, and compare four cases on one H100:
+```text
+Batch model timing total (token-trunk+diffusion-token-atom-batch, 2 input(s), predict 9.47s)
+Finished 2/2 input(s) ... in 9.56s
+```
+
+Because fallback escalation was enabled, that job would have failed if the
+batch path silently fell back to singleton inference.
+
+The representative paired gate is queued as job `96081`
+(`runs/sample_axis_b16s5_gate_20260702_215232_9eb2197`) on `gpu-canary`.  It
+uses the same 32 mixed 40-220-token proteins with `N_sample=5`, `N_step=200`,
+`--batch_size 16`, confidence enabled, no MSA/template, and compares four cases
+on one H100:
 
 1. `old_low_sample_boundary`: `PROTENIX_BATCH_DIFFUSION_MAX_SAMPLES=1`,
    default full-attention FP32 policy.
