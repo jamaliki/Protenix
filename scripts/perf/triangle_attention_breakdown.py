@@ -280,6 +280,34 @@ def max_abs_error(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(finite.max().item()) if finite.numel() else float("nan")
 
 
+def cuda_profiler_capture(
+    name: str,
+    fn: Callable[[], torch.Tensor],
+    *,
+    warmup: int,
+    iters: int,
+) -> torch.Tensor:
+    """Run one narrow CUDA-profiler capture for Nsight Compute.
+
+    Nsight Compute can be told to ignore kernels until CUDA profiling starts
+    (``ncu --profile-from-start off``).  Wrapping only the target module keeps
+    reports small and prevents first-call Triton/CUEQ compilation or unrelated
+    setup kernels from dominating the launch list.
+    """
+    for _ in range(warmup):
+        out = fn()
+    torch.cuda.synchronize()
+
+    torch.cuda.nvtx.range_push(name)
+    torch.cuda.cudart().cudaProfilerStart()
+    for _ in range(iters):
+        out = fn()
+    torch.cuda.synchronize()
+    torch.cuda.cudart().cudaProfilerStop()
+    torch.cuda.nvtx.range_pop()
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", type=int, default=245)
@@ -296,6 +324,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--enable-tf32", type=str_bool, default=True)
     parser.add_argument("--randomize-zero-weights", type=str_bool, default=True)
+    parser.add_argument(
+        "--ncu-capture",
+        choices=["none", "module", "manual"],
+        default="none",
+        help=(
+            "Run only a warmed CUDA-profiler capture for Nsight Compute. "
+            "'module' captures TriangleAttention.forward; 'manual' captures "
+            "the split implementation used by this breakdown script."
+        ),
+    )
+    parser.add_argument(
+        "--ncu-iters",
+        type=int,
+        default=1,
+        help="Target calls inside the CUDA-profiler capture range.",
+    )
     return parser.parse_args()
 
 
@@ -312,6 +356,41 @@ def main() -> None:
     totals: dict[str, float] = defaultdict(float)
     amp = cuda_autocast(args.compute_dtype)
     with torch.inference_mode(), amp:
+        if args.ncu_capture != "none":
+            capture_fn: Callable[[], torch.Tensor]
+            if args.ncu_capture == "module":
+                capture_fn = lambda: module_forward(module, x, mask)
+            else:
+                capture_fn = lambda: manual_cueq_forward(module, x, mask)[0]
+            out = cuda_profiler_capture(
+                (
+                    f"triangle_attention_{args.ncu_capture}_"
+                    f"B{args.batch}_N{args.tokens}_"
+                    f"{'end' if args.ending else 'start'}"
+                ),
+                capture_fn,
+                warmup=args.warmup,
+                iters=args.ncu_iters,
+            )
+            layout = layout_probe(module, x, mask)
+            print(
+                json.dumps(
+                    {
+                        "args": vars(args),
+                        "capture_shape": list(out.shape),
+                        "layout_probe": layout,
+                        "device": torch.cuda.get_device_name(),
+                        "torch": {
+                            "version": torch.__version__,
+                            "cuda": torch.version.cuda,
+                        },
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return
+
         for _ in range(args.warmup):
             manual_cueq_forward(module, x, mask)
 

@@ -350,6 +350,26 @@ slightly reduced pairformer time on this noisy node, but lost far more in
 diffusion and confidence.  The README mixed-campaign command intentionally uses
 the default-off settings.
 
+A narrower follow-up branch
+`codex/pair-transition-scoped-fusion` tried to apply only the pairformer
+transition elementwise fusion, without enabling the global elementwise flag that
+poisoned diffusion and confidence.  The isolated one-block screen looked
+plausible: at the actual B20/N148 and B12-16/N220 campaign shapes, scoped
+fusion reduced the `pair_transition` subrange by about 18-19% and the full
+single-block time by about 3-4%.  The representative gate rejected the change:
+
+| setting | predict sec sum | pairformer | diffusion | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| scoped pair-transition off | 41.74 | 15.26 | 17.51 | 7.79 | control |
+| scoped elementwise only | 40.46 | 15.40 | 17.46 | 6.48 | reject: pairformer did not improve |
+| scoped elementwise + input projection | 41.19 | 15.48 | 17.45 | 7.14 | reject: pairformer slower, more memory |
+
+The apparent end-to-end movement in that noisy job came from unrelated
+confidence variation, not from the intended pairformer mechanism.  Decision:
+keep the branch as an audit trail, but do not merge it into `main`.  The lesson
+is the same as above: a local subrange win is only a hypothesis until the
+measured full-workload subtotal moves in the expected direction.
+
 A batch-size follow-up on commit `7de6bdf` screened fixed B16/B20/B24/B32 with
 conditioning batching enabled (job `95646`,
 `runs/batchsize_screen_cond_b16_32_20260702_171044`).  The node was slower than
@@ -1371,6 +1391,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Fused transition `a1/a2` projection without split-aware consumer | transition slowed from about 5.3 ms to 7.0 ms | fusing the producer can break the consumer by creating non-contiguous halves |
 | Custom Triton transition input GEMM+SiLU | synthetic +12%, but real transition input path slowed from 3.09 ms to 3.54 ms | custom GEMM screens must use real module weights/autocast; cuBLAS efficiency is the bottleneck to match |
 | Unguarded pairformer transition input fusion at B96 | failed before producing model output | the concatenated pair-transition activation is too large; keep the shape guard |
+| Scoped pairformer transition elementwise fusion | isolated pair-transition subrange improved 18-19%, but the full representative gate showed pairformer flat/slower | subrange wins must be rejected when the measured full-workload subtotal does not move |
 | Custom Triton transition output GEMM+gate/residual | best tile 2.00 ms versus 1.51 ms for cuBLAS plus fused gate/residual | the output epilogue is still attractive, but only if implemented as a vendor-quality CuTe/CUTLASS epilogue |
 | Naive fused Triton triangle attention | correct at N64, but B16/N245 slowed from 4.24-4.26 ms to 6.22-7.78 ms | the right boundary still needs a vendor-quality CUEQ/CuTe schedule |
 | CUEQ triangle-multiplication ONDEMAND tuning | total B64 block +0.34%, below noise | the shipped/default schedule is close enough for this shape |
