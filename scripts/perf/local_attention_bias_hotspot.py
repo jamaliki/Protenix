@@ -61,12 +61,21 @@ def make_module(args: argparse.Namespace) -> AttentionPairBias:
     return module
 
 
-def make_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def make_inputs(
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     device = torch.device("cuda")
     dtype = getattr(torch, args.dtype)
     n_trunks = (args.atoms + args.n_queries - 1) // args.n_queries
+    leading_shape = (
+        (args.outer_batch, args.samples) if args.outer_batch else (args.samples,)
+    )
+    bias_samples = args.bias_samples if args.bias_samples is not None else args.samples
+    bias_leading_shape = (
+        (args.outer_batch, bias_samples) if args.outer_batch else (bias_samples,)
+    )
     q = torch.randn(
-        args.samples,
+        *leading_shape,
         args.atoms,
         args.c_atom,
         device=device,
@@ -74,7 +83,7 @@ def make_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, torch.Tensor, t
     )
     kv = torch.randn_like(q)
     z = torch.randn(
-        args.samples,
+        *bias_leading_shape,
         n_trunks,
         args.n_queries,
         args.n_keys,
@@ -82,7 +91,19 @@ def make_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, torch.Tensor, t
         device=device,
         dtype=dtype,
     )
-    return q, kv, z
+    atom_mask = None
+    if args.key_mask:
+        if args.outer_batch:
+            atom_mask = torch.ones(
+                args.outer_batch, args.atoms, device=device, dtype=torch.bool
+            )
+        else:
+            atom_mask = torch.ones(args.atoms, device=device, dtype=torch.bool)
+        # Make the last block's fake keys visible to the benchmark.  The
+        # production ragged path passes per-record masks because atom padding is
+        # only a batching device, not model input.
+        atom_mask[..., -args.n_queries :] = False
+    return q, kv, z, atom_mask
 
 
 def reference_bias(module: AttentionPairBias, z: torch.Tensor) -> torch.Tensor:
@@ -113,6 +134,7 @@ def run_local_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
     z: torch.Tensor,
+    atom_mask: torch.Tensor | None,
     args: argparse.Namespace,
 ) -> torch.Tensor:
     return module.local_multihead_attention(
@@ -123,6 +145,7 @@ def run_local_attention(
         n_keys=args.n_keys,
         inplace_safe=False,
         chunk_size=None,
+        key_mask=atom_mask,
     )
 
 
@@ -139,6 +162,25 @@ def compare(a: torch.Tensor, b: torch.Tensor) -> dict[str, float | int]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples", type=int, default=640)
+    parser.add_argument(
+        "--outer-batch",
+        type=int,
+        default=0,
+        help="Optional leading record batch before the diffusion sample axis.",
+    )
+    parser.add_argument(
+        "--bias-samples",
+        type=int,
+        default=None,
+        help="Leading sample count for z. Use 1 for cached sample-invariant bias.",
+    )
+    parser.add_argument(
+        "--key-mask",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Apply a per-record atom key mask, matching padded ragged batches.",
+    )
     parser.add_argument("--atoms", type=int, default=2529)
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--c-atom", type=int, default=128)
@@ -157,9 +199,10 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("local_attention_bias_hotspot requires CUDA")
     torch.manual_seed(args.seed)
+    args.key_mask = bool(args.key_mask)
 
     module = make_module(args)
-    q, kv, z = make_inputs(args)
+    q, kv, z, atom_mask = make_inputs(args)
     amp = (
         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         if args.dtype == "bfloat16"
@@ -174,7 +217,7 @@ def main() -> None:
             iters=args.iters,
         )
         ref_out, ref_full_ms = cuda_time(
-            lambda: run_local_attention(module, q, kv, z, args),
+            lambda: run_local_attention(module, q, kv, z, atom_mask, args),
             warmup=args.warmup,
             iters=args.iters,
         )
@@ -186,7 +229,7 @@ def main() -> None:
             iters=args.iters,
         )
         cand_out, cand_full_ms = cuda_time(
-            lambda: run_local_attention(module, q, kv, z, args),
+            lambda: run_local_attention(module, q, kv, z, atom_mask, args),
             warmup=args.warmup,
             iters=args.iters,
         )
@@ -196,6 +239,7 @@ def main() -> None:
         "device": torch.cuda.get_device_name(),
         "q_shape": list(q.shape),
         "z_shape": list(z.shape),
+        "atom_mask_shape": None if atom_mask is None else list(atom_mask.shape),
         "ref_bias_shape": list(ref_bias.shape),
         "candidate_bias_shape": list(cand_bias.shape),
         "ref_bias_ms": ref_bias_ms,
