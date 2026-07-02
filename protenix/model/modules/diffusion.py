@@ -451,6 +451,7 @@ class DiffusionModule(nn.Module):
         chunk_size: Optional[int] = None,
         use_conditioning: bool = True,
         enable_efficient_fusion: bool = False,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """The raw network to be trained.
         As in EDM equation (7), this is F_theta(c_in * x, c_noise(sigma)).
@@ -605,6 +606,7 @@ class DiffusionModule(nn.Module):
                     inplace_safe=inplace_safe,
                     chunk_size=chunk_size,
                     enable_efficient_fusion=enable_efficient_fusion,
+                    token_mask=token_mask,
                 )
         if a_token.dtype != torch.float32:
             a_token = a_token.to(dtype=torch.float32)
@@ -657,6 +659,7 @@ class DiffusionModule(nn.Module):
         chunk_size: Optional[int] = None,
         use_conditioning: bool = True,
         enable_efficient_fusion: bool = False,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """One step denoise: x_noisy, noise_level -> x_denoised
 
@@ -714,6 +717,7 @@ class DiffusionModule(nn.Module):
             chunk_size=chunk_size,
             use_conditioning=use_conditioning,
             enable_efficient_fusion=enable_efficient_fusion,
+            token_mask=token_mask,
         )
 
         # Rescale updates to positions and combine with input positions

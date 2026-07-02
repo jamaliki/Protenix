@@ -391,6 +391,7 @@ class DiffusionTransformerBlock(nn.Module):
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
         enable_efficient_fusion: bool = False,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -428,6 +429,7 @@ class DiffusionTransformerBlock(nn.Module):
                 chunk_size=chunk_size,
                 enable_efficient_fusion=enable_efficient_fusion,
                 residual=a,
+                token_mask=token_mask,
             )
         else:
             attn_out = self.drop_path(
@@ -440,6 +442,7 @@ class DiffusionTransformerBlock(nn.Module):
                     inplace_safe=inplace_safe,
                     chunk_size=chunk_size,
                     enable_efficient_fusion=enable_efficient_fusion,
+                    token_mask=token_mask,
                 )
             )
             if inplace_safe:
@@ -522,6 +525,7 @@ class DiffusionTransformer(nn.Module):
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
         enable_efficient_fusion: bool = False,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> list[Callable]:
         blocks = [
             partial(
@@ -531,6 +535,7 @@ class DiffusionTransformer(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
                 enable_efficient_fusion=enable_efficient_fusion,
+                token_mask=token_mask,
             )
             for b in self.blocks
         ]
@@ -546,6 +551,7 @@ class DiffusionTransformer(nn.Module):
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
         enable_efficient_fusion: bool = False,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
                 Args:
@@ -569,6 +575,7 @@ class DiffusionTransformer(nn.Module):
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
             enable_efficient_fusion=enable_efficient_fusion,
+            token_mask=token_mask,
         )
         blocks_per_ckpt = self.blocks_per_ckpt
         if not torch.is_grad_enabled():
