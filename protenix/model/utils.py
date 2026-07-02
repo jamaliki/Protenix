@@ -295,7 +295,7 @@ def batched_gather(
     remaining_dims = [slice(None) for _ in range(len(data.shape) - no_batch_dims)]
     remaining_dims[dim - no_batch_dims if dim >= 0 else dim] = inds
     ranges.extend(remaining_dims)
-    return data[ranges]
+    return data[tuple(ranges)]
 
 
 def broadcast_token_to_atom(
