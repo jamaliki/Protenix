@@ -548,7 +548,8 @@ promoted LayerNorm gate:
 | flat sample lanes, FP32 attention | 76.81 | 0.417 | 2.083 | 23.44 | 43.49 | 26.59 | 8.32 | promoted mechanism |
 | flat sample lanes, BF16 attention | 73.34 | 0.436 | 2.182 | 21.88 | 39.99 | 23.14 | 9.94 | best robust setting |
 | explicit sample axis, BF16 attention | 72.50 | 0.441 | 2.207 | 22.07 | 44.26 | 27.45 | 4.58 | not promoted beyond opt-in |
-| flat sample lanes, BF16 attention, Triton LayerNorm fallback | 58.34 | 0.549 | 2.743 | 16.45 | 37.15 | - | 2.50 | promoted low-precision fallback |
+| flat sample lanes, BF16 attention, forced Triton LayerNorm fallback | 58.34 | 0.549 | 2.743 | 16.45 | 37.15 | - | 2.50 | best paired low-precision fallback |
+| flat sample lanes, BF16 attention, default Triton LayerNorm fallback | 61.41 | 0.521 | 2.605 | 16.62 | 40.81 | - | 2.55 | promoted default repeat at commit `95fb258` |
 
 The large, trustworthy movement is the flattened low-sample diffusion boundary:
 `212.51s -> 73.34s` predict (`2.90x`) and `0.753 -> 2.182` generated samples/s
@@ -577,6 +578,17 @@ confidence fell `9.42s -> 2.50s`, and diffusion moved more modestly
 only for FP16/BF16 no-grad CUDA inference when the C++ fast LayerNorm extension
 is unavailable; FP32 stays opt-in because several FP32 isolated shapes were
 slower.
+
+After making that policy the default, job `96183`
+(`runs/layer_norm_default_gate_n200_20260702_230327_95fb258`) reran the same
+N200 gate at commit `95fb258` with `PROTENIX_TRITON_LAYER_NORM` unset for the
+candidate case.  The CUDA unit test suite passed inside the allocation
+(`5 tests OK`).  The paired model result was `75.30s -> 61.41s` predict and
+`2.125 -> 2.605` generated samples/s versus forced-off LayerNorm.  This is
+slower than the prior forced-on repeat because diffusion was noisier, but it is
+the conservative current-default number: `212.51s -> 61.41s` (`3.46x`) and
+`0.753 -> 2.605` generated samples/s (`3.46x`) over the old low-sample
+boundary.
 
 Launch-level follow-up: job `96110`
 (`runs/flat_bf16_batch_profile_20260702_221601_c8a532d`) proved the profiler

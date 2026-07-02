@@ -203,7 +203,7 @@ dumping:
 | One combined JSON with 32 same-shape records | 361.8 s runner time | 69.3 s runner time | 5.2x after initialization |
 | 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.9 s summed predict, 0.943 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.70x predict, 5.69x throughput |
-| 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 58.3 s, 2.74 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, and Triton LayerNorm fallback | 3.64x over the old branch boundary |
+| 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 61.4 s, 2.61 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, and default Triton LayerNorm fallback | 3.46x over the old branch boundary |
 
 Quick sanity check: a good campaign run should log messages like
 `Predicting 32 same-shape (auto) input(s)` or
