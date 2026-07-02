@@ -95,6 +95,27 @@ def _repeat_bias_for_sample_lanes(
     )
 
 
+def _insert_sample_bias_axis(
+    bias: torch.Tensor,
+    z_sample_count: Optional[int],
+) -> torch.Tensor:
+    """Broadcast record-level pair bias over an explicit diffusion sample axis.
+
+    The low-sample campaign path can keep activations as
+    ``[record, sample, token, channel]`` instead of flattening record and sample.
+    Pair features are still sample-invariant, so the attention mask should be
+    ``[record, 1, head, token, token]``.  The singleton sample axis lets SDPA
+    broadcast the bias without materializing ``N_sample`` identical rows.
+    """
+    if z_sample_count is None or z_sample_count <= 1:
+        return bias
+    if bias.dim() != 4:
+        raise ValueError(
+            "sample-axis pair bias expects [B, H, N, N] after projection"
+        )
+    return bias[:, None]
+
+
 def fused_transition_residual_enabled() -> bool:
     return os.getenv("PROTENIX_TRITON_FUSED_TRANSITION_RESIDUAL", "0").lower() not in {
         "0",
@@ -290,6 +311,7 @@ class AttentionPairBias(nn.Module):
         inplace_safe: bool = False,
         enable_efficient_fusion: bool = False,
         z_sample_count: Optional[int] = None,
+        z_sample_axis: bool = False,
     ) -> torch.Tensor:
         """Used by Algorithm 7/20
 
@@ -328,13 +350,21 @@ class AttentionPairBias(nn.Module):
             bias = permute_final_dims(
                 bias, [2, 0, 1]
             )  # [..., n_heads, N_token, N_token]
-        bias = _repeat_bias_for_sample_lanes(bias, z_sample_count)
+        if z_sample_axis:
+            bias = _insert_sample_bias_axis(bias, z_sample_count)
+        else:
+            bias = _repeat_bias_for_sample_lanes(bias, z_sample_count)
 
         if token_mask is not None:
             # Pairformer padding uses pair_mask[i, j] = token_mask[i] *
             # token_mask[j].  The pair bias alone does not stop token attention
             # from reading padded key/value tokens, so add a standard key mask
             # in the same [..., H, Q, K] bias tensor consumed by attention.
+            #
+            # In the explicit sample-axis path, callers pass token_mask as
+            # [B, 1, N].  The inserted singleton keeps the key bias aligned with
+            # the bias prefix [B, 1] instead of accidentally broadcasting B over
+            # the sample dimension.
             key_bias = (token_mask.to(dtype=bias.dtype) - 1) * 1e4
             bias = bias + key_bias[..., None, None, :]
 
@@ -356,6 +386,7 @@ class AttentionPairBias(nn.Module):
         residual: Optional[torch.Tensor] = None,
         token_mask: Optional[torch.Tensor] = None,
         z_sample_count: Optional[int] = None,
+        z_sample_axis: bool = False,
     ) -> torch.Tensor:
         """Details are given in local_forward and standard_forward"""
         # Input projections
@@ -376,6 +407,8 @@ class AttentionPairBias(nn.Module):
         if n_queries and n_keys:
             if z_sample_count is not None and z_sample_count > 1:
                 raise ValueError("z_sample_count is only supported for full attention")
+            if z_sample_axis:
+                raise ValueError("z_sample_axis is only supported for full attention")
             a = self.local_multihead_attention(
                 a,
                 kv if self.cross_attention_mode else a,
@@ -395,6 +428,7 @@ class AttentionPairBias(nn.Module):
                 inplace_safe=inplace_safe,
                 enable_efficient_fusion=enable_efficient_fusion,
                 z_sample_count=z_sample_count,
+                z_sample_axis=z_sample_axis,
             )
 
         # Output projection (from adaLN-Zero [27])
@@ -476,6 +510,7 @@ class DiffusionTransformerBlock(nn.Module):
         enable_efficient_fusion: bool = False,
         token_mask: Optional[torch.Tensor] = None,
         z_sample_count: Optional[int] = None,
+        z_sample_axis: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -515,6 +550,7 @@ class DiffusionTransformerBlock(nn.Module):
                 residual=a,
                 token_mask=token_mask,
                 z_sample_count=z_sample_count,
+                z_sample_axis=z_sample_axis,
             )
         else:
             attn_out = self.drop_path(
@@ -529,6 +565,7 @@ class DiffusionTransformerBlock(nn.Module):
                     enable_efficient_fusion=enable_efficient_fusion,
                     token_mask=token_mask,
                     z_sample_count=z_sample_count,
+                    z_sample_axis=z_sample_axis,
                 )
             )
             if inplace_safe:
@@ -613,6 +650,7 @@ class DiffusionTransformer(nn.Module):
         enable_efficient_fusion: bool = False,
         token_mask: Optional[torch.Tensor] = None,
         z_sample_count: Optional[int] = None,
+        z_sample_axis: bool = False,
     ) -> list[Callable]:
         blocks = [
             partial(
@@ -624,6 +662,7 @@ class DiffusionTransformer(nn.Module):
                 enable_efficient_fusion=enable_efficient_fusion,
                 token_mask=token_mask,
                 z_sample_count=z_sample_count,
+                z_sample_axis=z_sample_axis,
             )
             for b in self.blocks
         ]
@@ -641,6 +680,7 @@ class DiffusionTransformer(nn.Module):
         enable_efficient_fusion: bool = False,
         token_mask: Optional[torch.Tensor] = None,
         z_sample_count: Optional[int] = None,
+        z_sample_axis: bool = False,
     ) -> torch.Tensor:
         """
                 Args:
@@ -666,6 +706,7 @@ class DiffusionTransformer(nn.Module):
             enable_efficient_fusion=enable_efficient_fusion,
             token_mask=token_mask,
             z_sample_count=z_sample_count,
+            z_sample_axis=z_sample_axis,
         )
         blocks_per_ckpt = self.blocks_per_ckpt
         if not torch.is_grad_enabled():

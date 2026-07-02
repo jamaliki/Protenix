@@ -86,6 +86,15 @@ def attention_force_fp32() -> bool:
     }
 
 
+def rank5_full_attention_bf16_enabled() -> bool:
+    return os.getenv("PROTENIX_RANK5_FULL_ATTENTION_BF16", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
 def transition_input_projection_fusion_enabled() -> bool:
     return os.getenv("PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION", "0").lower() not in {
         "0",
@@ -464,8 +473,23 @@ def _attention(
     # Local atom attention has small 32x128 windows. On H100/cuDNN this path is
     # faster and more reliable in FP32, while full token attention benefits from
     # BF16 when PROTENIX_ATTENTION_FORCE_FP32=0.
+    #
+    # Rank-5 tensors used to mean "local attention with an extra trunk axis",
+    # so Protenix conservatively upcast them.  Low-sample campaign inference has
+    # a different rank-5 shape: [record, sample, head, token, channel].  That is
+    # still full token attention, and BF16 SDPA can use tensor cores.  Keep the
+    # old policy by default, but let the diffusion sample-axis experiment opt in
+    # without weakening the atom-local-attention guard.
+    rank5_full_attention = q.dim() == 5 and q.shape[-2] == k.shape[-2]
     force_fp32_attention = (
-        attention_force_fp32() or q.dim() >= 5 or q.shape[-2] != k.shape[-2]
+        attention_force_fp32()
+        or q.shape[-2] != k.shape[-2]
+        or (
+            q.dim() >= 5
+            and not (
+                rank5_full_attention and rank5_full_attention_bf16_enabled()
+            )
+        )
     )
     if force_fp32_attention:
         # Upcast to compute attn_weights

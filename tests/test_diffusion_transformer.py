@@ -149,6 +149,76 @@ class TestDiffusionTransformer(unittest.TestCase):
 
                 torch.testing.assert_close(out_shared, out_repeated)
 
+    def test_sample_axis_pair_bias_matches_repeated_z(self) -> None:
+        torch.manual_seed(11)
+        n_heads = 2
+        c_a = 8
+        c_s = 6
+        c_z = 4
+        n_records = 2
+        n_sample = 3
+        n_token = 5
+
+        model = self.get_model(
+            c_a=c_a, c_s=c_s, c_z=c_z, n_blocks=1, n_heads=n_heads
+        )
+        model.eval()
+
+        a = torch.randn(n_records, n_sample, n_token, c_a, device=self.device)
+        s = torch.randn(n_records, 1, n_token, c_s, device=self.device)
+        z = torch.randn(n_records, n_token, n_token, c_z, device=self.device)
+        token_mask = torch.tensor(
+            [[True, True, True, False, False], [True, True, True, True, False]],
+            device=self.device,
+        )
+        a_flat = a.reshape(n_records * n_sample, n_token, c_a)
+        s_flat = (
+            s.expand(n_records, n_sample, n_token, c_s)
+            .reshape(n_records * n_sample, n_token, c_s)
+            .contiguous()
+        )
+        token_mask_flat = (
+            token_mask[:, None]
+            .expand(n_records, n_sample, n_token)
+            .reshape(n_records * n_sample, n_token)
+        )
+
+        with torch.no_grad():
+            for efficient in (False, True):
+                if efficient:
+                    z_shared = z.permute(0, 3, 1, 2).contiguous()
+                    z_repeated = (
+                        z_shared[:, None]
+                        .expand(n_records, n_sample, c_z, n_token, n_token)
+                        .reshape(n_records * n_sample, c_z, n_token, n_token)
+                    )
+                else:
+                    z_shared = z
+                    z_repeated = (
+                        z[:, None]
+                        .expand(n_records, n_sample, n_token, n_token, c_z)
+                        .reshape(n_records * n_sample, n_token, n_token, c_z)
+                    )
+
+                out_repeated = model(
+                    a=a_flat,
+                    s=s_flat,
+                    z=z_repeated,
+                    enable_efficient_fusion=efficient,
+                    token_mask=token_mask_flat,
+                ).reshape(n_records, n_sample, n_token, c_a)
+                out_sample_axis = model(
+                    a=a,
+                    s=s,
+                    z=z_shared,
+                    enable_efficient_fusion=efficient,
+                    token_mask=token_mask[:, None],
+                    z_sample_count=n_sample,
+                    z_sample_axis=True,
+                )
+
+                torch.testing.assert_close(out_sample_axis, out_repeated)
+
     def tearDown(self):
         elapsed_time = time.time() - self._start_time
         print(f"Test {self.id()} took {elapsed_time:.6f}s")

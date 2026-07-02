@@ -212,6 +212,10 @@ def _flatten_record_sample_mask(
     )
 
 
+def _diffusion_transformer_sample_axis_enabled() -> bool:
+    return _env_flag_enabled("PROTENIX_DIFFUSION_TRANSFORMER_SAMPLE_AXIS")
+
+
 def update_input_feature_dict(input_feature_dict: dict[str, Any]) -> dict[str, Any]:
     """
     Lines 1-3 of Algorithm 5 compute d_lm, v_lm, and pad_info utilized in the AtomAttentionEncoder.
@@ -1221,6 +1225,9 @@ class Protenix(nn.Module):
                 )
 
             token_mask = _make_token_mask(token_counts, max_tokens, device)
+            use_sample_axis_transformer = (
+                N_sample > 1 and _diffusion_transformer_sample_axis_enabled()
+            )
             if z_pair_padded is not None:
                 # Batched conditioning has already produced one padded
                 # [B, N, N, C] pair tensor.  Reusing it avoids a redundant
@@ -1251,9 +1258,24 @@ class Protenix(nn.Module):
                     channel_first=self.enable_efficient_fusion,
                 )
 
-            a_transformer = _flatten_record_sample_axes(a_batch, N_sample)
-            s_transformer = _flatten_record_sample_axes(s_batch, N_sample)
-            token_mask_transformer = _flatten_record_sample_mask(token_mask, N_sample)
+            if use_sample_axis_transformer:
+                # Experimental low-sample path: keep the sample axis explicit so
+                # pair bias can stay [record, 1, head, token, token].  Flattening
+                # to [record * sample, ...] is robust and still the default, but
+                # it materializes N_sample copies of the same pair/padding bias.
+                # The transformer code broadcasts the singleton axis and relies
+                # on PROTENIX_RANK5_FULL_ATTENTION_BF16=1 to keep full token
+                # attention on tensor-core BF16 SDPA instead of the generic
+                # rank-5 FP32 safeguard used for atom local attention.
+                a_transformer = _expand_sample_axis(a_batch, N_sample)
+                s_transformer = s_batch
+                token_mask_transformer = token_mask[:, None, :]
+            else:
+                a_transformer = _flatten_record_sample_axes(a_batch, N_sample)
+                s_transformer = _flatten_record_sample_axes(s_batch, N_sample)
+                token_mask_transformer = _flatten_record_sample_mask(
+                    token_mask, N_sample
+                )
 
             with dm._profile_block("transformer"), torch.profiler.record_function(
                 "protenix/batched_token_diffusion_transformer"
@@ -1272,12 +1294,19 @@ class Protenix(nn.Module):
                         enable_efficient_fusion=self.enable_efficient_fusion,
                         token_mask=token_mask_transformer,
                         z_sample_count=N_sample,
+                        z_sample_axis=use_sample_axis_transformer,
                     )
             if a_transformer.dtype != torch.float32:
                 a_transformer = a_transformer.to(dtype=torch.float32)
-            a_batch = a_transformer.reshape(
-                len(input_feature_dicts), N_sample, max_tokens, a_transformer.shape[-1]
-            )
+            if use_sample_axis_transformer:
+                a_batch = a_transformer
+            else:
+                a_batch = a_transformer.reshape(
+                    len(input_feature_dicts),
+                    N_sample,
+                    max_tokens,
+                    a_transformer.shape[-1],
+                )
 
             if batch_atom_transformer:
                 assert atom_batch is not None
