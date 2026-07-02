@@ -666,6 +666,27 @@ the implementation has to keep the vendor GEMM schedule and add the epilogue
 load/store logic.  Replacing cuBLAS with a generic Triton matmul loses more GEMM
 efficiency than the 0.47 ms memory-bound epilogue can pay back.
 
+`scripts/perf/transition_output_epilogue_hotspot.py` is the reusable screen for
+the next attempt.  It builds a real `ConditionedTransitionBlock`, fixes the
+output-boundary tensors, times the baseline `linear_b(b)` plus promoted
+`fused_sigmoid_mul_add`, and optionally imports a candidate op with signature
+`fn(b, weight, gate, residual) -> out`.  Use it before touching model code:
+
+```bash
+LAYERNORM_TYPE=normal \
+PROTENIX_TRITON_FUSED_ELEMENTWISE=1 \
+/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/env-boltz2/bin/python \
+  scripts/perf/transition_output_epilogue_hotspot.py \
+  --samples 1280 \
+  --tokens 245 \
+  --compute-dtype bfloat16 \
+  --candidate /path/to/native_epilogue_candidate.py:transition_output_epilogue
+```
+
+A candidate should only advance if this screen shows both acceptable BF16 parity
+and a win over the full baseline boundary, not merely over the elementwise
+epilogue launch in isolation.
+
 ### 4. Use lower precision only where profiling supports it
 
 `PROTENIX_BF16_DIFFUSION_CORE=1` and `PROTENIX_BF16_ATOM_ATTENTION=1` reduce
@@ -1021,6 +1042,8 @@ Profiling and reproducibility helpers:
 - `scripts/perf/trunk_attention_hotspot.py`: trunk attention block screen.
 - `scripts/perf/triangle_attention_breakdown.py`: per-launch/subrange screen
   for CUEQ triangle attention and its layout/epilogue boundaries.
+- `scripts/perf/transition_output_epilogue_hotspot.py`: transition output-GEMM
+  epilogue screen and candidate-injection harness for native CuTe/CUTLASS work.
 - `scripts/perf/confidence_head_hotspot.py`: confidence pairformer screen.
 - `scripts/perf/confidence_precision_screen.py`: confidence precision/parity
   screen with real checkpoint weights and matmul dtype tracing.
