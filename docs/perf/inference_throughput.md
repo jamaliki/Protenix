@@ -75,6 +75,72 @@ export PROTENIX_TRITON_TRIANGLE_ATTENTION_EPILOGUE=0
 export PROTENIX_TRITON_CUEQ_QKV_LAYOUT=0
 ```
 
+### Many independent exact-shape inputs
+
+Protein-design campaigns often care less about one sequence with thousands of
+samples and more about many independent sequences with `N_sample=1-5`.  The
+model already supports a leading protein-batch dimension for same-shape feature
+tensors, but the public inference path historically ran one input per
+`runner.predict()` call.  The `pred` CLI now exposes exact-shape batching:
+
+```bash
+protenix pred \
+  -i many_same_shape_inputs.json \
+  -o ./output \
+  -s 101 \
+  -c 10 \
+  -p 200 \
+  -e 1 \
+  -d bf16 \
+  --trimul_kernel cuequivariance \
+  --triatt_kernel cuequivariance \
+  --enable_cache true \
+  --enable_fusion true \
+  --enable_tf32 true \
+  --batch_size 32
+```
+
+The batching rule is intentionally conservative: only records whose feature
+tensor trees have exactly matching shapes and dtypes are stacked.  Ragged
+proteins are not padded into a shared batch because padding is not a proven
+semantic no-op for the triangular trunk.  If shapes differ, the runner keeps
+separate buckets and flushes each bucket independently.
+
+Public CLI gates on one H100, repeated `7r6r` inputs, `N_sample=1`,
+`N_step=200`, confidence enabled, and normal CIF/JSON dumping:
+
+| run | inputs | wall sec | runner job sec | predict+dump sec | seq/s | outputs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| singleton loop | 32 x `--batch_size 1` | 406.3 | 361.8 | 346.5 | 0.079 | 32 CIFs |
+| exact-shape batch | 32 x `--batch_size 32` | 112.5 | 69.3 | 54.5 | 0.284 | 32 CIFs |
+
+The user-visible wrapper speedup is `3.6x`; after model initialization, the
+runner speedup is `5.2x`; for the actual predict+dump section it is `6.4x`.
+The smaller B8 public gate also passed correctness (8 CIFs) but only reached
+`1.9x` wrapper speedup because checkpoint/model initialization dominated such a
+short run.
+
+The model-only same-shape sweep shows where larger batches stop helping:
+
+| shape | sequence throughput | output-sample throughput | wall sec | peak reserved GiB | dominant work |
+| --- | ---: | ---: | ---: | ---: | --- |
+| B1, `N_sample=1` | 0.101 seq/s | 0.101 sample/s | 9.86 | 2.65 | diffusion |
+| B8, `N_sample=1` | 0.449 seq/s | 0.449 sample/s | 17.81 | 6.84 | pairformer/diffusion |
+| B32, `N_sample=1` | 0.842 seq/s | 0.842 sample/s | 37.99 | 20.83 | pairformer |
+| B64, `N_sample=1` | 0.867 seq/s | 0.867 sample/s | 73.86 | 39.39 | pairformer |
+| B96, `N_sample=1` | 0.876 seq/s | 0.876 sample/s | 109.59 | 58.13 | pairformer |
+| B128, `N_sample=1` | 0.881 seq/s | 0.881 sample/s | 145.27 | 74.07 | pairformer |
+| B16, `N_sample=5` | 0.412 seq/s | 2.06 sample/s | 38.80 | 13.37 | diffusion |
+| B32, `N_sample=5` | 0.430 seq/s | 2.15 sample/s | 74.45 | 24.42 | diffusion |
+| B64, `N_sample=5` | 0.436 seq/s | 2.18 sample/s | 146.80 | 46.74 | diffusion |
+| B96, `N_sample=5` | 0.438 seq/s | 2.19 sample/s | 219.23 | 69.06 | diffusion |
+
+For this 245-token input, `B=32-64` is the practical knee.  Larger batches keep
+raising memory but add little throughput.  The low-sample workload is therefore
+not the same bottleneck as the `N_sample=2560` same-output workload: `N_sample=1`
+is pairformer-heavy because the trunk runs once per sequence, while
+`N_sample=5` shifts more time back to diffusion.
+
 ## Reproducing the benchmark
 
 Use the benchmark harness rather than timing ad hoc commands.  It records the
@@ -540,6 +606,18 @@ atom-local-attention tweak; it is the token diffusion transformer, especially
 attention/transition boundaries where a custom kernel must preserve the
 consumer layout.
 
+For many independent low-sample inputs, the bottleneck shifts.  At
+`B=64, N_sample=1`, full inference spends about 44.0 s in the trunk pairformer
+and 26.9 s in diffusion.  At `B=64, N_sample=5`, diffusion grows to 98.4 s
+while pairformer remains about 43.5 s.  This means the next kernel target
+depends on the campaign:
+
+| campaign shape | first-class target | reason |
+| --- | --- | --- |
+| many sequences, `N_sample=1` | pairformer triangle attention / transition boundaries | trunk is the largest non-amortized cost |
+| many sequences, `N_sample=5` | diffusion token transformer plus pairformer | diffusion dominates but pairformer is still material |
+| one sequence, very large `N_sample` | diffusion token transformer / confidence streaming | pairformer is amortized over samples |
+
 An early confidence pairformer hotspot was profiled in a deliberately FP32
 standalone screen.  That was useful for understanding the worst case, but it
 was not the production inference precision path:
@@ -713,6 +791,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Custom Triton transition output GEMM+gate/residual | best tile 2.00 ms versus 1.51 ms for cuBLAS plus fused gate/residual | the output epilogue is still attractive, but only if implemented as a vendor-quality CuTe/CUTLASS epilogue |
 | Naive fused Triton triangle attention | correct at N64, but B16/N245 slowed from 4.24-4.26 ms to 6.22-7.78 ms | the right boundary still needs a vendor-quality CUEQ/CuTe schedule |
 | CUEQ triangle-multiplication ONDEMAND tuning | total B64 block +0.34%, below noise | the shipped/default schedule is close enough for this shape |
+| Inference DataLoader workers for exact-shape batches | B8 had a small screen win, but B32 hit tensor-sharing failures unless switched to slower file-system sharing; clean B32 no-worker batching was better | do not add host-pipeline complexity unless it survives the actual many-input gate |
 | CUDA graph capture of the denoiser | slower in this setup | graph overhead/constraints can outweigh launch savings |
 
 The main learning point: isolated wins are hypotheses, not promotions.  A
@@ -748,6 +827,10 @@ Production code touched by the throughput stack:
   CUEQ attention kernel unchanged while removing hidden contiguous-copy traffic.
 - `protenix/model/modules/confidence.py` and `protenix/model/protenix.py`:
   confidence-logit chunk iteration and streaming summary consumption.
+- `runner/inference.py`, `runner/batch_inference.py`, and
+  `configs/configs_inference.py`: public exact-shape inference batching.  The
+  runner stacks only identical feature tensor trees, splits predictions back to
+  one output per input, and leaves ragged shapes as separate buckets.
 
 Profiling and reproducibility helpers:
 
