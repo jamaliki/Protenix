@@ -27,6 +27,7 @@ from protenix.model.modules.fused_ops import dropout_add_rowwise
 from protenix.model.triangular.layers import DropoutRowwise, LayerNorm, OuterProductMean
 from protenix.model.triangular.triangular import (
     TriangleAttention,
+    TriangleAttentionEndingNode,
     TriangleMultiplicationIncoming,
     TriangleMultiplicationOutgoing,
 )
@@ -85,7 +86,7 @@ class PairformerBlock(nn.Module):
             c_hidden=c_hidden_pair_att,
             no_heads=no_heads_pair,
         )
-        self.tri_att_end = TriangleAttention(
+        self.tri_att_end = TriangleAttentionEndingNode(
             c_in=c_z,
             c_hidden=c_hidden_pair_att,
             no_heads=no_heads_pair,
@@ -157,15 +158,13 @@ class PairformerBlock(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
-            z = z.transpose(-2, -3).contiguous()
             z += self.tri_att_end(
                 z,
-                mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
+                mask=pair_mask,
                 triangle_attention=triangle_attention,
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
-            z = z.transpose(-2, -3).contiguous()
             z += self.pair_transition(z)
         else:
             tmu_update = self.tri_mul_out(
@@ -198,20 +197,33 @@ class PairformerBlock(nn.Module):
                 self.p_drop,
                 self.training,
             )
-            z = z.transpose(-2, -3).contiguous()
-            z = dropout_add_rowwise(
+            tri_att_end_update = self.tri_att_end(
                 z,
-                self.tri_att_end(
-                    z,
-                    mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
-                    triangle_attention=triangle_attention,
-                    inplace_safe=inplace_safe,
-                    chunk_size=chunk_size,
-                ),
-                self.p_drop,
-                self.training,
+                mask=pair_mask,
+                triangle_attention=triangle_attention,
+                inplace_safe=inplace_safe,
+                chunk_size=chunk_size,
             )
-            z = z.transpose(-2, -3).contiguous()
+            if self.training and self.p_drop != 0.0:
+                # Ending triangle attention is mathematically starting
+                # attention over the transposed pair axes.  The old code
+                # materialized that transpose, applied row-wise dropout, and
+                # transposed back, which makes the dropout mask column-wise in
+                # the canonical [..., token_i, token_j, channel] layout.  In
+                # inference dropout is disabled, so the fast path below avoids
+                # both large HBM copies; this branch keeps training semantics
+                # unchanged when dropout is active.
+                mask_shape = list(tri_att_end_update.shape)
+                mask_shape[-2] = 1
+                dropout_mask = tri_att_end_update.new_ones(mask_shape)
+                dropout_mask = F.dropout(
+                    dropout_mask,
+                    p=self.p_drop,
+                    training=True,
+                )
+                z = z + tri_att_end_update * dropout_mask
+            else:
+                z = z + tri_att_end_update
 
             z = z + self.pair_transition(z)
         if self.c_s > 0:
