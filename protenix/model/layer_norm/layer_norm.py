@@ -31,9 +31,11 @@ import importlib
 import numbers
 import os
 import sys
+import warnings
 from typing import Any, Optional, Union
 
 import torch
+import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 
@@ -55,15 +57,24 @@ try:
 except ImportError:
     from protenix.model.layer_norm.torch_ext_compile import compile
 
-    fast_layer_norm_cuda_v2 = compile(
-        name="fast_layer_norm_cuda_v2",
-        sources=[
-            os.path.join(f"{current_dir}/kernel", file)
-            for file in ["layer_norm_cuda.cpp", "layer_norm_cuda_kernel.cu"]
-        ],
-        extra_include_paths=[f"{current_dir}/kernel"],
-        build_directory=build_directory,
-    )
+    try:
+        fast_layer_norm_cuda_v2 = compile(
+            name="fast_layer_norm_cuda_v2",
+            sources=[
+                os.path.join(f"{current_dir}/kernel", file)
+                for file in ["layer_norm_cuda.cpp", "layer_norm_cuda_kernel.cu"]
+            ],
+            extra_include_paths=[f"{current_dir}/kernel"],
+            build_directory=build_directory,
+        )
+    except Exception as exc:  # pragma: no cover - depends on local CUDA toolchain.
+        error_summary = str(exc).splitlines()[0] if str(exc) else repr(exc)
+        warnings.warn(
+            "fast_layer_norm_cuda_v2 could not be built; falling back to "
+            f"torch.nn.functional.layer_norm. Original error: {error_summary}",
+            RuntimeWarning,
+        )
+        fast_layer_norm_cuda_v2 = None
 
 
 class FusedLayerNormAffineFunction(torch.autograd.Function):
@@ -228,6 +239,11 @@ class FusedLayerNorm(torch.nn.Module):
             torch.nn.init.zeros_(self.bias)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if fast_layer_norm_cuda_v2 is None:
+            dtype = input.dtype
+            weight = None if self.weight is None else self.weight.to(dtype=dtype)
+            bias = None if self.bias is None else self.bias.to(dtype=dtype)
+            return F.layer_norm(input, self.normalized_shape, weight, bias, self.eps)
         return FusedLayerNormAffineFunction.apply(
             input, self.weight, self.bias, self.normalized_shape, self.eps
         )
