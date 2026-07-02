@@ -245,6 +245,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--randomize-zero-weights", action="store_true", default=True)
+    parser.add_argument(
+        "--compare-triattention",
+        action="store_true",
+        help="Also time/compare Protenix's existing materialized Triton backend.",
+    )
     return parser.parse_args()
 
 
@@ -266,7 +271,15 @@ def main() -> None:
             args.warmup,
             args.iters,
         )
-    print(json.dumps({
+        tri_out = None
+        tri_ms = None
+        if args.compare_triattention:
+            tri_out, tri_ms = cuda_time(
+                lambda: module(x, mask=mask, triangle_attention="triattention"),
+                args.warmup,
+                args.iters,
+            )
+    result = {
         "args": vars(args),
         "device": torch.cuda.get_device_name(),
         "cueq_ms": cueq_ms,
@@ -277,7 +290,19 @@ def main() -> None:
         "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
         "peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
         "torch": {"version": torch.__version__, "cuda": torch.version.cuda},
-    }, indent=2, sort_keys=True))
+    }
+    if tri_out is not None and tri_ms is not None:
+        result.update(
+            {
+                "triattention_ms": tri_ms,
+                "packed_speedup_vs_triattention": tri_ms / packed_ms,
+                "triattention_vs_cueq_max_abs_error": max_abs_error(cueq_out, tri_out),
+                "triattention_vs_cueq_mean_abs_error": mean_abs_error(cueq_out, tri_out),
+                "packed_vs_triattention_max_abs_error": max_abs_error(tri_out, packed_out),
+                "packed_vs_triattention_mean_abs_error": mean_abs_error(tri_out, packed_out),
+            }
+        )
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
