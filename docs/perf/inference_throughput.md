@@ -437,6 +437,11 @@ its original guarded path.  This is deliberately not default-on yet: it changes
 the fusion boundary and needs a GPU gate before promotion.  Remote CPU checks in
 the `env-boltz2` environment passed the sample-invariant and explicit
 sample-axis parity tests plus the ragged-batch helper tests.
+Follow-up commit `aa899d3` fixes the model integration boundary so the
+conditioning tensor is passed as `[record, 1, token, channel]`; the original
+implementation correctly tested the transformer module with that shape, but the
+full diffusion batching path accidentally passed `[record, token, channel]`,
+which would broadcast against the sample axis incorrectly.
 
 Candidate gate status: queued from isolated checkout
 `/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_sampleaxis_40e51f8`.
