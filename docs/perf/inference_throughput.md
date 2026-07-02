@@ -415,7 +415,9 @@ current flattened `[record * sample, token, channel]` block against a rank-5
 candidate that keeps `a` as `[record, sample, token, channel]` and keeps the
 diffusion conditioning `s` sample-invariant as `[record, 1, token, channel]`.
 It also includes the current Protenix rank-5 FP32-upcast policy as a rejection
-control.
+control.  Status: queued as job `95925`
+(`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/diffusion_transformer_sample_axis_20260702_203922`),
+dependent on the raw masked SDPA probe (`afterany:95919`).
 
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`
