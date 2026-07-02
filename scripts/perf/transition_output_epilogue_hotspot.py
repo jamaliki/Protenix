@@ -239,6 +239,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--candidate")
+    parser.add_argument("--output-json")
     parser.add_argument("--randomize-zero-weights", action="store_true", default=True)
     return parser.parse_args()
 
@@ -275,24 +276,22 @@ def main() -> None:
                 "parity": max_mean_abs(reference, candidate_out),
             }
 
-    print(
-        json.dumps(
-            {
-                "args": vars(args),
-                "baseline": {
-                    "ms": baseline_ms,
-                    "subranges_ms": subranges,
-                },
-                "candidate": candidate_row,
-                "device": torch.cuda.get_device_name(),
-                "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
-                "peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
-                "torch": {"version": torch.__version__, "cuda": torch.version.cuda},
-            },
-            indent=2,
-            sort_keys=True,
-        )
-    )
+    result = {
+        "args": vars(args),
+        "baseline": {
+            "ms": baseline_ms,
+            "subranges_ms": subranges,
+        },
+        "candidate": candidate_row,
+        "device": torch.cuda.get_device_name(),
+        "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
+        "peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
+        "torch": {"version": torch.__version__, "cuda": torch.version.cuda},
+    }
+    text = json.dumps(result, indent=2, sort_keys=True)
+    if args.output_json:
+        Path(args.output_json).write_text(text + "\n", encoding="utf-8")
+    print(text)
 
 
 if __name__ == "__main__":

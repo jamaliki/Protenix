@@ -66,6 +66,7 @@ ARGS=(
   --warmup "${WARMUP:-10}"
   --iters "${ITERS:-30}"
   --seed "${SEED:-123}"
+  --output-json "$RUN_DIR/result.json"
 )
 
 if [[ -n "${CANDIDATE:-}" ]]; then
@@ -76,5 +77,4 @@ printf 'command:'
 printf ' %q' "$PROTENIX_PYTHON" scripts/perf/transition_output_epilogue_hotspot.py "${ARGS[@]}"
 printf '\n'
 
-"$PROTENIX_PYTHON" scripts/perf/transition_output_epilogue_hotspot.py "${ARGS[@]}" \
-  | tee "$RUN_DIR/result.json"
+"$PROTENIX_PYTHON" scripts/perf/transition_output_epilogue_hotspot.py "${ARGS[@]}"

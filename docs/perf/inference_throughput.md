@@ -687,6 +687,10 @@ PROTENIX_RUN_NAME=transition_epilogue_candidate_$(date -u +%Y%m%d_%H%M%S) \
 sbatch scripts/perf/tokyo_transition_epilogue_hotspot.sbatch
 ```
 
+The wrapper writes a clean `$RUN_DIR/result.json` directly from the Python
+harness, so extension compile logs on stdout do not corrupt the machine-readable
+timing record.
+
 A candidate should only advance if this screen shows both acceptable BF16 parity
 and a win over the full baseline boundary, not merely over the elementwise
 epilogue launch in isolation.
