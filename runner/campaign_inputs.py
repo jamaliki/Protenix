@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Optional
 
 _GENERATED_JSON_SUFFIXES = ("-update-msa", "-final-updated")
+_SEQUENCE_ENTITY_KEYS = ("proteinChain", "dnaSequence", "rnaSequence")
 
 
 def _has_source_json(path: Path, all_jsons: set[Path]) -> bool:
@@ -113,22 +114,54 @@ def group_inference_jsons_by_seed(
     return groups
 
 
+def _entity_count(entity: dict) -> int:
+    try:
+        return max(1, int(entity.get("count", 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def estimate_record_token_count(record: dict) -> int:
+    """Estimate token length from raw inference JSON before featurization.
+
+    This is intentionally conservative and schema-local: for the common protein
+    design case, token count is just summed polymer sequence length times entity
+    count.  Unknown or ligand-only entities contribute zero, so they keep their
+    original relative order through the stable sort below.
+    """
+    total = 0
+    for entry in record.get("sequences", []):
+        if not isinstance(entry, dict):
+            continue
+        for key in _SEQUENCE_ENTITY_KEYS:
+            entity = entry.get(key)
+            if isinstance(entity, dict):
+                sequence = entity.get("sequence", "")
+                if isinstance(sequence, str):
+                    total += len(sequence) * _entity_count(entity)
+    return total
+
+
 def write_campaign_json(
     json_paths: list[str],
     out_dir: str,
+    sort_by_token_length: bool = False,
 ) -> tuple[str, Optional[str]]:
     """Merge JSON records for one campaign batch and return ``(path, cleanup)``.
 
-    If there is only one source JSON, no file is written and cleanup is ``None``.
-    For multiple files we write a short-lived JSON under the output directory so
-    the existing dataloader and exact-shape batcher can run unchanged.
+    If there is only one source JSON and no sorting is requested, no file is
+    written and cleanup is ``None``.  For multiple files, or for length-sorted
+    batching, we write a short-lived JSON under the output directory so the
+    existing dataloader and batcher can run unchanged.
     """
-    if len(json_paths) == 1:
+    if len(json_paths) == 1 and not sort_by_token_length:
         return json_paths[0], None
 
     records = []
     for json_path in json_paths:
         records.extend(load_inference_records(json_path))
+    if sort_by_token_length:
+        records = sorted(records, key=estimate_record_token_count)
 
     campaign_dir = os.path.join(out_dir, ".protenix_campaign_inputs")
     os.makedirs(campaign_dir, exist_ok=True)

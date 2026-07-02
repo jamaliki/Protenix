@@ -431,6 +431,16 @@ def _inference_batch_mode(configs: Any) -> str:
     return mode
 
 
+def _inference_token_bucket_size(configs: Any) -> int:
+    """Return the approximate padded-token batching bucket width."""
+    try:
+        value = int(configs.get("inference_token_bucket_size", 0))
+    except (TypeError, ValueError):
+        logger.warning("Invalid inference_token_bucket_size; using input order.")
+        return 0
+    return max(0, value)
+
+
 _ATOM_ONLY_FEATURE_KEYS = {
     "atom_to_token_idx",
     "atom_to_tokatom_idx",
@@ -693,6 +703,20 @@ def _input_batch_signature(data: Mapping[str, Any], batch_mode: str) -> Any:
     return _input_feature_signature(data)
 
 
+def _token_bucket_id(n_token: int, bucket_size: int) -> int:
+    return (n_token - 1) // bucket_size
+
+
+def _queue_batch_signature(
+    data: Mapping[str, Any], batch_mode: str, token_bucket_size: int
+) -> Any:
+    signature = _input_batch_signature(data, batch_mode)
+    if batch_mode not in {"auto", "padded"} or token_bucket_size <= 0:
+        return signature
+    n_token = int(data["N_token"].item())
+    return (signature, ("token_bucket", _token_bucket_id(n_token, token_bucket_size)))
+
+
 def _effective_batch_mode(
     items: list[tuple[dict[str, Any], Any]], batch_mode: str
 ) -> str:
@@ -868,7 +892,7 @@ def _describe_batch(
         batch_kind = f"{batch_kind} (auto)"
     logger.info(
         "[Rank %s] Predicting %d %s input(s) [seed:%s]: "
-        "N_token %s, N_atom %s-%s, N_msa %s, names=%s",
+        "N_token %s, token_pad_eff %.1f%%, N_atom %s-%s, N_msa %s, names=%s",
         DIST_WRAPPER.rank,
         len(items),
         batch_kind,
@@ -878,6 +902,7 @@ def _describe_batch(
             if min(token_counts) == max(token_counts)
             else f"{min(token_counts)}-{max(token_counts)}"
         ),
+        100.0 * sum(token_counts) / (len(token_counts) * max(token_counts)),
         min(atom_counts),
         max(atom_counts),
         int(first_data["N_msa"].item()),
@@ -1213,6 +1238,7 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
         t1_start = time.time()
         batch_size = _inference_batch_size(configs)
         batch_mode = _inference_batch_mode(configs)
+        token_bucket_size = _inference_token_bucket_size(configs)
         pending: dict[Any, list[tuple[dict[str, Any], Any]]] = {}
 
         def flush_signature(signature: Any) -> None:
@@ -1244,7 +1270,9 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                         f"N_asym {data['N_asym'].item()}, N_token {data['N_token'].item()}, "
                         f"N_atom {data['N_atom'].item()}, N_msa {data['N_msa'].item()}"
                     )
-                    signature = _input_batch_signature(data, batch_mode)
+                    signature = _queue_batch_signature(
+                        data, batch_mode, token_bucket_size
+                    )
                     pending.setdefault(signature, []).append((data, atom_array))
                     if len(pending[signature]) >= batch_size:
                         flush_signature(signature)

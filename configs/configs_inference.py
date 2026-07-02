@@ -37,6 +37,12 @@ inference_configs = {
     # Atom-shaped diffusion/confidence work stays per record.  "exact", "token",
     # and "padded" force one boundary for debugging or benchmarking.
     "inference_batch_mode": "auto",
+    # Optional fallback for callers that feed unsorted records directly into
+    # infer_predict.  The CLI sorts raw campaign records by length before
+    # featurization, which packs batches better without holding feature tensors
+    # in memory.  Set this >0 to additionally split the streaming queue into
+    # approximate N_token buckets.
+    "inference_token_bucket_size": 0,
     "use_msa": True,
     "enable_tf32": True,
     "enable_efficient_fusion": True,

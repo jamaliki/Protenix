@@ -318,6 +318,7 @@ def get_default_runner(
     need_atom_confidence: bool = False,
     inference_batch_size: int = 1,
     inference_batch_mode: str = "auto",
+    inference_token_bucket_size: int = 0,
     kalign_binary_path: Optional[str] = None,
     use_tfg_guidance: bool = False,
 ) -> InferenceRunner:
@@ -342,6 +343,7 @@ def get_default_runner(
         use_seeds_in_json (bool): Whether to use seeds defined in the JSON file.
         inference_batch_size (int): Number of compatible inputs per model forward.
         inference_batch_mode (str): Batching boundary: "auto", "exact", "token", or "padded".
+        inference_token_bucket_size (int): Optional queue bucket width for padded-token batching.
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Whether to use TFG guidance.
 
@@ -394,6 +396,7 @@ def get_default_runner(
     configs.need_atom_confidence = need_atom_confidence
     configs.inference_batch_size = max(1, int(inference_batch_size))
     configs.inference_batch_mode = inference_batch_mode
+    configs.inference_token_bucket_size = max(0, int(inference_token_bucket_size))
     if kalign_binary_path is not None:
         # The path provided by the user is expected to exist by default
         configs.data.template.kalign_binary_path = kalign_binary_path
@@ -445,7 +448,8 @@ def get_default_runner(
         f"enable_efficient_fusion: {configs.enable_efficient_fusion}, "
         f"enable_tf32: {configs.enable_tf32}, "
         f"inference_batch_size: {configs.inference_batch_size}, "
-        f"inference_batch_mode: {configs.inference_batch_mode}"
+        f"inference_batch_mode: {configs.inference_batch_mode}, "
+        f"inference_token_bucket_size: {configs.inference_token_bucket_size}"
     )
     download_inference_cache(configs)
     return InferenceRunner(configs)
@@ -473,6 +477,7 @@ def inference_jsons(
     need_atom_confidence: bool = False,
     inference_batch_size: int = 1,
     inference_batch_mode: str = "auto",
+    inference_token_bucket_size: int = 0,
     kalign_binary_path: Optional[str] = None,
     use_tfg_guidance: bool = False,
     hmmsearch_binary_path: Optional[str] = None,
@@ -510,6 +515,7 @@ def inference_jsons(
         use_seeds_in_json (bool): Whether to use seeds from JSON.
         inference_batch_size (int): Number of compatible inputs per model forward.
         inference_batch_mode (str): Batching boundary: "auto", "exact", "token", or "padded".
+        inference_token_bucket_size (int): Optional queue bucket width for padded-token batching.
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Use TFG guidance.
         hmmsearch_binary_path (Optional[str]): Path to hmmsearch binary.
@@ -549,6 +555,7 @@ def inference_jsons(
         need_atom_confidence=need_atom_confidence,
         inference_batch_size=inference_batch_size,
         inference_batch_mode=inference_batch_mode,
+        inference_token_bucket_size=inference_token_bucket_size,
         kalign_binary_path=kalign_binary_path,
         use_tfg_guidance=use_tfg_guidance,
     )
@@ -591,10 +598,19 @@ def inference_jsons(
         merged_json = cleanup_json = None
         try:
             configs["seeds"] = list(seed_key)
-            merged_json, cleanup_json = write_campaign_json(group_jsons, out_dir)
+            sort_records = (
+                inference_batch_size > 1
+                and inference_batch_mode in {"auto", "padded"}
+                and not use_seeds_in_json
+            )
+            merged_json, cleanup_json = write_campaign_json(
+                group_jsons, out_dir, sort_by_token_length=sort_records
+            )
             if cleanup_json is not None:
+                action = "Merged and length-sorted" if sort_records else "Merged"
                 logger.info(
-                    "Merged %d JSON file(s) for campaign inference into %s",
+                    "%s %d JSON file(s) for campaign inference into %s",
+                    action,
                     len(group_jsons),
                     merged_json,
                 )
@@ -763,6 +779,16 @@ def protenix_cli() -> None:
     ),
 )
 @click.option(
+    "--token_bucket_size",
+    type=int,
+    default=0,
+    help=(
+        "Optional N_token bucket width for the streaming padded-token queue. "
+        "The CLI already length-sorts campaign records before featurization; "
+        "use 0 to rely on that sorted order."
+    ),
+)
+@click.option(
     "--kalign_binary_path",
     type=str,
     default=None,
@@ -857,6 +883,7 @@ def predict(
     need_atom_confidence: bool,
     batch_size: int,
     batch_mode: str,
+    token_bucket_size: int,
     kalign_binary_path: Optional[str] = None,
     use_tfg_guidance: bool = False,
     hmmsearch_binary_path: Optional[str] = None,
@@ -896,6 +923,7 @@ def predict(
         need_atom_confidence (bool): Compute atom-level confidence scores.
         batch_size (int): Number of compatible inputs per model forward.
         batch_mode (str): Batching boundary: "auto", "exact", "token", or "padded".
+        token_bucket_size (int): Optional queue bucket width for padded-token batching.
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Use TFG guidance.
         hmmsearch_binary_path (Optional[str]): Path to hmmsearch binary.
@@ -1018,6 +1046,7 @@ def predict(
         need_atom_confidence=need_atom_confidence,
         inference_batch_size=batch_size,
         inference_batch_mode=batch_mode,
+        inference_token_bucket_size=token_bucket_size,
         kalign_binary_path=kalign_binary_path,
         use_tfg_guidance=use_tfg_guidance,
         hmmsearch_binary_path=hmmsearch_binary_path,

@@ -24,9 +24,11 @@ from runner.inference import (
     _effective_batch_mode,
     _input_batch_signature,
     _pad_token_trunk_tree,
+    _queue_batch_signature,
     _run_prediction_batch,
 )
 from runner.campaign_inputs import (
+    estimate_record_token_count,
     group_inference_jsons_by_seed,
     load_inference_records,
     resolve_inference_jsons,
@@ -115,6 +117,51 @@ class TestCampaignJsonBatching(unittest.TestCase):
 
             self.assertEqual(merged_path, path)
             self.assertIsNone(cleanup_path)
+
+    def test_campaign_json_can_sort_records_by_estimated_token_count(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "records.json")
+            _write_json(
+                path,
+                [
+                    {
+                        "name": "long",
+                        "sequences": [
+                            {"proteinChain": {"sequence": "A" * 80, "count": 1}}
+                        ],
+                    },
+                    {
+                        "name": "short_dimer",
+                        "sequences": [
+                            {"proteinChain": {"sequence": "A" * 20, "count": 2}}
+                        ],
+                    },
+                    {
+                        "name": "medium",
+                        "sequences": [
+                            {"proteinChain": {"sequence": "A" * 60, "count": 1}}
+                        ],
+                    },
+                ],
+            )
+
+            merged_path, cleanup_path = write_campaign_json(
+                [path], tmpdir, sort_by_token_length=True
+            )
+            try:
+                records = load_inference_records(merged_path)
+                self.assertEqual(
+                    [record["name"] for record in records],
+                    ["short_dimer", "medium", "long"],
+                )
+                self.assertEqual(
+                    [estimate_record_token_count(record) for record in records],
+                    [40, 60, 80],
+                )
+                self.assertEqual(cleanup_path, merged_path)
+            finally:
+                if cleanup_path is not None:
+                    os.remove(cleanup_path)
 
     def test_token_batch_signature_ignores_atom_only_shapes(self):
         def make_data(n_atom: int) -> dict:
@@ -217,6 +264,36 @@ class TestCampaignJsonBatching(unittest.TestCase):
 
         self.assertEqual(tuple(padded["restype"].shape), (40, 32))
         self.assertEqual(tuple(padded["token_bonds"].shape), (40, 40))
+
+    def test_padded_queue_signature_uses_token_buckets(self):
+        def make_data(n_token: int) -> dict:
+            return {
+                "N_token": torch.tensor([n_token]),
+                "input_feature_dict": {
+                    "residue_index": torch.zeros(n_token, dtype=torch.long),
+                    "token_index": torch.zeros(n_token, dtype=torch.long),
+                    "token_bonds": torch.zeros(n_token, n_token),
+                    "msa": torch.zeros(1, n_token, dtype=torch.long),
+                    "restype": torch.zeros(n_token, 32),
+                },
+            }
+
+        len40 = make_data(40)
+        len55 = make_data(55)
+        len96 = make_data(96)
+
+        self.assertEqual(
+            _queue_batch_signature(len40, "auto", token_bucket_size=0),
+            _queue_batch_signature(len96, "auto", token_bucket_size=0),
+        )
+        self.assertEqual(
+            _queue_batch_signature(len40, "auto", token_bucket_size=32),
+            _queue_batch_signature(len55, "auto", token_bucket_size=32),
+        )
+        self.assertNotEqual(
+            _queue_batch_signature(len40, "auto", token_bucket_size=32),
+            _queue_batch_signature(len96, "auto", token_bucket_size=32),
+        )
 
     def test_singleton_prediction_batch_keeps_exact_path(self):
         class DummyRunner:
