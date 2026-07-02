@@ -301,6 +301,7 @@ def get_default_runner(
     use_rna_msa: bool = False,
     use_seeds_in_json: bool = False,
     need_atom_confidence: bool = False,
+    inference_batch_size: int = 1,
     kalign_binary_path: Optional[str] = None,
     use_tfg_guidance: bool = False,
 ) -> InferenceRunner:
@@ -323,6 +324,7 @@ def get_default_runner(
         use_template (bool): Whether to use templates.
         use_rna_msa (bool): Whether to use RNA MSA.
         use_seeds_in_json (bool): Whether to use seeds defined in the JSON file.
+        inference_batch_size (int): Number of exact-shape inputs per model forward.
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Whether to use TFG guidance.
 
@@ -373,6 +375,7 @@ def get_default_runner(
     configs.use_rna_msa = use_rna_msa
     configs.use_seeds_in_json = use_seeds_in_json
     configs.need_atom_confidence = need_atom_confidence
+    configs.inference_batch_size = max(1, int(inference_batch_size))
     if kalign_binary_path is not None:
         # The path provided by the user is expected to exist by default
         configs.data.template.kalign_binary_path = kalign_binary_path
@@ -422,7 +425,8 @@ def get_default_runner(
     logger.info(
         f"enable_diffusion_shared_vars_cache: {configs.enable_diffusion_shared_vars_cache}, "
         f"enable_efficient_fusion: {configs.enable_efficient_fusion}, "
-        f"enable_tf32: {configs.enable_tf32}"
+        f"enable_tf32: {configs.enable_tf32}, "
+        f"inference_batch_size: {configs.inference_batch_size}"
     )
     download_inference_cache(configs)
     return InferenceRunner(configs)
@@ -448,6 +452,7 @@ def inference_jsons(
     use_rna_msa: bool = False,
     use_seeds_in_json: bool = False,
     need_atom_confidence: bool = False,
+    inference_batch_size: int = 1,
     kalign_binary_path: Optional[str] = None,
     use_tfg_guidance: bool = False,
     hmmsearch_binary_path: Optional[str] = None,
@@ -483,6 +488,7 @@ def inference_jsons(
         use_template (bool): Whether to use templates.
         use_rna_msa (bool): Whether to use RNA MSA.
         use_seeds_in_json (bool): Whether to use seeds from JSON.
+        inference_batch_size (int): Number of exact-shape inputs per model forward.
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Use TFG guidance.
         hmmsearch_binary_path (Optional[str]): Path to hmmsearch binary.
@@ -531,6 +537,7 @@ def inference_jsons(
         use_rna_msa=use_rna_msa,
         use_seeds_in_json=use_seeds_in_json,
         need_atom_confidence=need_atom_confidence,
+        inference_batch_size=inference_batch_size,
         kalign_binary_path=kalign_binary_path,
         use_tfg_guidance=use_tfg_guidance,
     )
@@ -689,6 +696,15 @@ def protenix_cli() -> None:
     help="Whether to compute atom-level confidence scores.",
 )
 @click.option(
+    "--batch_size",
+    type=int,
+    default=1,
+    help=(
+        "Number of exact-shape input records to run in one model forward. "
+        "Inputs with different tensor shapes are automatically kept separate."
+    ),
+)
+@click.option(
     "--kalign_binary_path",
     type=str,
     default=None,
@@ -781,6 +797,7 @@ def predict(
     use_rna_msa: bool,
     use_seeds_in_json: bool,
     need_atom_confidence: bool,
+    batch_size: int,
     kalign_binary_path: Optional[str] = None,
     use_tfg_guidance: bool = False,
     hmmsearch_binary_path: Optional[str] = None,
@@ -818,6 +835,7 @@ def predict(
         use_rna_msa (bool): Use RNA MSA.
         use_seeds_in_json (bool): Use seeds from JSON.
         need_atom_confidence (bool): Compute atom-level confidence scores.
+        batch_size (int): Number of exact-shape inputs per model forward.
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Use TFG guidance.
         hmmsearch_binary_path (Optional[str]): Path to hmmsearch binary.
@@ -938,6 +956,7 @@ def predict(
         use_rna_msa=use_rna_msa,
         use_seeds_in_json=use_seeds_in_json,
         need_atom_confidence=need_atom_confidence,
+        inference_batch_size=batch_size,
         kalign_binary_path=kalign_binary_path,
         use_tfg_guidance=use_tfg_guidance,
         hmmsearch_binary_path=hmmsearch_binary_path,
