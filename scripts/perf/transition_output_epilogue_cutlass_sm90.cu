@@ -26,10 +26,6 @@ static constexpr auto RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
 
 using TileShape = Shape<_128, _128, _64>;
 using ClusterShape = Shape<_2, _1, _1>;
-using StrideA = Stride<int64_t, _1, int64_t>;
-using StrideB = Stride<int64_t, _1, _0>;
-using StrideC = Stride<int64_t, _1, int64_t>;
-using StrideD = Stride<int64_t, _1, int64_t>;
 using StrideGate = Stride<_0, _1, int64_t>;
 
 using GateLoad = cutlass::epilogue::fusion::Sm90AuxLoad<
@@ -94,6 +90,13 @@ using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     cutlass::gemm::PersistentScheduler>;
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+using ProblemShapeType = typename Gemm::GemmKernel::ProblemShape;
+using MainloopArguments = typename Gemm::GemmKernel::MainloopArguments;
+using EpilogueArguments = typename Gemm::GemmKernel::EpilogueArguments;
+using StrideA = typename Gemm::GemmKernel::StrideA;
+using StrideB = typename Gemm::GemmKernel::StrideB;
+using StrideC = typename Gemm::GemmKernel::StrideC;
+using StrideD = typename Gemm::GemmKernel::StrideD;
 
 Element const* bf16_ptr(torch::Tensor const& t) {
   return reinterpret_cast<Element const*>(t.data_ptr<at::BFloat16>());
@@ -144,18 +147,27 @@ torch::Tensor forward(
   auto stream = at::cuda::getCurrentCUDAStream();
   auto hw_info = cutlass::KernelHardwareInfo::make_kernel_hardware_info<GemmKernel>(
       b.get_device(), 0, 0, stream);
-
-  typename Gemm::Arguments arguments{
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      {static_cast<int>(samples), static_cast<int>(output_channels), static_cast<int>(hidden), static_cast<int>(tokens)},
-      {bf16_ptr(b), StrideA{tokens * hidden, _1{}, hidden},
-       bf16_ptr(weight), StrideB{hidden, _1{}, _0{}}},
+  ProblemShapeType problem_shape{
+      static_cast<int>(samples),
+      static_cast<int>(output_channels),
+      static_cast<int>(hidden),
+      static_cast<int>(tokens)};
+  MainloopArguments mainloop_args{
+      bf16_ptr(b), StrideA{tokens * hidden, _1{}, hidden},
+      bf16_ptr(weight), StrideB{hidden, _1{}, 0}};
+  EpilogueArguments epilogue_args{
       {{{ElementCompute(1.0f)},
         {},
         {{{gate_bf16_ptr(gate), Element(0), StrideGate{_0{}, _1{}, output_channels}}, {}}, {}, {}},
         {}},
        bf16_ptr(residual), StrideC{tokens * output_channels, _1{}, output_channels},
-       mutable_bf16_ptr(out), StrideD{tokens * output_channels, _1{}, output_channels}},
+       mutable_bf16_ptr(out), StrideD{tokens * output_channels, _1{}, output_channels}};
+
+  typename Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      problem_shape,
+      mainloop_args,
+      epilogue_args,
       hw_info,
       {}};
 
