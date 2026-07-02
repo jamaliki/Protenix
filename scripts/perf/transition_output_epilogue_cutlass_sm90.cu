@@ -28,6 +28,7 @@ using TileShape = Shape<_128, _128, _64>;
 using ClusterShape = Shape<_2, _1, _1>;
 using StrideGate = Stride<_0, _1, int64_t>;
 
+using ResidualScale = cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementCompute>;
 using GateLoad = cutlass::epilogue::fusion::Sm90AuxLoad<
     0,
     cutlass::epilogue::collective::EpilogueTileAuto,
@@ -38,18 +39,35 @@ using GateLoad = cutlass::epilogue::fusion::Sm90AuxLoad<
     8>;
 
 // D = residual + sigmoid(gate) * acc
+//
+// CUTLASS epilogue visitor trees are easiest to reason about from the leaves up:
+//   1. GateLoad reads gate[n, l] with stride_m=0 so it broadcasts over samples.
+//   2. GateSigmoid applies sigmoid(gate).
+//   3. GateTimesAcc multiplies that value by the GEMM accumulator.
+//   4. GateResidualEVT adds the residual C tensor with scale 1.0.
+//
+// The final tree computes exactly the PyTorch hotspot:
+//   residual + sigmoid(gate) * (b @ weight.T)
+using GateSigmoid = cutlass::epilogue::fusion::Sm90EVT<
+    cutlass::epilogue::fusion::Sm90Compute<cutlass::epilogue::thread::Sigmoid, ElementCompute, ElementCompute, RoundStyle>,
+    GateLoad>;
+
 using GateTimesAcc = cutlass::epilogue::fusion::Sm90EVT<
     cutlass::epilogue::fusion::Sm90Compute<cutlass::multiplies, ElementCompute, ElementCompute, RoundStyle>,
-    cutlass::epilogue::fusion::Sm90EVT<
-        cutlass::epilogue::fusion::Sm90Compute<cutlass::epilogue::thread::Sigmoid, ElementCompute, ElementCompute, RoundStyle>,
-        GateLoad>,
+    GateSigmoid,
     cutlass::epilogue::fusion::Sm90AccFetch>;
 
 using GateResidualEVT = cutlass::epilogue::fusion::Sm90EVT<
     cutlass::epilogue::fusion::Sm90Compute<cutlass::homogeneous_multiply_add, Element, ElementCompute, RoundStyle>,
-    cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementCompute>,
+    ResidualScale,
     cutlass::epilogue::fusion::Sm90SrcFetch<Element>,
     GateTimesAcc>;
+
+using ResidualScaleArguments = typename ResidualScale::Arguments;
+using GateLoadArguments = typename GateLoad::Arguments;
+using GateSigmoidArguments = typename GateSigmoid::Arguments;
+using GateTimesAccArguments = typename GateTimesAcc::Arguments;
+using GateResidualArguments = typename GateResidualEVT::Arguments;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm90,
@@ -75,7 +93,7 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     cutlass::layout::RowMajor,
     8,
     Element,
-    cutlass::layout::RowMajor,
+    cutlass::layout::ColumnMajor,
     8,
     ElementAccumulator,
     TileShape,
@@ -108,6 +126,23 @@ Element* mutable_bf16_ptr(torch::Tensor const& t) {
 
 Element const* gate_bf16_ptr(torch::Tensor const& t) {
   return reinterpret_cast<Element const*>(t.data_ptr<at::BFloat16>());
+}
+
+GateResidualArguments make_gate_residual_args(torch::Tensor const& gate, int64_t output_channels) {
+  // The tree argument layout mirrors the type definition above:
+  // {residual_scale, residual_fetch, {sigmoid_gate, accumulator_fetch, multiply}, add}.
+  // Using typed sub-arguments avoids the unreadable nested-brace errors that
+  // otherwise come from CUTLASS's aggregate visitor-tree API.
+  return GateResidualArguments{
+      ResidualScaleArguments{{ElementCompute(1.0f)}},
+      {},
+      GateTimesAccArguments{
+          GateSigmoidArguments{
+              GateLoadArguments{gate_bf16_ptr(gate), Element(0), StrideGate{_0{}, _1{}, output_channels}},
+              {}},
+          {},
+          {}},
+      {}};
 }
 
 void check_inputs(
@@ -156,12 +191,9 @@ torch::Tensor forward(
       bf16_ptr(b), StrideA{tokens * hidden, _1{}, hidden},
       bf16_ptr(weight), StrideB{hidden, _1{}, 0}};
   EpilogueArguments epilogue_args{
-      {{{ElementCompute(1.0f)},
-        {},
-        {{{gate_bf16_ptr(gate), Element(0), StrideGate{_0{}, _1{}, output_channels}}, {}}, {}, {}},
-        {}},
-       bf16_ptr(residual), StrideC{tokens * output_channels, _1{}, output_channels},
-       mutable_bf16_ptr(out), StrideD{tokens * output_channels, _1{}, output_channels}};
+      make_gate_residual_args(gate, output_channels),
+      bf16_ptr(residual), StrideC{tokens * output_channels, _1{}, output_channels},
+      mutable_bf16_ptr(out), StrideD{tokens * output_channels, _1{}, output_channels}};
 
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGemm,
