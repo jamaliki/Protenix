@@ -66,6 +66,15 @@ many-sequence/few-sample path described below; its pairformer use is
 shape-guarded so larger batches fall back when the fused temporary would be too
 large.
 
+For the many-independent-sequence path, two triangle-attention layout fusions
+are now default-on when Triton is available.  They can be disabled independently
+for profiling:
+
+```bash
+export PROTENIX_TRITON_TRIANGLE_ATTENTION_EPILOGUE=0
+export PROTENIX_TRITON_CUEQ_QKV_LAYOUT=0
+```
+
 ## Reproducing the benchmark
 
 Use the benchmark harness rather than timing ad hoc commands.  It records the
@@ -187,6 +196,44 @@ The candidate kept exact BF16 parity in the batched-vs-loop hotspot screen for
 this boundary (`z` max abs 0.0).  The remaining dominant cost is the CUEQ core
 itself; replacing that needs a real attention-kernel design, not another
 layout cleanup.
+
+#### Pairformer CUEQ q/k/v layout producer
+
+Kernel-level profiling of one B64 starting-triangle-attention module showed
+that the apparent `cueq_attention` range was not a single launch: it was the
+cuDNN/CUEQ attention kernel plus multiple layout/materialization launches around
+it.  The fused q/k/v projection produces `[*, I, J, 3 * H * D]`; CUEQ consumes
+three contiguous tensors in `[*, I, H, J, D]`.  The original path reached that
+shape with view/transpose metadata, then paid for contiguous q/k/v copies before
+the CUEQ CUDA call.
+
+`triton_qkv_to_cueq_heads_first` keeps the fused projection GEMM unchanged and
+only changes the boundary after it: one streaming Triton kernel splits q/k/v and
+writes CUEQ's physical layout directly.  This is intentionally narrower than a
+"mega-kernel"; it removes measured HBM traffic while preserving the high-quality
+matrix multiply and attention kernels.  The kernel uses 64-bit offsets because
+B96/N245 addresses beyond 2**31 elements in the fused qkv tensor.  A previous
+32-bit version was fast but corrupted B96 outputs; this is exactly the kind of
+shape-specific overflow a performance path must guard against.
+
+This path is inference-only, shape-guarded, default-on when Triton is present,
+and can be disabled with `PROTENIX_TRITON_CUEQ_QKV_LAYOUT=0`.
+
+Representative one-H100 gate, `N_token=245`, `batch=96`, `N_sample=1`, BF16,
+CUEQ triangle ops, confidence enabled:
+
+| gate | default layout | direct CUEQ layout | result |
+| --- | ---: | ---: | ---: |
+| one-block stack | 107.81 ms | 101.78 ms | 1.059x |
+| one-block sequence throughput | 890.4 seq/s | 943.2 seq/s | +5.9% |
+| full inference wall time | 116.67 s | 109.47 s | 1.066x |
+| full inference throughput | 0.8228 seq/s | 0.8770 seq/s | +6.6% |
+| pairformer time | 70.80 s | 65.88 s | 1.075x |
+| peak allocated/reserved | 57096 / 59526 MiB | 57096 / 59526 MiB | unchanged |
+
+The full gate produced finite coordinates for all 96 sequences and preserved
+the confidence head.  Direct q/k/v parity at B96 after the 64-bit offset fix was
+bitwise exact against the original layout path.
 
 #### Pairformer transition input fusion for many-sequence batches
 
@@ -643,6 +690,9 @@ Production code touched by the throughput stack:
   Triton gate kernels with PyTorch fallbacks, including the 64-bit-indexed
   split-aware `silu(first_half) * second_half` consumer for concatenated
   transition projections.
+- `protenix/model/triangular/qkv_layout_triton.py`: inference-only CUEQ q/k/v
+  layout producer for triangle attention; keeps the fused projection GEMM and
+  CUEQ attention kernel unchanged while removing hidden contiguous-copy traffic.
 - `protenix/model/modules/confidence.py` and `protenix/model/protenix.py`:
   confidence-logit chunk iteration and streaming summary consumption.
 
@@ -655,6 +705,8 @@ Profiling and reproducibility helpers:
 - `scripts/perf/local_attention_hotspot.py`: local-attention kernel screen.
 - `scripts/perf/local_attention_bias_hotspot.py`: bias-projection screen.
 - `scripts/perf/trunk_attention_hotspot.py`: trunk attention block screen.
+- `scripts/perf/triangle_attention_breakdown.py`: per-launch/subrange screen
+  for CUEQ triangle attention and its layout/epilogue boundaries.
 - `scripts/perf/confidence_head_hotspot.py`: confidence pairformer screen.
 - `scripts/perf/confidence_precision_screen.py`: confidence precision/parity
   screen with real checkpoint weights and matmul dtype tracing.
@@ -666,7 +718,7 @@ Do not expect another large gain from config changes.  The next proper
 same-output campaign should be one of:
 
 1. a deliberate atom/trunk kernel-layout rewrite, especially around producers
-   feeding local attention;
+   feeding attention kernels;
 2. a confidence-pairformer precision/tiling campaign with explicit numerical
    acceptance criteria;
 3. vendor-quality fused epilogues for specific matmul-adjacent patterns.

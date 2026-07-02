@@ -29,6 +29,10 @@ from protenix.model.triangular.layers import (
     cuequivariance_triangular_attn,
     flatten_final_dims,
 )
+from protenix.model.triangular.qkv_layout_triton import (
+    triton_cueq_qkv_layout_available,
+    triton_cueq_qkv_layout_enabled,
+)
 from protenix.model.triangular.triangular import TriangleAttention
 from protenix.model.utils import permute_final_dims
 
@@ -226,6 +230,8 @@ def layout_probe(
         "triangle_attention_epilogue_enabled": (
             triton_triangle_attention_epilogue_enabled()
         ),
+        "cueq_qkv_layout_enabled": triton_cueq_qkv_layout_enabled(),
+        "cueq_qkv_layout_available": triton_cueq_qkv_layout_available(),
         "triton_available": triton_fused_elementwise_available(),
         "helper_returned": fused is not None,
         "gate_shape": list(gate.shape),

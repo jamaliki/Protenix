@@ -26,6 +26,7 @@ from scipy.stats import truncnorm
 from protenix.model.modules.fused_elementwise_triton import (
     triton_sigmoid_mul_heads_first,
 )
+from protenix.model.triangular.qkv_layout_triton import triton_qkv_to_cueq_heads_first
 from protenix.model.utils import (
     chunk_layer,
     flatten_final_dims,
@@ -362,7 +363,11 @@ class Attention(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def _prep_qkv(
-        self, q_x: torch.Tensor, kv_x: torch.Tensor, apply_scale: bool = True
+        self,
+        q_x: torch.Tensor,
+        kv_x: torch.Tensor,
+        apply_scale: bool = True,
+        cueq_heads_first: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # [*, Q/K/V, H * C_hidden]
         if (
@@ -387,6 +392,14 @@ class Attention(nn.Module):
                     )
             else:
                 qkv = nn.functional.linear(q_x, torch.cat(weights))
+            if cueq_heads_first:
+                # CUEQ ultimately needs physically contiguous q/k/v tensors in
+                # [..., I, H, J, D] layout.  Producing that layout here avoids
+                # the hidden transpose/contiguous copies inside the CUEQ call
+                # while preserving the same fused projection and fallback path.
+                qkv_heads_first = triton_qkv_to_cueq_heads_first(qkv, self.no_heads)
+                if qkv_heads_first is not None:
+                    return qkv_heads_first
             q, k, v = qkv.chunk(3, dim=-1)
         else:
             q = self.linear_q(q_x)
@@ -486,7 +499,10 @@ class Attention(nn.Module):
 
         # DeepSpeed attention kernel applies scaling internally
         q, k, v = self._prep_qkv(
-            q_x, kv_x, apply_scale=triangle_attention in ["torch", "triattention"]
+            q_x,
+            kv_x,
+            apply_scale=triangle_attention in ["torch", "triattention"],
+            cueq_heads_first=triangle_attention == "cuequivariance",
         )
 
         if q.shape[-2] <= 16:
