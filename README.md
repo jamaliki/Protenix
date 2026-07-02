@@ -105,10 +105,11 @@ Only inputs whose feature tensors match exactly are stacked; different shapes
 are automatically kept in separate buckets rather than padded. When `-i` points
 to a directory of JSON files, the runner now merges the records into a transient
 campaign JSON before inference, so one-record-per-design campaigns can still
-fill exact-shape GPU batches while loading the model only once. On one H100 with
-32 repeated `7r6r` inputs, `N_sample=1`, `N_step=200`, and normal output
-dumping, exact-shape batching improved post-initialization runner time from
-`361.8s` to `69.3s` (`5.2x`). The same profiling loop found the trunk
+fill exact-shape GPU batches while loading the model only once. In a paired
+directory-campaign gate on one H100, 32 one-record `7r6r` JSON files improved
+from `342.7s` to `121.5s` end to end (`2.82x`). With the same shape supplied as
+one combined JSON, exact-shape batching improved post-initialization runner
+time from `361.8s` to `69.3s` (`5.2x`). The same profiling loop found the trunk
 pairformer triangle-attention epilogue and CUEQ QKV layout conversion as useful
 memory boundaries. The guarded Triton epilogue fuses sigmoid gating,
 head-layout conversion, and flattening after the CUEQ attention kernel, while

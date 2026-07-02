@@ -123,6 +123,28 @@ The smaller B8 public gate also passed correctness (8 CIFs) but only reached
 `1.9x` wrapper speedup because checkpoint/model initialization dominated such a
 short run.
 
+The real campaign shape is often a directory containing one JSON file per
+design.  That used to defeat batching because the runner called
+`infer_predict()` once per file.  The directory path now resolves the whole
+directory as one campaign, keeps JSONs with incompatible `modelSeeds` in
+separate transient merged files, and lets the existing exact-shape tensor-tree
+bucket decide what can actually stack.  Generated preprocessing siblings such
+as `foo-update-msa.json` are ignored when the source `foo.json` is present, so a
+rerun does not silently infer both the source and generated JSON.
+
+Paired directory-campaign gate, one H100, job `94948`, run directory
+`/mnt/lustre/users/kiarash-eitgbi/code/protenix/runs/campaign_json_batching_gate_20260702_112333_fair2`:
+
+| run | inputs | wall sec | seq/s | outputs | notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| current `main` | 32 one-record JSON files | 342.7 | 0.093 | 32 CIFs, 0 errors | 32 singleton model calls |
+| campaign merge | 32 one-record JSON files | 121.5 | 0.263 | 32 CIFs, 0 errors | one `Predicting 32 same-shape input(s)` call |
+
+This is a `2.82x` end-to-end speedup for the practical one-file-per-design
+workflow.  Both variants still write generated MSA JSON siblings during
+preprocessing; the promoted change is about not treating those siblings as new
+inputs on directory reruns.
+
 The model-only same-shape sweep shows where larger batches stop helping:
 
 | shape | sequence throughput | output-sample throughput | wall sec | peak reserved GiB | dominant work |
