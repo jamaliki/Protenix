@@ -1268,7 +1268,7 @@ class Protenix(nn.Module):
                 # attention on tensor-core BF16 SDPA instead of the generic
                 # rank-5 FP32 safeguard used for atom local attention.
                 a_transformer = _expand_sample_axis(a_batch, N_sample)
-                s_transformer = s_batch
+                s_transformer = s_batch[:, None, :, :]
                 token_mask_transformer = token_mask[:, None, :]
             else:
                 a_transformer = _flatten_record_sample_axes(a_batch, N_sample)
