@@ -14,6 +14,7 @@
 # Copyright 2021 AlQuraishi Laboratory
 
 
+import math
 from abc import ABC, abstractmethod
 from functools import partial, partialmethod
 from typing import List, Optional
@@ -22,6 +23,10 @@ import torch
 import torch.nn as nn
 
 from protenix.model.triangular.layers import Attention, LayerNorm, OpenfoldLinear
+from protenix.model.triangular.attention_triton import (
+    triton_triangle_attention_fused_enabled,
+    triton_triangle_attention_qkv_gate,
+)
 from protenix.model.utils import chunk_layer, is_fp16_enabled, permute_final_dims
 
 
@@ -687,8 +692,34 @@ class TriangleAttention(nn.Module):
         # [*, I, 1, 1, J]
         mask_bias = (self.inf * (mask - 1))[..., :, None, None, :]
 
+        # [*, I, J, H]
+        triangle_bias_raw = self.linear(x)
+
+        if (
+            chunk_size is None
+            and triangle_attention == "cuequivariance"
+            and triton_triangle_attention_fused_enabled()
+            and self.mha.linear_g is not None
+        ):
+            qkv = self.mha._prep_qkv_interleaved(x, x)
+            if qkv is not None:
+                gate = self.mha.linear_g(x)
+                fused = triton_triangle_attention_qkv_gate(
+                    qkv=qkv,
+                    triangle_bias=triangle_bias_raw,
+                    mask=mask if mask.is_contiguous() else mask.contiguous(),
+                    gate=gate,
+                    no_heads=self.no_heads,
+                    scale=1.0 / math.sqrt(self.c_hidden),
+                )
+                if fused is not None:
+                    x = self.mha.linear_o(fused)
+                    if not self.starting:
+                        x = x.transpose(-2, -3)
+                    return x
+
         # [*, H, I, J]
-        triangle_bias = permute_final_dims(self.linear(x), (2, 0, 1))
+        triangle_bias = permute_final_dims(triangle_bias_raw, (2, 0, 1))
 
         # [*, 1, H, I, J]
         triangle_bias = triangle_bias.unsqueeze(-4)
