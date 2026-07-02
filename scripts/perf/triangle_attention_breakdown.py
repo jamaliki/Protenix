@@ -161,9 +161,11 @@ def manual_cueq_forward(
         "cueq_attention",
         lambda: cuequivariance_triangular_attn(
             q, k, v, triangle_bias_fp32, mask_bool, scale
-        )[0],
+        ),
         events,
     )
+    if isinstance(o, tuple):
+        o = o[0]
     o = timed("attention_transpose", lambda: o.transpose(-2, -3), events)
 
     if module.mha.linear_g is not None:
@@ -212,7 +214,9 @@ def layout_probe(
     scale = 1.0 / math.sqrt(module.c_hidden)
     heads_first = cuequivariance_triangular_attn(
         q, k, v, triangle_bias.float(), (mask_bias == 0).bool(), scale
-    )[0]
+    )
+    if isinstance(heads_first, tuple):
+        heads_first = heads_first[0]
     gate = module.mha.linear_g(x)
     fused = triton_sigmoid_mul_heads_first(gate, heads_first)
 

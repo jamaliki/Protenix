@@ -516,7 +516,14 @@ class Attention(nn.Module):
             scale = 1.0 / math.sqrt(self.c_hidden)
             o = cuequivariance_triangular_attn(
                 q, k, v, biases[1].float(), (biases[0] == 0).bool(), scale
-            )[0]
+            )
+            # cuequivariance returns a tensor unless return_aux=True.  Indexing
+            # with ``[0]`` silently drops the sequence-batch dimension for B>1,
+            # causing one target's update to be broadcast across the whole
+            # batch.  Keep tuple handling only for API variants that return
+            # auxiliary tensors.
+            if isinstance(o, tuple):
+                o = o[0]
             return self._wrap_up_heads_first(o, q_x)
         else:
             o = _attention(q, k, v, biases)
