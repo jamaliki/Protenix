@@ -55,26 +55,39 @@ if build_directory is None:
 try:
     fast_layer_norm_cuda_v2 = importlib.import_module("fast_layer_norm_cuda_v2")
 except ImportError:
-    from protenix.model.layer_norm.torch_ext_compile import compile
-
-    try:
-        fast_layer_norm_cuda_v2 = compile(
-            name="fast_layer_norm_cuda_v2",
-            sources=[
-                os.path.join(f"{current_dir}/kernel", file)
-                for file in ["layer_norm_cuda.cpp", "layer_norm_cuda_kernel.cu"]
-            ],
-            extra_include_paths=[f"{current_dir}/kernel"],
-            build_directory=build_directory,
-        )
-    except Exception as exc:  # pragma: no cover - depends on local CUDA toolchain.
-        error_summary = str(exc).splitlines()[0] if str(exc) else repr(exc)
+    if os.environ.get("PROTENIX_DISABLE_FAST_LAYER_NORM", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
         warnings.warn(
-            "fast_layer_norm_cuda_v2 could not be built; falling back to "
-            f"torch.nn.functional.layer_norm. Original error: {error_summary}",
+            "PROTENIX_DISABLE_FAST_LAYER_NORM=1; using "
+            "torch.nn.functional.layer_norm.",
             RuntimeWarning,
         )
         fast_layer_norm_cuda_v2 = None
+    else:
+        from protenix.model.layer_norm.torch_ext_compile import compile
+
+        try:
+            fast_layer_norm_cuda_v2 = compile(
+                name="fast_layer_norm_cuda_v2",
+                sources=[
+                    os.path.join(f"{current_dir}/kernel", file)
+                    for file in ["layer_norm_cuda.cpp", "layer_norm_cuda_kernel.cu"]
+                ],
+                extra_include_paths=[f"{current_dir}/kernel"],
+                build_directory=build_directory,
+            )
+        except Exception as exc:  # pragma: no cover - depends on local CUDA toolchain.
+            error_summary = str(exc).splitlines()[0] if str(exc) else repr(exc)
+            warnings.warn(
+                "fast_layer_norm_cuda_v2 could not be built; falling back to "
+                f"torch.nn.functional.layer_norm. Original error: {error_summary}",
+                RuntimeWarning,
+            )
+            fast_layer_norm_cuda_v2 = None
 
 
 class FusedLayerNormAffineFunction(torch.autograd.Function):
