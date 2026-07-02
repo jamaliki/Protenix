@@ -891,6 +891,7 @@ def _run_prediction_batch(
     items: list[tuple[dict[str, Any], Any]],
     batch_mode: str,
 ) -> Mapping[str, Any] | list[Mapping[str, Any]]:
+    first_data = items[0][0]
     n_token = max(int(data["N_token"].item()) for data, _atom_array in items)
     runner.update_model_configs(update_inference_configs(configs, n_token))
     if _effective_batch_mode(items, batch_mode) in {"token", "padded"}:

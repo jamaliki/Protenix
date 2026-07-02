@@ -16,6 +16,7 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -23,6 +24,7 @@ from runner.inference import (
     _effective_batch_mode,
     _input_batch_signature,
     _pad_token_trunk_tree,
+    _run_prediction_batch,
 )
 from runner.campaign_inputs import (
     group_inference_jsons_by_seed,
@@ -215,6 +217,42 @@ class TestCampaignJsonBatching(unittest.TestCase):
 
         self.assertEqual(tuple(padded["restype"].shape), (40, 32))
         self.assertEqual(tuple(padded["token_bonds"].shape), (40, 40))
+
+    def test_singleton_prediction_batch_keeps_exact_path(self):
+        class DummyRunner:
+            def __init__(self):
+                self.configs_seen = []
+                self.predicted = None
+
+            def update_model_configs(self, configs):
+                self.configs_seen.append(configs)
+
+            def predict(self, data):
+                self.predicted = data
+                return {"ok": True}
+
+            def predict_token_batch(self, data_items):
+                raise AssertionError("singleton exact path should not use trunk batch")
+
+        data = {
+            "N_token": torch.tensor([4]),
+            "input_feature_dict": {
+                "residue_index": torch.zeros(4, dtype=torch.long),
+                "ref_pos": torch.zeros(20, 3),
+            },
+        }
+        configs = SimpleNamespace(
+            model_name="protenix_base_default_v1.0.0",
+            skip_amp=SimpleNamespace(),
+        )
+        runner = DummyRunner()
+
+        self.assertEqual(
+            _run_prediction_batch(runner, configs, [(data, None)], "auto"),
+            {"ok": True},
+        )
+        self.assertIs(runner.predicted, data)
+        self.assertEqual(len(runner.configs_seen), 1)
 
 
 if __name__ == "__main__":
