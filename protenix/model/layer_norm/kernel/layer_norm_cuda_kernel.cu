@@ -20,9 +20,11 @@
 
 #include <THC/THCDeviceUtils.cuh>
 
-#include "ATen/ATen.h"
 #include "ATen/AccumulateType.h"
+#include "ATen/core/TensorBody.h"
 #include "ATen/cuda/CUDAContext.h"
+#include "ATen/ops/empty.h"
+#include "ATen/ops/empty_like.h"
 #include "compat.h"
 #include "type_shim.h"
 
