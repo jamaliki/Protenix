@@ -720,6 +720,22 @@ A candidate should only advance if this screen shows both acceptable BF16 parity
 and a win over the full baseline boundary, not merely over the elementwise
 epilogue launch in isolation.
 
+Latest warmed one-H100 roofline screen, commit `0cba4ac`, `N_sample=1280`,
+`N_token=245`, BF16, `gate_batch=1`:
+
+| job | run | boundary ms | GEMM ms | epilogue ms | GEMM TFLOP/s | epilogue TB/s lower bound | note |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `95081` | `transition_epilogue_roofline_warm_baseline_20260702_132714` | 1.448 | 1.012 | 0.474 | 731 | 3.05 | baseline |
+| `95082` | `transition_epilogue_roofline_warm_reference_20260702_132714` | 1.468 | 1.027 | 0.474 | 721 | 3.05 | reference candidate 1.482 ms, exact parity, 0.991x |
+
+The lower-bound byte model reports 2.90 GB of logical boundary traffic for the
+baseline and 1.93 GB for a fused-epilogue GEMM.  The removable projected
+store/reload is 0.96 GB.  The ideal "delete only the current epilogue launch"
+boundary would be about 0.97-0.99 ms, a 1.48x speedup for this boundary.  That
+does **not** mean the full model can move by 1.48x: it is a 0.47 ms saving on
+one transition-output boundary, and any native CuTe implementation has to keep
+roughly 720-730 TFLOP/s GEMM throughput or it will lose the whole win.
+
 ### 4. Use lower precision only where profiling supports it
 
 `PROTENIX_BF16_DIFFUSION_CORE=1` and `PROTENIX_BF16_ATOM_ATTENTION=1` reduce
