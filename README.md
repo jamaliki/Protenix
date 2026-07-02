@@ -103,12 +103,6 @@ invokes `protenix pred` once per JSON.  Put the one-record JSON files in a
 directory and let the runner fill GPU batches:
 
 ```bash
-export PROTENIX_BF16_DIFFUSION_CORE=1
-export PROTENIX_TRITON_FUSED_ELEMENTWISE=1
-export PROTENIX_TRITON_FUSED_ATTENTION_RESIDUAL=1
-export PROTENIX_TRITON_FUSED_TRANSITION_RESIDUAL=1
-export PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION=1
-
 protenix pred \
   -i ./campaign_jsons \
   -o ./output \
@@ -131,6 +125,11 @@ diffusion kernels enough work without padding the pairformer trunk too much.
 For tightly bucketed or same-shape 245-token `7r6r`-like inputs, `32-64` is the
 practical knee: larger batches consume much more memory but add little
 throughput.  If you hit OOM, try `--batch_size 8`.
+
+Do not set the experimental Triton elementwise/residual/transition flags for
+this mixed-campaign path unless you are running a new benchmark.  On the B16
+mixed-length gate they slowed the representative predict section from `41.6s`
+to `69.3s`; the default branch settings are the measured fast path.
 
 The default `--batch_mode auto` is deliberately conservative but usable for real
 sequence-design campaigns.  If all featurized tensor shapes match, the whole

@@ -329,6 +329,27 @@ and the batched atom encoder/decoder (`4.22s` combined).  Further throughput
 work should target those boundaries rather than the now-small conditioning
 path.
 
+The existing experimental Triton elementwise/residual/transition-input flags are
+not a shortcut for this mixed-campaign workload.  Job `95635`
+(`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/fusion_flags_pair_b16_n200_20260702_170343`)
+ran the same B16 gate with
+`PROTENIX_TRITON_FUSED_ELEMENTWISE=1`,
+`PROTENIX_TRITON_FUSED_ATTENTION_RESIDUAL=1`,
+`PROTENIX_TRITON_FUSED_TRANSITION_RESIDUAL=1`, and
+`PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION=1`.  On the same node/job,
+`fusion_off` was already noisy (`41.64s` predict versus the promoted `33.93s`
+on the earlier node), but the paired comparison is decisive:
+
+| setting | predict sec sum | records/s by predict | pairformer | diffusion | diffusion transformer | confidence |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| fusion flags off | 41.64 | 0.768 | 18.00 | 19.41 | 10.48 | 1.82 |
+| fusion flags on | 69.32 | 0.462 | 17.13 | 30.37 | 12.59 | 13.86 |
+
+Decision: reject these flags for mixed-length B16 campaign inference.  They
+slightly reduced pairformer time on this noisy node, but lost far more in
+diffusion and confidence.  The README mixed-campaign command intentionally uses
+the default-off settings.
+
 A follow-up branch tried to merge source JSONs before MSA/template preprocessing
 so preprocessing would run once for the transient campaign file instead of once
 per source file.  That cleaned up generated JSON siblings but did not materially
