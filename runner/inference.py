@@ -531,6 +531,15 @@ def _inference_token_bucket_size(configs: Any) -> int:
     return max(0, value)
 
 
+def _raise_on_batch_fallback_enabled() -> bool:
+    return os.getenv("PROTENIX_RAISE_ON_BATCH_FALLBACK", "").strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
+
+
 _ATOM_ONLY_FEATURE_KEYS = {
     "atom_to_token_idx",
     "atom_to_tokatom_idx",
@@ -1112,12 +1121,7 @@ def _fallback_to_singletons(
         exc,
         failure_traceback,
     )
-    if os.getenv("PROTENIX_RAISE_ON_BATCH_FALLBACK", "").strip().lower() in {
-        "1",
-        "true",
-        "on",
-        "yes",
-    }:
+    if _raise_on_batch_fallback_enabled():
         raise exc
     torch.cuda.empty_cache()
     for item in items:
@@ -1575,6 +1579,8 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                     if len(pending[signature]) >= batch_size:
                         flush_signature(signature)
                 except Exception as e:
+                    if _raise_on_batch_fallback_enabled():
+                        raise
                     error_message = (
                         f"[Rank {DIST_WRAPPER.rank}] {sample_name} failed: {e}\n"
                         f"{traceback.format_exc()}"
