@@ -145,6 +145,10 @@ def manual_baseline(module: Transition, x: torch.Tensor) -> torch.Tensor:
 
 def manual_fused_input(module: Transition, x: torch.Tensor) -> torch.Tensor:
     flat, prefix_shape = flat_view(x)
+    if not can_use_fused_input_projection(module, flat):
+        raise RuntimeError(
+            "wide input projection is disabled by Transition guard"
+        )
     y = module.layernorm1(flat)
     projected = F.linear(y, module._input_projection_params())
     with transition_fusion_env(True):
@@ -153,6 +157,15 @@ def manual_fused_input(module: Transition, x: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("triton_silu_mul_split returned None")
     out = module.linear_no_bias(b)
     return out.reshape(*prefix_shape, module.c_in)
+
+
+def can_use_fused_input_projection(
+    module: Transition,
+    flat: torch.Tensor,
+) -> bool:
+    """Ask the model whether the wide-GEMM path is legal for this flattened shape."""
+    with torch.inference_mode(), transition_fusion_env(True):
+        return bool(module._can_fuse_input_projection(flat))
 
 
 def manual_timed(
@@ -166,6 +179,10 @@ def manual_timed(
         flat, prefix_shape = flat_view(x)
         y = event_time("layernorm", lambda: module.layernorm1(flat), events)
         if fused_input:
+            if not can_use_fused_input_projection(module, flat):
+                raise RuntimeError(
+                    "wide input projection is disabled by Transition guard"
+                )
             projected = event_time(
                 "wide_input_projection",
                 lambda: F.linear(y, module._input_projection_params()),
@@ -279,29 +296,43 @@ def main() -> None:
     x = make_input(args)
     amp = cuda_autocast(args.compute_dtype)
 
+    flat, _ = flat_view(x)
+    can_use_wide_input_projection = can_use_fused_input_projection(module, flat)
     variants: dict[str, TensorFn] = {
         "manual_two_input_gemms": lambda: manual_baseline(module, x),
-        "manual_wide_input_projection": lambda: manual_fused_input(module, x),
         "forward_env_off": lambda: transition_forward_with_env(
             module, x, enabled=False
         ),
         "forward_env_on": lambda: transition_forward_with_env(module, x, enabled=True),
     }
+    if can_use_wide_input_projection:
+        variants["manual_wide_input_projection"] = lambda: manual_fused_input(module, x)
 
     results: dict[str, Any] = {}
     torch.cuda.reset_peak_memory_stats()
     with amp:
         reference, baseline_parts = manual_timed(module, x, fused_input=False)
-        fused_parts_out, fused_parts = manual_timed(module, x, fused_input=True)
+        if can_use_wide_input_projection:
+            fused_parts_out, fused_parts = manual_timed(module, x, fused_input=True)
+        else:
+            fused_parts_out = None
+            fused_parts = {}
         for name, fn in variants.items():
             out, ms = cuda_time(fn, args.warmup, args.iters)
             results[name] = {
                 "ms": ms,
                 "parity_vs_manual_two_input_gemms": max_mean_abs(reference, out),
             }
+        if not can_use_wide_input_projection:
+            results["manual_wide_input_projection"] = {
+                "skipped": True,
+                "reason": "disabled by Transition guard for this flattened shape",
+            }
         results["manual_parts_two_input_gemms"] = baseline_parts
         results["manual_parts_wide_input_projection"] = fused_parts
-        results["manual_wide_parts_parity"] = max_mean_abs(reference, fused_parts_out)
+        results["wide_input_projection_eligible"] = can_use_wide_input_projection
+        if fused_parts_out is not None:
+            results["manual_wide_parts_parity"] = max_mean_abs(reference, fused_parts_out)
         if args.profile:
             results["profiler_top_cuda"] = {
                 name: profiler_rows(fn, args.warmup, args.profile_top)
@@ -311,6 +342,12 @@ def main() -> None:
     row = {
         "args": vars(args),
         "device": torch.cuda.get_device_name(),
+        "shape": {
+            "batch": args.batch,
+            "tokens": args.tokens,
+            "c_in": args.c_in,
+            "transition_factor": args.factor,
+        },
         "torch": {"version": torch.__version__, "cuda": torch.version.cuda},
         "results": results,
         "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
