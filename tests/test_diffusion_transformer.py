@@ -102,8 +102,17 @@ class TestDiffusionTransformer(unittest.TestCase):
         a = torch.randn(n_records, n_sample, n_token, c_a, device=self.device)
         s = torch.randn(n_records, n_sample, n_token, c_s, device=self.device)
         z = torch.randn(n_records, n_token, n_token, c_z, device=self.device)
+        token_mask = torch.tensor(
+            [[True, True, True, False, False], [True, True, True, True, False]],
+            device=self.device,
+        )
         a_flat = a.reshape(n_records * n_sample, n_token, c_a)
         s_flat = s.reshape(n_records * n_sample, n_token, c_s)
+        token_mask_flat = (
+            token_mask[:, None]
+            .expand(n_records, n_sample, n_token)
+            .reshape(n_records * n_sample, n_token)
+        )
 
         with torch.no_grad():
             for efficient in (False, True):
@@ -127,12 +136,14 @@ class TestDiffusionTransformer(unittest.TestCase):
                     s=s_flat,
                     z=z_repeated,
                     enable_efficient_fusion=efficient,
+                    token_mask=token_mask_flat,
                 )
                 out_shared = model(
                     a=a_flat,
                     s=s_flat,
                     z=z_shared,
                     enable_efficient_fusion=efficient,
+                    token_mask=token_mask_flat,
                     z_sample_count=n_sample,
                 )
 
