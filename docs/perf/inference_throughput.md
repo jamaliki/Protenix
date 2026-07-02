@@ -173,6 +173,25 @@ not the same bottleneck as the `N_sample=2560` same-output workload: `N_sample=1
 is pairformer-heavy because the trunk runs once per sequence, while
 `N_sample=5` shifts more time back to diffusion.
 
+Naively padding nearby but unequal token lengths into one pairformer batch is
+not promoted.  A corrected padding diagnostic snapshots every stage because the
+pairformer uses in-place kernels during inference; without those snapshots, an
+earlier row can be mutated by a later stage and point to the wrong boundary.
+With the fixed diagnostic, one padded 245-token block inside a 384-token tensor
+is almost exact in FP32, but the valid-region difference grows through a full
+stack.  On a 48-block random pairformer stack:
+
+| mode | valid `s` mean abs | valid `s` max abs | valid `z` mean abs | valid `z` max abs |
+| --- | ---: | ---: | ---: | ---: |
+| FP32 CUEQ, 245 -> 384 tokens | 0.0120 | 0.0775 | 0.0060 | 0.0653 |
+| BF16 CUEQ, 245 -> 384 tokens | 0.2359 | 1.4375 | 0.1676 | 1.6094 |
+
+The mechanism is length-dependent numerical drift through masked triangular
+reductions, not obvious unmasked padded-token leakage in the first block.  It
+is still enough to make padded mixed-shape batching a numerical-change feature,
+not a safe default throughput optimization.  The runner therefore keeps exact
+tensor-tree batching and leaves shape-heterogeneous records in separate buckets.
+
 ## Reproducing the benchmark
 
 Use the benchmark harness rather than timing ad hoc commands.  It records the
@@ -866,6 +885,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Inference DataLoader workers for exact-shape batches | B8 had a small screen win, but B32 hit tensor-sharing failures unless switched to slower file-system sharing; clean B32 no-worker batching was better | do not add host-pipeline complexity unless it survives the actual many-input gate |
 | CUDA graph capture of the denoiser | slower in this setup | graph overhead/constraints can outweigh launch savings |
 | Merging campaign JSONs before preprocessing | 64-file directory gate moved only from 197.54 s to 195.70 s (`1.009x`) and worsened preprocessing failure granularity | the remaining e2e gap is not mainly per-file JSON preprocessing |
+| Naive padded mixed-shape pairformer batching | valid-region differences accumulated over 48 blocks: FP32 `s/z` mean abs `0.012/0.006`, BF16 `0.236/0.168` for 245 -> 384 tokens | exact-shape batching is conservative but correct; padding needs explicit numerical acceptance criteria and probably real-output validation |
 
 The main learning point: isolated wins are hypotheses, not promotions.  A
 candidate becomes part of the throughput stack only after a representative
