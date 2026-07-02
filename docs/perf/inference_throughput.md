@@ -372,6 +372,16 @@ yet: isolated hotspot job `95881`
 `N_sample=5`, broadcast-bias atom-attention shape before deciding whether the
 Triton atom-attention flags belong in the low-sample campaign stack.
 
+Commit `84f08ec` fixes the adjacent mask boundary.  Ragged atom batching also
+passes an atom key mask shaped `[record, atom]`; the old mask add expanded that
+mask to q/k/v's full `[record, sample, atom]` prefix before adding it to the
+attention bias.  That was correct numerically but defeated the compact-bias
+kernel path by materializing the sample axis.  The mask now expands to the
+existing bias prefix, usually `[record, 1]`, so both pair bias and key mask stay
+sample-invariant.  Hotspot job `95891`
+(`runs/local_attn_masked_bcast_b16s5_20260702_201338`) times the more
+representative masked local-attention boundary.
+
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`
 (`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/fusion_flags_pair_b16_n200_20260702_170343`)
