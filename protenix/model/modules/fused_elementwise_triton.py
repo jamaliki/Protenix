@@ -248,6 +248,21 @@ if triton_fused_elementwise_available():
         tl.store(out_ptr + offsets, out, mask=mask)
 
     @triton.jit
+    def _silu_mul_inplace_y_kernel(
+        x_ptr,
+        y_ptr,
+        n_elements: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = (pid * block_size + tl.arange(0, block_size)).to(tl.int64)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        out = x * (1.0 / (1.0 + tl.exp(-x))) * y
+        tl.store(y_ptr + offsets, out, mask=mask)
+
+    @triton.jit
     def _silu_mul_split_kernel(
         x_ptr,
         out_ptr,
@@ -389,8 +404,8 @@ def triton_silu_mul_inplace_y(
     """
     if not _can_use_triton(x, y):
         return None
-    _silu_mul_kernel[_grid(y.numel())](
-        x, y, y, y.numel(), block_size=_BLOCK_SIZE, num_warps=4
+    _silu_mul_inplace_y_kernel[_grid(y.numel())](
+        x, y, y.numel(), block_size=_BLOCK_SIZE, num_warps=4
     )
     return y
 
