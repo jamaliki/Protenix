@@ -43,6 +43,7 @@ except ImportError:  # pragma: no cover - optional runtime dependency.
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 _BLOCK_SIZE = 1024
+_MAX_TRITON_VECTOR_ELEMENTS = 1_000_000_000
 _FALSE_ENV_VALUES = {"0", "false", "off", "no"}
 
 
@@ -251,12 +252,14 @@ if triton_fused_elementwise_available():
     def _silu_mul_inplace_y_kernel(
         x_ptr,
         y_ptr,
+        offset_base: tl.constexpr,
         n_elements: tl.constexpr,
         block_size: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        offsets = (pid * block_size + tl.arange(0, block_size)).to(tl.int64)
-        mask = offsets < n_elements
+        local_offsets = pid * block_size + tl.arange(0, block_size)
+        mask = local_offsets < n_elements
+        offsets = (offset_base + local_offsets).to(tl.int64)
         x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         out = x * (1.0 / (1.0 + tl.exp(-x))) * y
@@ -404,9 +407,21 @@ def triton_silu_mul_inplace_y(
     """
     if not _can_use_triton(x, y):
         return None
-    _silu_mul_inplace_y_kernel[_grid(y.numel())](
-        x, y, y.numel(), block_size=_BLOCK_SIZE, num_warps=4
-    )
+    # Very large pair-transition batches exceed 2^31 elements.  Splitting into
+    # offset chunks avoids unsafe giant-vector indexing while still replacing
+    # PyTorch's separate SiLU and multiply chunk launches with one fused launch
+    # per chunk.
+    total = y.numel()
+    for start in range(0, total, _MAX_TRITON_VECTOR_ELEMENTS):
+        n_elements = min(_MAX_TRITON_VECTOR_ELEMENTS, total - start)
+        _silu_mul_inplace_y_kernel[_grid(n_elements)](
+            x,
+            y,
+            start,
+            n_elements,
+            block_size=_BLOCK_SIZE,
+            num_warps=4,
+        )
     return y
 
 
