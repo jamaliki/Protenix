@@ -855,6 +855,30 @@ class Protenix(nn.Module):
                 for cache in caches
             )
         )
+        batch_diffusion_conditioning = (
+            _env_flag_enabled_by_default("PROTENIX_BATCH_DIFFUSION_CONDITIONING")
+            and self.enable_diffusion_shared_vars_cache
+            and all(cache["pair_z"] is not None for cache in caches)
+        )
+        conditioning_batch: Optional[dict[str, torch.Tensor]] = None
+        if batch_diffusion_conditioning:
+            # DiffusionConditioning's per-step work is token-local once pair_z
+            # has been cached.  Stack the cached pair tensor and token singles
+            # once, then run the conditioning transition for the whole batch.
+            conditioning_batch = {
+                "relp": _stack_padded_token_pairs(
+                    [feature_dict["relp"] for feature_dict in input_feature_dicts],
+                    max_tokens=max_tokens,
+                    channel_first=False,
+                ),
+                "s_inputs": _stack_padded_token_vectors(s_inputs_list, max_tokens),
+                "s_trunk": _stack_padded_token_vectors(s_list, max_tokens),
+                "pair_z": _stack_padded_token_pairs(
+                    [cache["pair_z"] for cache in caches],
+                    max_tokens=max_tokens,
+                    channel_first=False,
+                ),
+            }
         atom_batch: Optional[dict[str, Any]] = None
         if batch_atom_transformer:
             # Atom caches already contain the t-invariant pair conditioning.
@@ -956,6 +980,7 @@ class Protenix(nn.Module):
             x_noisies = []
             t_hats = []
             decoder_inputs = []
+            z_pair_padded = None
 
             for batch_idx, feature_dict in enumerate(input_feature_dicts):
                 x_l = (
@@ -976,28 +1001,63 @@ class Protenix(nn.Module):
                         / torch.sqrt(dm.sigma_data**2 + t_hat**2)[..., None, None]
                     )
 
-                cache = caches[batch_idx]
-                with dm._profile_block("conditioning"), torch.profiler.record_function(
-                    "protenix/batched_token_diffusion_conditioning"
-                ):
-                    s_single, z_pair = dm.diffusion_conditioning(
-                        t_hat_noise_level=t_hat,
-                        relp_feature=feature_dict["relp"],
-                        s_inputs=s_inputs_list[batch_idx],
-                        s_trunk=s_list[batch_idx],
-                        z_trunk=None if cache["pair_z"] is not None else z_list[batch_idx],
-                        pair_z=cache["pair_z"],
-                        inplace_safe=inplace_safe,
-                        use_conditioning=True,
-                    )
-
                 r_noisies.append(r_noisy)
                 x_noisies.append(x_noisy)
                 t_hats.append(t_hat)
-                s_singles.append(s_single)
-                z_pairs.append(z_pair)
 
+            if batch_diffusion_conditioning:
+                assert conditioning_batch is not None
+                with dm._profile_block("conditioning"), torch.profiler.record_function(
+                    "protenix/batched_diffusion_conditioning"
+                ):
+                    s_single_padded, z_pair_padded = dm.diffusion_conditioning(
+                        t_hat_noise_level=torch.stack(t_hats, dim=0),
+                        relp_feature=conditioning_batch["relp"],
+                        s_inputs=conditioning_batch["s_inputs"],
+                        s_trunk=conditioning_batch["s_trunk"],
+                        z_trunk=None,
+                        pair_z=conditioning_batch["pair_z"],
+                        inplace_safe=inplace_safe,
+                        use_conditioning=True,
+                    )
+                s_singles = [
+                    s_single_padded[batch_idx, :, : token_counts[batch_idx]]
+                    for batch_idx in range(len(input_feature_dicts))
+                ]
+                z_pairs = [
+                    z_pair_padded[
+                        batch_idx, : token_counts[batch_idx], : token_counts[batch_idx]
+                    ]
+                    for batch_idx in range(len(input_feature_dicts))
+                ]
+            else:
+                for batch_idx, feature_dict in enumerate(input_feature_dicts):
+                    cache = caches[batch_idx]
+                    with dm._profile_block(
+                        "conditioning"
+                    ), torch.profiler.record_function(
+                        "protenix/batched_token_diffusion_conditioning"
+                    ):
+                        s_single, z_pair = dm.diffusion_conditioning(
+                            t_hat_noise_level=t_hats[batch_idx],
+                            relp_feature=feature_dict["relp"],
+                            s_inputs=s_inputs_list[batch_idx],
+                            s_trunk=s_list[batch_idx],
+                            z_trunk=(
+                                None
+                                if cache["pair_z"] is not None
+                                else z_list[batch_idx]
+                            ),
+                            pair_z=cache["pair_z"],
+                            inplace_safe=inplace_safe,
+                            use_conditioning=True,
+                        )
+                    s_singles.append(s_single)
+                    z_pairs.append(z_pair)
+
+            for batch_idx, feature_dict in enumerate(input_feature_dicts):
                 if not batch_atom_transformer:
+                    cache = caches[batch_idx]
                     with dm._profile_block(
                         "atom_encoder"
                     ), torch.profiler.record_function(
@@ -1014,9 +1074,9 @@ class Protenix(nn.Module):
                                 feature_dict["d_lm"],
                                 feature_dict["v_lm"],
                                 feature_dict["pad_info"],
-                                r_l=r_noisy,
+                                r_l=r_noisies[batch_idx],
                                 s=s_list[batch_idx].unsqueeze(dim=-3),
-                                z=z_pair.unsqueeze(dim=-4),
+                                z=z_pairs[batch_idx].unsqueeze(dim=-4),
                                 p_lm=cache["p_lm/c_l"][0],
                                 c_l=cache["p_lm/c_l"][1],
                                 inplace_safe=inplace_safe,
@@ -1026,14 +1086,23 @@ class Protenix(nn.Module):
                     transformer_dtype = dm._diffusion_core_dtype(a_token.dtype)
                     a_token = a_token.to(dtype=transformer_dtype)
                     if inplace_safe:
-                        a_token += dm.linear_no_bias_s(dm.layernorm_s(s_single))
+                        a_token += dm.linear_no_bias_s(
+                            dm.layernorm_s(s_singles[batch_idx])
+                        )
                     else:
                         a_token = a_token + dm.linear_no_bias_s(
-                            dm.layernorm_s(s_single)
+                            dm.layernorm_s(s_singles[batch_idx])
                         )
                     a_tokens.append(a_token.squeeze(dim=-3))
                     decoder_inputs.append(
-                        (batch_idx, x_noisy, t_hat, q_skip, c_skip, p_skip)
+                        (
+                            batch_idx,
+                            x_noisies[batch_idx],
+                            t_hats[batch_idx],
+                            q_skip,
+                            c_skip,
+                            p_skip,
+                        )
                     )
 
             if batch_atom_transformer:
@@ -1056,15 +1125,23 @@ class Protenix(nn.Module):
                                 r_l=_stack_padded_axis(
                                     r_noisies, axis=-2, max_size=max_atoms
                                 ),
-                                s=_stack_padded_axis(
-                                    [s_i.unsqueeze(dim=-3) for s_i in s_list],
-                                    axis=-2,
-                                    max_size=max_tokens,
+                                s=(
+                                    conditioning_batch["s_trunk"].unsqueeze(dim=-3)
+                                    if conditioning_batch is not None
+                                    else _stack_padded_axis(
+                                        [s_i.unsqueeze(dim=-3) for s_i in s_list],
+                                        axis=-2,
+                                        max_size=max_tokens,
+                                    )
                                 ),
-                                z=_stack_padded_token_pairs(
-                                    z_pairs,
-                                    max_tokens=max_tokens,
-                                    channel_first=False,
+                                z=(
+                                    z_pair_padded
+                                    if z_pair_padded is not None
+                                    else _stack_padded_token_pairs(
+                                        z_pairs,
+                                        max_tokens=max_tokens,
+                                        channel_first=False,
+                                    )
                                 ).unsqueeze(dim=-4),
                                 p_lm=atom_batch["p_lm"],
                                 c_l=atom_batch["c_l"],
@@ -1099,7 +1176,15 @@ class Protenix(nn.Module):
                 a_batch = _stack_padded_token_vectors(a_tokens, max_tokens)
 
             token_mask = _make_token_mask(token_counts, max_tokens, device)
-            if self.enable_efficient_fusion:
+            if z_pair_padded is not None:
+                if self.enable_efficient_fusion:
+                    z_batch = permute_final_dims(
+                        dm.normalize(z_pair_padded.to(dtype=transformer_dtype)),
+                        [2, 0, 1],
+                    ).contiguous()
+                else:
+                    z_batch = z_pair_padded.to(dtype=transformer_dtype)
+            elif self.enable_efficient_fusion:
                 z_pairs_for_transformer = [
                     permute_final_dims(
                         dm.normalize(z_pair.to(dtype=transformer_dtype)),
@@ -1215,6 +1300,7 @@ class Protenix(nn.Module):
         _sync_cuda_for_timing(sync_timings)
         time_tracker: dict[str, Any] = {"diffusion": time.time() - step_start}
         time_tracker["diffusion_atom_transformer_batched"] = batch_atom_transformer
+        time_tracker["diffusion_conditioning_batched"] = batch_diffusion_conditioning
         if hasattr(dm, "consume_perf_stats"):
             time_tracker.update(dm.consume_perf_stats())
         return x_list, time_tracker
