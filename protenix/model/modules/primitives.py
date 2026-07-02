@@ -94,6 +94,15 @@ def transition_input_projection_fusion_enabled() -> bool:
     }
 
 
+def transition_output_residual_fusion_enabled() -> bool:
+    return os.getenv("PROTENIX_FUSED_TRANSITION_OUTPUT_RESIDUAL", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
 def transition_input_projection_max_elements() -> int:
     value = os.getenv("PROTENIX_FUSED_TRANSITION_INPUT_MAX_ELEMENTS", "4000000000")
     try:
@@ -376,11 +385,39 @@ class Transition(nn.Module):
         projected = F.linear(x, self._input_projection_params())
         return triton_silu_mul_split(projected, self.n * self.c_in)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _can_fuse_output_residual(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor],
+    ) -> bool:
+        if residual is None:
+            return False
+        if not transition_output_residual_fusion_enabled():
+            return False
+        if torch.is_grad_enabled():
+            return False
+        if not x.is_cuda or not residual.is_cuda:
+            return False
+        if x.shape != residual.shape or x.dtype != residual.dtype:
+            return False
+        # The fused path reshapes the residual to the same 2D matrix that cuBLAS
+        # would otherwise add after the projection.  Requiring contiguity avoids
+        # accidentally inserting a hidden copy before ``addmm``.
+        return x.is_contiguous() and residual.is_contiguous()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             x (torch.Tensor): the input tensor
                 [..., c]
+            residual (torch.Tensor, optional): if set, return
+                ``residual + transition(x)``.  In inference, an opt-in cuBLAS
+                ``addmm`` path can fold this residual add into the final
+                no-bias projection.
 
         Returns:
             torch.Tensor: the output tensor as the same shape of x
@@ -391,14 +428,22 @@ class Transition(nn.Module):
             a = self.linear_no_bias_a(x)
             b = self.linear_no_bias_b(x)
             x = self.linear_no_bias(F.silu(a) * b)
+            if residual is not None:
+                x = x + residual
             return x
         else:
             other_dims = x.shape[:-1]
             dim_size = x.shape[-1]
             size = x.shape[-2]
+            fuse_output_residual = self._can_fuse_output_residual(x, residual)
             x = x.reshape(-1, dim_size)
+            residual_chunks = None
+            if residual is not None:
+                residual = residual.reshape(-1, dim_size)
             chunk_num = 1 if size < 3200 else 8
             chunks = torch.chunk(x, chunk_num, dim=-2)
+            if fuse_output_residual:
+                residual_chunks = torch.chunk(residual, chunk_num, dim=-2)
             outputs = (
                 None
                 if chunk_num == 1
@@ -407,7 +452,7 @@ class Transition(nn.Module):
                 )
             )
             start = 0
-            for chunk in chunks:
+            for index, chunk in enumerate(chunks):
                 y = self.layernorm1(chunk)
                 b = self._fused_input_projection(y)
                 if b is None:
@@ -417,7 +462,19 @@ class Transition(nn.Module):
                     b *= a
                     del a
                 del y
-                b = self.linear_no_bias(b)
+                if residual_chunks is None:
+                    b = self.linear_no_bias(b)
+                else:
+                    # ``linear_no_bias`` computes ``b @ W.T`` and the caller
+                    # immediately adds the full residual tensor.  ``addmm`` keeps
+                    # the same cuBLAS matmul but lets cuBLAS stream the residual
+                    # into the output instead of launching a separate HBM-sized
+                    # add kernel.
+                    b = torch.addmm(
+                        residual_chunks[index],
+                        b,
+                        self.linear_no_bias.weight.t(),
+                    )
                 if outputs is None:
                     # Most inference shapes, including B64/N245 pairformer,
                     # use a single chunk.  Returning the projection directly
@@ -430,6 +487,8 @@ class Transition(nn.Module):
                 del b
             assert outputs is not None
             outputs = outputs.reshape(*other_dims, self.c_in)
+            if residual is not None and not fuse_output_residual:
+                outputs = outputs + residual.reshape(*other_dims, self.c_in)
             return outputs
 
 

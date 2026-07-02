@@ -21,7 +21,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from protenix.data.constants import STD_RESIDUES_WITH_GAP
-from protenix.model.modules.primitives import LinearNoBias, Transition
+from protenix.model.modules.primitives import (
+    LinearNoBias,
+    Transition,
+    transition_output_residual_fusion_enabled,
+)
 from protenix.model.modules.transformer import AttentionPairBias
 from protenix.model.modules.fused_ops import dropout_add_rowwise
 from protenix.model.triangular.layers import DropoutRowwise, LayerNorm, OuterProductMean
@@ -135,6 +139,7 @@ class PairformerBlock(nn.Module):
                 [..., N_token, c_s] | None
                 [..., N_token, N_token, c_z]
         """
+        fuse_transition_residual = transition_output_residual_fusion_enabled()
         if inplace_safe:
             z = self.tri_mul_out(
                 z,
@@ -166,7 +171,10 @@ class PairformerBlock(nn.Module):
                 chunk_size=chunk_size,
             )
             z = z.transpose(-2, -3).contiguous()
-            z += self.pair_transition(z)
+            if fuse_transition_residual:
+                z = self.pair_transition(z, residual=z)
+            else:
+                z += self.pair_transition(z)
         else:
             tmu_update = self.tri_mul_out(
                 z,
@@ -213,7 +221,10 @@ class PairformerBlock(nn.Module):
             )
             z = z.transpose(-2, -3).contiguous()
 
-            z = z + self.pair_transition(z)
+            if fuse_transition_residual:
+                z = self.pair_transition(z, residual=z)
+            else:
+                z = z + self.pair_transition(z)
         if self.c_s > 0:
             token_mask = (
                 None
@@ -226,7 +237,10 @@ class PairformerBlock(nn.Module):
                 z=z,
                 token_mask=token_mask,
             )
-            s = s + self.single_transition(s)
+            if fuse_transition_residual:
+                s = self.single_transition(s, residual=s)
+            else:
+                s = s + self.single_transition(s)
         return s, z
 
 
