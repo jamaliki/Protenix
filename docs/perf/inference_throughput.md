@@ -37,6 +37,12 @@ export PROTENIX_CONFIDENCE_LOGIT_CHUNK_SIZE=32
 export PROTENIX_BROADCAST_DIFFUSION_S=1
 ```
 
+The BF16 diffusion core and the BF16/Triton atom local-attention boundary are
+now defaults on BF16-capable CUDA devices; they are shown explicitly above so a
+benchmark log captures the full promoted stack.  Set
+`PROTENIX_BF16_DIFFUSION_CORE=0`, `PROTENIX_BF16_ATOM_ATTENTION=0`, or
+`PROTENIX_TRITON_LOCAL_ATTN=0` when running conservative numerical audits.
+
 Measured one-H100 throughput:
 
 | mode | e2e samples/sec | forward samples/sec | forward sec | peak reserved MiB | notes |
@@ -610,9 +616,28 @@ This is the cleanest precision win so far: pairformer and confidence are flat,
 while the diffusion transformer subrange falls from about `23.5-24.3s` to
 `13.9-14.0s`.  The default policy now enables BF16 diffusion core on
 BF16-capable CUDA devices; set `PROTENIX_BF16_DIFFUSION_CORE=0` to recover the
-old conservative FP32 core.  The current mixed-sequence `N_sample=5` headline is
-therefore `212.51s -> 51.16s` predict and `0.753 -> 3.127` generated samples/s,
-or `4.15x` over the old low-sample boundary.
+old conservative FP32 core.
+
+Job `96301`
+(`runs/atom_path_gate_n200_20260703_010037_51c2e8f`) then tested the atom
+encoder/decoder boundary on the same mixed-sequence `N_sample=5`, `N_step=200`,
+batch-size-16 workload:
+
+| case | predict sec | generated samples/s | pairformer | diffusion | atom encoder | diffusion transformer | atom decoder | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| current default after BF16 diffusion core | 51.23 | 3.123 | 16.59 | 30.65 | 7.50 | 13.88 | 7.33 | 2.47 | baseline repeat |
+| BF16 atom attention only | 51.54 | 3.104 | 16.55 | 30.83 | 7.80 | 13.85 | 7.02 | 2.59 | rejected alone |
+| BF16 atom attention + Triton local attention + fused bias | 44.36 | 3.607 | 16.12 | 23.72 | 2.94 | 14.08 | 2.13 | 2.45 | promoted |
+| same plus local-attention gate fusion | 44.47 | 3.598 | 16.13 | 23.78 | 2.91 | 14.13 | 2.11 | 2.46 | rejected, no extra throughput |
+
+The mechanism is specific: BF16 atom attention by itself is neutral because the
+old local-attention/SDPA boundary still stores and reloads large FP32 tensors.
+The Triton local-attention kernel consumes the profiled 32-query by 128-key atom
+window directly, and the fused bias producer writes the layout that kernel
+expects.  The atom encoder+decoder subtotal falls from `14.83s` to `5.06s`;
+pairformer and confidence stay flat.  The current mixed-sequence `N_sample=5`
+headline is therefore `212.51s -> 44.36s` predict and `0.753 -> 3.607`
+generated samples/s, or `4.79x` over the old low-sample boundary.
 
 Launch-level follow-up: job `96110`
 (`runs/flat_bf16_batch_profile_20260702_221601_c8a532d`) proved the profiler
@@ -1242,8 +1267,12 @@ The full same-output inference gate was much smaller:
 | forward sec | 139.80 | 139.59 | -0.15% |
 | peak allocated MiB | 15245.8 | 14455.4 | -790.3 |
 
-Decision: useful kernel-learning result and memory reduction, but not promoted
-as a throughput win until repeated full gates clear the noise floor.
+Decision: for the same-output high-`N_sample` path this gate-fusion boundary is
+a useful kernel-learning result and memory reduction, but not a promoted
+throughput win until repeated full gates clear the noise floor.  For the
+many-independent-sequence `N_sample=5` path, the underlying Triton local
+attention plus fused bias producer is promoted by job `96301` above; only the
+extra gate-fusion flag remains opt-in.
 
 ### 3b. Fuse only across a boundary the consumer can still use
 
@@ -1551,10 +1580,11 @@ roughly 720-730 TFLOP/s GEMM throughput or it will lose the whole win.
 The diffusion core now defaults to BF16 on BF16-capable CUDA devices after the
 mixed-sequence gate showed a clear end-to-end win concentrated in the diffusion
 transformer.  Set `PROTENIX_BF16_DIFFUSION_CORE=0` for conservative numerical
-audits.  `PROTENIX_BF16_ATOM_ATTENTION=1` remains opt-in: it reduces traffic in
-the atom attention path at high sample counts, but local atom attention still
-has guards and fallbacks because not every cuDNN/SDPA shape is safe or fast in
-BF16.  Full token attention is allowed to stay BF16 with
+audits.  BF16 atom attention is also default-on for BF16-capable CUDA, but only
+became a promoted win once the atom local-attention consumer was moved to the
+guarded Triton path with fused bias production.  Set
+`PROTENIX_BF16_ATOM_ATTENTION=0` and `PROTENIX_TRITON_LOCAL_ATTN=0` to recover
+the old atom path.  Full token attention is allowed to stay BF16 with
 `PROTENIX_ATTENTION_FORCE_FP32=0`.
 
 The lesson is to use precision as a local performance decision, not a global

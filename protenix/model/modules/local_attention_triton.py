@@ -39,13 +39,17 @@ except ImportError:  # pragma: no cover - optional runtime dependency.
     tl = None
 
 
+_FALSE_ENV_VALUES = {"0", "false", "off", "no"}
+
+
 def triton_local_attention_enabled() -> bool:
-    return os.getenv("PROTENIX_TRITON_LOCAL_ATTN", "0").lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
+    # Default-on is safe because `triton_local_attention()` is only a guarded
+    # candidate path: no Triton, gradients enabled, CPU tensors, or unprofiled
+    # shapes all return `None` and use the original PyTorch implementation.
+    return (
+        os.getenv("PROTENIX_TRITON_LOCAL_ATTN", "1").strip().lower()
+        not in _FALSE_ENV_VALUES
+    )
 
 
 def triton_local_attention_available() -> bool:
@@ -78,21 +82,20 @@ def triton_local_attention_num_warps(dtype: torch.dtype) -> int:
 
 
 def triton_local_attention_bf16_output_enabled() -> bool:
-    return os.getenv("PROTENIX_TRITON_LOCAL_ATTN_OUTPUT_BF16", "0").lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
+    # When atom attention enters the kernel in BF16, storing BF16 avoids an
+    # immediate FP32 output tensor that the following gate/projection would have
+    # to read, cast, and write again. FP32 inputs still return FP32.
+    return (
+        os.getenv("PROTENIX_TRITON_LOCAL_ATTN_OUTPUT_BF16", "1").strip().lower()
+        not in _FALSE_ENV_VALUES
+    )
 
 
 def triton_local_attention_gate_fusion_enabled() -> bool:
-    return os.getenv("PROTENIX_TRITON_LOCAL_ATTN_FUSE_GATE", "0").lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
+    return (
+        os.getenv("PROTENIX_TRITON_LOCAL_ATTN_FUSE_GATE", "0").strip().lower()
+        not in _FALSE_ENV_VALUES
+    )
 
 
 _SUPPORTED_INPUT_DTYPES = {torch.float32, torch.bfloat16}

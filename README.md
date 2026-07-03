@@ -133,8 +133,13 @@ set `PROTENIX_ATTENTION_FORCE_FP32=0`; this lets full token attention stay in
 BF16/cuDNN instead of upcasting q/k/v to FP32.  The diffusion transformer core
 now defaults to BF16 on BF16-capable CUDA GPUs because the representative mixed
 gate showed its FP32/TF32 GEMMs were the largest remaining diffusion bottleneck;
-set `PROTENIX_BF16_DIFFUSION_CORE=0` only for conservative numerical audits.  Do
-not enable
+set `PROTENIX_BF16_DIFFUSION_CORE=0` only for conservative numerical audits.
+The atom encoder/decoder now also default to the measured fast boundary on
+BF16-capable CUDA: BF16 atom attention, narrow Triton local attention, and fused
+local-attention bias production.  This boundary is guarded by dtype, shape,
+CUDA, and no-grad checks, so unsupported cases fall back to the original PyTorch
+path; set `PROTENIX_BF16_ATOM_ATTENTION=0` and `PROTENIX_TRITON_LOCAL_ATTN=0`
+when you need the old conservative atom path.  Do not enable
 `PROTENIX_DIFFUSION_TRANSFORMER_SAMPLE_AXIS=1` by default yet: it is useful for
 kernel experiments, but the full gate did not show a robust win over the
 flattened BF16 path.
@@ -207,7 +212,7 @@ dumping:
 | One combined JSON with 32 same-shape records | 361.8 s runner time | 69.3 s runner time | 5.2x after initialization |
 | 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.9 s summed predict, 0.943 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.70x predict, 5.69x throughput |
-| 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 51.2 s, 3.13 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, BF16 diffusion core, and default Triton LayerNorm fallback | 4.15x over the old branch boundary |
+| 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 44.4 s, 3.61 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, BF16 diffusion core, BF16 atom attention, Triton local atom attention, and default Triton LayerNorm fallback | 4.79x over the old branch boundary |
 
 Quick sanity check: a good campaign run should log messages like
 `Predicting 32 same-shape (auto) input(s)` or
@@ -233,6 +238,8 @@ large-sample fast-path flags:
 export PROTENIX_GPU_RANDOM_AUGMENT=1
 export PROTENIX_BF16_DIFFUSION_CORE=1
 export PROTENIX_ATTENTION_FORCE_FP32=0
+# These atom/local-attention flags are defaults on BF16-capable CUDA in this
+# branch; exporting them is useful when you want a fully explicit benchmark env.
 export PROTENIX_TRITON_LOCAL_ATTN=1
 export PROTENIX_TRITON_LOCAL_ATTN_NUM_WARPS=1
 export PROTENIX_TRITON_LOCAL_ATTN_OUTPUT_BF16=1

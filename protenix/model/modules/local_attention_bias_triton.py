@@ -40,18 +40,18 @@ except ImportError:  # pragma: no cover - optional runtime dependency.
 
 _SUPPORTED_DTYPES = {torch.float32, torch.bfloat16}
 _BLOCK_SIZE = 256
+_FALSE_ENV_VALUES = {"0", "false", "off", "no"}
 
 
 def triton_fused_local_attention_bias_enabled() -> bool:
     value = os.getenv("PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS")
     if value is None:
-        value = os.getenv("PROTENIX_TRITON_LOCAL_ATTN", "0")
-    return value.lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
+        # Match the local-attention default. The fused producer only helps when
+        # the consumer can use the final bias layout. Opting out of local
+        # attention should disable both sides unless this producer is explicitly
+        # overridden.
+        value = os.getenv("PROTENIX_TRITON_LOCAL_ATTN", "1")
+    return value.strip().lower() not in _FALSE_ENV_VALUES
 
 
 def triton_fused_local_attention_bias_available() -> bool:

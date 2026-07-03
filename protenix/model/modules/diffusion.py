@@ -65,6 +65,24 @@ def diffusion_core_bf16_enabled() -> bool:
     return value.strip().lower() not in _FALSE_ENV_VALUES
 
 
+def atom_attention_bf16_enabled() -> bool:
+    """Return whether atom encoder/decoder attention should run under BF16.
+
+    The mixed-length `N_sample=5` gate showed that BF16 atom attention by
+    itself is not enough: it only becomes an end-to-end win when paired with the
+    Triton local-attention path, which can consume and produce BF16 without the
+    old SDPA boundary traffic.  The policy still lives here because this module
+    owns the atom encoder/decoder autocast boundary.  Unsupported or non-CUDA
+    devices keep the original FP32 path; set ``PROTENIX_BF16_ATOM_ATTENTION=0``
+    to force the conservative path during numerical audits.
+    """
+
+    value = os.getenv("PROTENIX_BF16_ATOM_ATTENTION")
+    if value is None or value.strip().lower() in _AUTO_ENV_VALUES:
+        return _cuda_bf16_supported()
+    return value.strip().lower() not in _FALSE_ENV_VALUES
+
+
 def _can_broadcast_diffusion_s(
     module: nn.Module,
     t_hat_noise_level: torch.Tensor,
@@ -439,14 +457,7 @@ class DiffusionModule(nn.Module):
         return torch.autocast(device_type="cuda", dtype=dtype)
 
     def _atom_attention_autocast(self):
-        # Atom attention dominates traffic at high sample counts.  BF16 reduces
-        # memory bandwidth pressure; guards keep this inference-only opt-in from
-        # affecting training unless explicitly requested by the environment.
-        if (
-            os.getenv("PROTENIX_BF16_ATOM_ATTENTION", "0").lower()
-            in {"0", "false", "off", "no"}
-            or not torch.cuda.is_available()
-        ):
+        if not atom_attention_bf16_enabled() or not torch.cuda.is_available():
             return nullcontext()
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 

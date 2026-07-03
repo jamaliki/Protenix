@@ -4,9 +4,46 @@ import torch
 
 from protenix.model.modules.local_attention_triton import (
     _flatten_bias_for_sample_axis,
+    triton_local_attention_bf16_output_enabled,
+    triton_local_attention_enabled,
+    triton_local_attention_gate_fusion_enabled,
+)
+from protenix.model.modules.local_attention_bias_triton import (
+    triton_fused_local_attention_bias_enabled,
 )
 
 os.environ.setdefault("LAYERNORM_TYPE", "torch")
+
+
+def test_triton_local_attention_defaults_to_guarded_fast_path(monkeypatch):
+    monkeypatch.delenv("PROTENIX_TRITON_LOCAL_ATTN", raising=False)
+    monkeypatch.delenv("PROTENIX_TRITON_LOCAL_ATTN_OUTPUT_BF16", raising=False)
+    monkeypatch.delenv("PROTENIX_TRITON_LOCAL_ATTN_FUSE_GATE", raising=False)
+    monkeypatch.delenv("PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS", raising=False)
+
+    assert triton_local_attention_enabled()
+    assert triton_local_attention_bf16_output_enabled()
+    assert triton_fused_local_attention_bias_enabled()
+    assert not triton_local_attention_gate_fusion_enabled()
+
+
+def test_triton_local_attention_opt_out_also_disables_bias_fusion(monkeypatch):
+    monkeypatch.setenv("PROTENIX_TRITON_LOCAL_ATTN", "0")
+    monkeypatch.delenv("PROTENIX_TRITON_LOCAL_ATTN_OUTPUT_BF16", raising=False)
+    monkeypatch.delenv("PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS", raising=False)
+
+    assert not triton_local_attention_enabled()
+    assert not triton_fused_local_attention_bias_enabled()
+    # The BF16 store policy is independent; it only matters if the guarded
+    # local-attention kernel actually runs.
+    assert triton_local_attention_bf16_output_enabled()
+
+
+def test_fused_local_attention_bias_can_be_overridden(monkeypatch):
+    monkeypatch.setenv("PROTENIX_TRITON_LOCAL_ATTN", "0")
+    monkeypatch.setenv("PROTENIX_TRITON_FUSED_LOCAL_ATTN_BIAS", "1")
+
+    assert triton_fused_local_attention_bias_enabled()
 
 
 def test_flatten_bias_reuses_record_bias_over_diffusion_samples():
