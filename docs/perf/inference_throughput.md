@@ -241,7 +241,7 @@ screen closely enough for launch attribution.  Top launch families:
 | --- | ---: | ---: | --- | --- |
 | cuDNN SDPA | 2 | 6.36 | ~56% SM, ~81% compute-memory throughput | vendor attention mainloop; not the first custom-kernel target |
 | PyTorch vectorized elementwise | 54 | 6.18 | several launches at ~90-92% DRAM | residuals, gates, and activation products remain real HBM boundaries |
-| PyTorch `_layer_norm_kernel` | 6 | 4.89 | ~68% SM, ~76% compute-memory throughput | normalization traffic is material but spread across the block |
+| Triton/PyTorch `_layer_norm_kernel` | 6 | 4.89 | ~68% SM, ~76% compute-memory throughput | normalization traffic is material but spread across the block |
 | CUEQ `fused_sigmoid_gated_dual_gemm` | 4 | 3.72 | ~74-76% memory throughput | triangle multiplication is still material, but the fused CUEQ kernel is not obviously weak |
 | CUTLASS/PyTorch GEMM `Kernel2` | 7 | 3.31 | mixed tensor/memory, low occupancy | library GEMMs are secondary; preserve their mainloops if fusing epilogues |
 | CUEQ q/k/v layout helper | 2 | 2.16 | ~85% DRAM | layout traffic around attention is still visible |
