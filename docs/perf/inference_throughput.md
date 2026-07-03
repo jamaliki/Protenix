@@ -1376,6 +1376,24 @@ attention, do not stop at commuting LayerNorm; the likely larger boundary is a
 contiguous ending-node producer that writes CUEQ's swapped q/k/v and bias
 layouts directly while preserving the current CUEQ attention throughput.
 
+A refreshed one-block profile on the current promoted path explains why that
+one-line boundary was too small.  Job `96864`
+(`runs/pairformer_block_current_b16_20260703_073024_a03319e`) timed a single
+`PairformerBlock` at the two actual B16 padded buckets from the sorted mixed
+campaign:
+
+| shape | block ms | triangle attention | pair transition | triangle multiplication | token/single/transpose |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `B=16`, `N=124` | 4.91 | 37.6% | 20.3% | 28.9% | 13.2% |
+| `B=16`, `N=220` | 14.89 | 44.9% | 20.6% | 23.6% | 10.9% |
+
+For `N=220`, starting and ending triangle attention are now essentially equal
+inside the full block (`3.34 ms` each), while pair transition is another
+`3.06 ms`.  The next credible trunk win therefore needs to cover a broader
+boundary than one ending-node LayerNorm layout: either a CUEQ-quality triangle
+attention producer/consumer rewrite that moves both start and end, or a
+vendor-quality transition epilogue/mainloop that preserves cuBLAS throughput.
+
 For this 245-token input, `B=32-64` is the practical knee.  Larger batches keep
 raising memory but add little throughput.  The low-sample workload is therefore
 not the same bottleneck as the `N_sample=2560` same-output workload: `N_sample=1`
