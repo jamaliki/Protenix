@@ -148,7 +148,17 @@ class TestAttentionPairBias(unittest.TestCase):
                         self.assertTrue(attn._can_fuse_self_qkv_projection(x, x))
                         fused = attn._prep_qkv(x, x, apply_scale=True)
                     for ref_tensor, fused_tensor in zip(ref, fused):
-                        self.assertTrue(torch.allclose(ref_tensor, fused_tensor))
+                        # The fused path changes three GEMM launches into one
+                        # wider GEMM.  That is algebraically identical, but the
+                        # library may choose a different reduction schedule
+                        # or TF32 plan, so assert numerical closeness rather
+                        # than accidental bitwise identity.
+                        torch.testing.assert_close(
+                            fused_tensor,
+                            ref_tensor,
+                            rtol=2e-3,
+                            atol=2e-3,
+                        )
         finally:
             if old is None:
                 os.environ.pop("PROTENIX_FUSED_SELF_QKV_PROJECTION", None)
