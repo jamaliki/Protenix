@@ -2653,6 +2653,23 @@ A true ragged pairformer kernel would need to keep the one-launch/vendor-kernel
 quality of CUEQ while avoiding padded work.  That remains a large kernel design
 project, not a cleanup or batching knob.
 
+A small mask-format hypothesis was also screened before changing model code.
+Triangle attention already feeds CUEQ a boolean mask, but triangle
+multiplication still receives the normal BF16 pair mask.  Commit `53bf637`
+added a benchmark-only `--pair-mask-dtype` knob to
+`scripts/perf/pairformer_block_breakdown.py`; job `97278`
+(`runs/pairformer_bool_mask_screen_20260703_111545_53bf637`) compared BF16 and
+bool masks on the two B16 shapes:
+
+| shape | BF16 mask block ms | bool mask block ms | decision |
+| --- | ---: | ---: | --- |
+| `B=16, N=124` | 4.904 | 4.910 | flat |
+| `B=16, N=220` | 14.909 | 14.840 | +0.5%, below threshold |
+
+Decision: do not plumb bool masks into triangle multiplication.  The result is
+within hotspot noise and far too small to justify changing pair-mask dtype
+contracts across the model.
+
 ## Negative results worth remembering
 
 These failed because the real workload, not the isolated kernel, is the gate:
@@ -2671,6 +2688,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Explicit mixed-token bucket sizes `96`, `64`, `48`, and `32` at B16 | all slowed the representative N200 gate; best explicit bucket fell from `3.649` to `3.270` generated samples/s and narrower buckets reached `2.307` generated samples/s | queue bucketing saves some padded pairformer work only by fragmenting diffusion/atom batches; the real solution needs ragged kernels or segmented schedules, not more launch groups |
 | Internal pairformer-only trunk buckets while keeping diffusion B16 | best case `trunk64` improved pairformer `15.736 -> 15.461s`, but diffusion worsened `24.098 -> 24.689s` and throughput fell `3.608 -> 3.575` generated samples/s; narrower trunk buckets were much worse | Python-level sub-batching changes launch/cache balance and is not the segmented-pairformer solution; remove the knob and target true ragged kernels/schedules |
 | Full-block ragged pairformer islands | two split buckets improved the long `136-220` block `1.15x`, but slowed the short `40-124` block to `0.66x`; exact-length groups and singletons were much slower | launch count and lost batching eat the padding savings unless the ragged schedule is a real one-launch/vendor-quality kernel |
+| Bool masks for CUEQ triangle multiplication | block screen was flat at `N=124` and only +0.5% at `N=220` | mask dtype plumbing is not a meaningful bottleneck after triangle-attention bool-mask cleanup |
 | Materializing pairformer token-attention bias as contiguous `[B, H, Q, K]` | traced pairformer SDPA shape `[16, 16, 124, 24]` moved from math-dispatch attempt to a cuDNN frontend "no valid execution plans" error; fallback timing then segfaulted in the isolated screen | the non-contiguous bias layout is not the only blocker; head_dim 24 plus dense additive bias lacks a safe cuDNN plan in this runtime, so do not pay a bias copy hoping for a backend flip |
 | CUEQ `attention_pair_bias` for diffusion token attention | native pair-bias projection needed an explicit zero LayerNorm bias, then CUEQ's internal SDPA failed with `No valid execution plans built`; forced PyTorch fallback was slower than the current full conv2d+SDPA baseline | CUEQ's wrapper is not a drop-in win here; use it only if we can call a narrower fused pair-bias producer while keeping Protenix's SDPA fallback policy |
 | Reusing Triton `TriAttentionFunction` for pairformer token attention | isolated `N=220` hotspot improved, but the full mixed-sequence gate averaged only `45.16s -> 44.89s` predict (`+0.6%`) and one repeat regressed | padding `D=24` to `D=32` and copying layouts is too much integration overhead; if revisited, write a direct dense-bias `D=24` kernel instead |
