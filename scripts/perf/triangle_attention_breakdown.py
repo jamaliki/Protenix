@@ -169,9 +169,17 @@ def manual_cueq_forward(
         events,
     )
 
+    # Production CUEQ attention needs physically contiguous [..., I, H, J, D]
+    # q/k/v tensors.  Time the same heads-first producer here so the split
+    # breakdown accounts for layout traffic at its actual boundary.
     q, k, v = timed(
         "qkv_projection",
-        lambda: module.mha._prep_qkv(x, x, apply_scale=False),
+        lambda: module.mha._prep_qkv(
+            x,
+            x,
+            apply_scale=False,
+            cueq_heads_first=True,
+        ),
         events,
     )
 
@@ -265,7 +273,19 @@ def layout_probe(
         mask_bias = (module.inf * (mask - 1))[..., :, None, None, :]
         mask_for_attention = (mask_bias == 0).bool()
     triangle_bias = permute_final_dims(module.linear(x), (2, 0, 1)).unsqueeze(-4)
-    q, k, v = module.mha._prep_qkv(x, x, apply_scale=False)
+    # Match TriangleAttention.forward(..., triangle_attention="cuequivariance"):
+    # the production path asks _prep_qkv to materialize CUEQ's physical
+    # heads-first layout, using the Triton producer when its guards pass.  This
+    # keeps the split benchmark honest: qkv_projection then includes the same
+    # layout kernel that Nsight Compute sees in the real module, rather than a
+    # cheaper metadata transpose that the CUEQ wrapper would later make
+    # contiguous out of sight.
+    q, k, v = module.mha._prep_qkv(
+        x,
+        x,
+        apply_scale=False,
+        cueq_heads_first=True,
+    )
     scale = 1.0 / math.sqrt(module.c_hidden)
     heads_first = cuequivariance_triangular_attn(
         q, k, v, triangle_bias.float(), mask_for_attention, scale
@@ -289,6 +309,10 @@ def layout_probe(
         "gate_stride": list(gate.stride()),
         "gate_contiguous": gate.is_contiguous(),
         "gate_dtype": str(gate.dtype),
+        "q_shape": list(q.shape),
+        "q_stride": list(q.stride()),
+        "q_contiguous": q.is_contiguous(),
+        "q_dtype": str(q.dtype),
         "heads_first_shape": list(heads_first.shape),
         "heads_first_stride": list(heads_first.stride()),
         "heads_first_contiguous": heads_first.is_contiguous(),
