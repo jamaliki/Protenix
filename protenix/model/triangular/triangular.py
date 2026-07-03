@@ -28,11 +28,6 @@ from protenix.model.utils import chunk_layer, is_fp16_enabled, permute_final_dim
 _FALSE_ENV_VALUES = {"0", "false", "off", "no"}
 
 
-def cueq_cache_cast_weights_enabled() -> bool:
-    value = os.getenv("PROTENIX_CUEQ_CACHE_CAST_WEIGHTS", "0")
-    return value.lower() not in _FALSE_ENV_VALUES
-
-
 def cueq_bool_mask_enabled() -> bool:
     value = os.getenv("PROTENIX_CUEQ_BOOL_MASK", "1")
     return value.lower() not in _FALSE_ENV_VALUES
@@ -132,69 +127,6 @@ class BaseTriangleMultiplicativeUpdate(nn.Module, ABC):
         self.layer_norm_out = LayerNorm(self.c_hidden)
 
         self.sigmoid = nn.Sigmoid()
-        self._cueq_weight_cache_key = None
-        self._cueq_weight_cache = None
-
-    def _cueq_cached_weights(
-        self,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> Optional[tuple[torch.Tensor, ...]]:
-        """Cache CUEQ's inference-only packed/cast weights.
-
-        The CUEQ triangle-multiplication API consumes concatenated A/B
-        projection weights and gate weights.  Passing FP32 parameters directly
-        is correct, but an inference trace shows repeated ``aten::cat`` and
-        dtype-copy traffic around those arguments.  In eval/no-grad inference
-        the parameters are immutable, so we can cache the exact packed tensors
-        CUEQ will consume.  Grad-enabled and training calls deliberately keep
-        the original parameter path so autograd semantics are unchanged.
-        """
-
-        if (
-            not cueq_cache_cast_weights_enabled()
-            or self.training
-            or torch.is_grad_enabled()
-        ):
-            return None
-
-        tensors = (
-            self.layer_norm_in.weight,
-            self.layer_norm_in.bias,
-            self.linear_a_p.weight,
-            self.linear_b_p.weight,
-            self.linear_a_g.weight,
-            self.linear_b_g.weight,
-            self.layer_norm_out.weight,
-            self.layer_norm_out.bias,
-            self.linear_z.weight,
-            self.linear_g.weight,
-        )
-        key = (
-            device,
-            dtype,
-            tuple(t.data_ptr() for t in tensors),
-            tuple(t._version for t in tensors),  # pylint: disable=protected-access
-        )
-        if key != self._cueq_weight_cache_key:
-            p_in = torch.cat(
-                [self.linear_a_p.weight, self.linear_b_p.weight], 0
-            ).to(device=device, dtype=dtype)
-            g_in = torch.cat(
-                [self.linear_a_g.weight, self.linear_b_g.weight], 0
-            ).to(device=device, dtype=dtype)
-            self._cueq_weight_cache = (
-                self.layer_norm_in.weight.to(device=device, dtype=dtype).contiguous(),
-                self.layer_norm_in.bias.to(device=device, dtype=dtype).contiguous(),
-                p_in.contiguous(),
-                g_in.contiguous(),
-                self.layer_norm_out.weight.to(device=device, dtype=dtype).contiguous(),
-                self.layer_norm_out.bias.to(device=device, dtype=dtype).contiguous(),
-                self.linear_z.weight.to(device=device, dtype=dtype).contiguous(),
-                self.linear_g.weight.to(device=device, dtype=dtype).contiguous(),
-            )
-            self._cueq_weight_cache_key = key
-        return self._cueq_weight_cache
 
     def _combine_projections(
         self,
@@ -568,43 +500,22 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
         # Therefore, we include a check here: if c != c_z, we fall back to using plain PyTorch.
         # This situation may occur in our template module.
         if triangle_multiplicative == "cuequivariance" and (self.c_z == self.c_hidden):
-            cached_weights = self._cueq_cached_weights(dtype=z.dtype, device=z.device)
-            if cached_weights is None:
-                norm_in_weight = self.layer_norm_in.weight
-                norm_in_bias = self.layer_norm_in.bias
-                p_in_weight = torch.cat(
-                    [self.linear_a_p.weight, self.linear_b_p.weight], 0
-                )
-                g_in_weight = torch.cat(
-                    [self.linear_a_g.weight, self.linear_b_g.weight], 0
-                )
-                norm_out_weight = self.layer_norm_out.weight
-                norm_out_bias = self.layer_norm_out.bias
-                p_out_weight = self.linear_z.weight
-                g_out_weight = self.linear_g.weight
-            else:
-                (
-                    norm_in_weight,
-                    norm_in_bias,
-                    p_in_weight,
-                    g_in_weight,
-                    norm_out_weight,
-                    norm_out_bias,
-                    p_out_weight,
-                    g_out_weight,
-                ) = cached_weights
             update = kernel_triangular_mult(
                 z[None],
                 direction="outgoing" if self._outgoing else "incoming",
                 mask=z.new_ones(z.shape[:-1])[None] if mask is None else mask,
-                norm_in_weight=norm_in_weight,
-                norm_in_bias=norm_in_bias,
-                p_in_weight=p_in_weight,
-                g_in_weight=g_in_weight,
-                norm_out_weight=norm_out_weight,
-                norm_out_bias=norm_out_bias,
-                p_out_weight=p_out_weight,
-                g_out_weight=g_out_weight,
+                norm_in_weight=self.layer_norm_in.weight,
+                norm_in_bias=self.layer_norm_in.bias,
+                p_in_weight=torch.cat(
+                    [self.linear_a_p.weight, self.linear_b_p.weight], 0
+                ),
+                g_in_weight=torch.cat(
+                    [self.linear_a_g.weight, self.linear_b_g.weight], 0
+                ),
+                norm_out_weight=self.layer_norm_out.weight,
+                norm_out_bias=self.layer_norm_out.bias,
+                p_out_weight=self.linear_z.weight,
+                g_out_weight=self.linear_g.weight,
                 eps=1e-5,  # In BF16, we use the default eps of 1e-5.
             )[0]
             if _input_inplace_safe and _add_with_inplace:

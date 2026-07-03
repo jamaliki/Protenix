@@ -751,6 +751,39 @@ were only tens of milliseconds.  The next atom win is therefore not another
 local-attention kernel rewrite; it would need to remove many small launches or
 copies around the atom blocks.
 
+A later scoped-pairformer trace, job `96710`
+(`runs/profile_b16_mixed_n20_d9b8cab_20260703_051515`), added
+`record_function` ranges around the pairformer block internals.  It confirmed
+that CUEQ triangle multiplication is the right place to look inside the
+pairformer: in the N20 profiling run, `triangle_mul_out` accounted for
+`11.93s` and `triangle_mul_in` for `4.30s` of scoped time, with repeated
+`cuequivariance::fused_gated_dual_gemm`, `cuequivariance::layer_norm_transpose`,
+`aten::cat`, `aten::to`, and copy traffic around the fused CUEQ kernels.  That
+suggested a narrow inference-only experiment: cache the packed/cast CUEQ
+projection weights so each triangle-multiplication call no longer rebuilds the
+same concatenated BF16 weight tensors.
+
+The hotspot screen rejected that experiment before an end-to-end gate.  Job
+`96737`
+(`runs/cueq_weight_cache_hotspot_20260703_053331_fb33367`) alternated baseline
+and cached-weight runs in one H100 allocation for the two mixed-batch shapes
+that matter (`B=16`, `N_token=124` and `220`, BF16, CUEQ triangle attention and
+triangle multiplication):
+
+| shape | block ms baseline | block ms cached | triangle-mul ms baseline | triangle-mul ms cached | decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `B=16, N=124` | 4.923 | 4.818 | 1.431 | 1.311 | reject: only `2.1%` block win |
+| `B=16, N=220` | 14.896 | 14.830 | 3.521 | 3.456 | reject: only `0.45%` block win |
+
+This is useful negative evidence.  The CUEQ kernels are fast enough that
+removing the obvious weight-pack/cast staging has little total-block ceiling,
+especially in the longer-token batch where triangle attention and pair
+transition dominate.  The default-off cached-weight code path was removed
+rather than carried as another unpromoted environment flag.  The remaining
+pairformer opportunity is not Python-side weight packing; it is a larger
+kernel-boundary change that removes work around CUEQ triangle attention or
+triangle multiplication itself without adding new layout traffic.
+
 This profile motivated one narrow follow-up instead of re-enabling the rejected
 broad fusion flag.  Commit `b5c8c3e` adds
 `PROTENIX_TRITON_FUSED_ELEMENTWISE_MIN_ELEMENTS`, which keeps the default-off
