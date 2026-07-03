@@ -15,6 +15,7 @@ from protenix.model.layer_norm.layer_norm_triton import (
     triton_layer_norm,
     triton_layer_norm_available,
     triton_layer_norm_enabled,
+    triton_layer_norm_enabled_for_shape,
 )
 
 
@@ -29,17 +30,38 @@ class TestTritonLayerNorm(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PROTENIX_TRITON_LAYER_NORM": "1"}):
             self.assertIsNone(triton_layer_norm(x, torch.Size([4]), None, None, 1e-5))
 
-    def test_auto_policy_defaults_to_low_precision_only(self):
+    def test_auto_policy_defaults_to_low_precision_and_large_fp32_shapes(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertTrue(triton_layer_norm_enabled(torch.bfloat16))
             self.assertTrue(triton_layer_norm_enabled(torch.float16))
+            # Shape-free policy remains conservative for FP32.  The runtime
+            # helper below is what promotes the large diffusion-token shapes
+            # that actually won the H100 gate.
             self.assertFalse(triton_layer_norm_enabled(torch.float32))
+            self.assertFalse(
+                triton_layer_norm_enabled_for_shape(torch.float32, 512, 384)
+            )
+            self.assertTrue(
+                triton_layer_norm_enabled_for_shape(torch.float32, 8192, 384)
+            )
+            self.assertTrue(
+                triton_layer_norm_enabled_for_shape(torch.float32, 16000, 768)
+            )
+            self.assertFalse(
+                triton_layer_norm_enabled_for_shape(torch.float32, 16000, 128)
+            )
 
         with mock.patch.dict(os.environ, {"PROTENIX_TRITON_LAYER_NORM": "1"}):
             self.assertTrue(triton_layer_norm_enabled(torch.float32))
+            self.assertTrue(
+                triton_layer_norm_enabled_for_shape(torch.float32, 512, 128)
+            )
 
         with mock.patch.dict(os.environ, {"PROTENIX_TRITON_LAYER_NORM": "0"}):
             self.assertFalse(triton_layer_norm_enabled(torch.bfloat16))
+            self.assertFalse(
+                triton_layer_norm_enabled_for_shape(torch.float32, 16000, 768)
+            )
 
     @unittest.skipUnless(
         torch.cuda.is_available() and triton_layer_norm_available(),
