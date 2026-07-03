@@ -1555,6 +1555,42 @@ scheduler option: avoiding padded pairformer work without losing throughput
 needs a true segmented/ragged pairformer kernel or schedule, not Python-level
 sub-batching.
 
+One possible confound in those smaller token buckets was CUEQ's own
+short-sequence fallback.  `cuequivariance_ops_torch` reads
+`CUEQ_TRIATTN_FALLBACK_THRESHOLD` at import time and defaults it to `100`, so a
+triangle-attention call with `Q <= 100` uses the PyTorch fallback instead of the
+native CUEQ CUDA op.  That is a sensible local policy for some tiny attention
+calls, but it could have made the short bucketed groups look worse than a
+proper segmented CUEQ schedule.
+
+Canary job `97548`
+(`runs/cueq_short_threshold_20260703_130536_856f1b8`) screened that confound by
+running `scripts/perf/triangle_attention_breakdown.py` in separate Python
+processes for the default threshold `100` and forced-CUEQ threshold `0`.
+Separate processes matter here because the CUEQ wrapper caches the environment
+variable when the module is imported.
+
+| shape | default threshold module ms | forced-CUEQ module ms | interpretation |
+| --- | ---: | ---: | --- |
+| `B4, N52` | 0.513 | 0.602 | forcing CUEQ hurts very small groups |
+| `B4, N76` | 0.523 | 0.496 | small win |
+| `B4, N100` | 0.529 | 0.519 | small win |
+| `B8, N52` | 0.489 | 0.515 | forcing CUEQ hurts very small groups |
+| `B8, N76` | 0.530 | 0.525 | neutral |
+| `B8, N100` | 1.018 | 0.534 | large isolated win |
+| `B8, N124` | 0.541 | 0.525 | neutral; both already use CUEQ in practice |
+| `B16, N124` | 0.855 | 0.851 | neutral |
+| `B16, N220` | 3.133 | 3.123 | neutral |
+
+Decision: do **not** change the global CUEQ fallback threshold or rerun the
+queue-bucket gate just for this knob.  The threshold effect is real at
+`B8, N100`, but the earlier full gate failed because bucketed queues fragmented
+diffusion/atom work by many seconds, while this knob touches only part of the
+triangle-attention cost in a subset of short groups.  It reinforces the same
+conclusion: the useful mixed-length fix is a true segmented/ragged pairformer
+kernel or vendor-extension schedule that keeps large diffusion batches intact,
+not another Python-level token split.
+
 Ending-node triangle attention looked like a more attractive layout boundary in
 isolation.  Job `96838`
 (`runs/triangle_attention_current_breakdown_20260703_070352_8c3409e`) first
@@ -2774,6 +2810,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Lowering mixed-token `N_sample=5` batch size from 16 to 8 | current full gate slowed from `3.56` to `3.0-3.1` generated samples/s because diffusion/atom work split into four smaller launch groups | tighter token ranges are useful only if the saved padding beats the lost batching efficiency |
 | Explicit mixed-token bucket sizes `96`, `64`, `48`, and `32` at B16 | all slowed the representative N200 gate; best explicit bucket fell from `3.649` to `3.270` generated samples/s and narrower buckets reached `2.307` generated samples/s | queue bucketing saves some padded pairformer work only by fragmenting diffusion/atom batches; the real solution needs ragged kernels or segmented schedules, not more launch groups |
 | Internal pairformer-only trunk buckets while keeping diffusion B16 | best case `trunk64` improved pairformer `15.736 -> 15.461s`, but diffusion worsened `24.098 -> 24.689s` and throughput fell `3.608 -> 3.575` generated samples/s; narrower trunk buckets were much worse | Python-level sub-batching changes launch/cache balance and is not the segmented-pairformer solution; remove the knob and target true ragged kernels/schedules |
+| Forcing CUEQ triangle attention below its default `Q <= 100` PyTorch fallback threshold | useful isolated effect at `B8, N100` (`1.018 -> 0.534 ms`) but neutral at `B8, N76`, worse at `B4/B8, N52`, and neutral for the promoted B16 shapes | this explains one short-bucket artifact but cannot rescue token bucketing because the full-gate failure was dominated by diffusion/atom fragmentation |
 | Full-block ragged pairformer islands | two split buckets improved the long `136-220` block `1.15x`, but slowed the short `40-124` block to `0.66x`; exact-length groups and singletons were much slower | launch count and lost batching eat the padding savings unless the ragged schedule is a real one-launch/vendor-quality kernel |
 | Bool masks for CUEQ triangle multiplication | block screen was flat at `N=124` and only +0.5% at `N=220` | mask dtype plumbing is not a meaningful bottleneck after triangle-attention bool-mask cleanup |
 | Materializing pairformer token-attention bias as contiguous `[B, H, Q, K]` | traced pairformer SDPA shape `[16, 16, 124, 24]` moved from math-dispatch attempt to a cuDNN frontend "no valid execution plans" error; fallback timing then segfaulted in the isolated screen | the non-contiguous bias layout is not the only blocker; head_dim 24 plus dense additive bias lacks a safe cuDNN plan in this runtime, so do not pay a bias copy hoping for a backend flip |
