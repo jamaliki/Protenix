@@ -240,7 +240,7 @@ def packed_forward(
     module: TriangleAttention,
     x_in: torch.Tensor,
     mask_in: torch.Tensor,
-    weight: torch.Tensor,
+    weights_by_dtype: dict[torch.dtype, torch.Tensor],
 ) -> torch.Tensor:
     x = x_in
     mask = mask_in
@@ -248,6 +248,10 @@ def packed_forward(
         x = x.transpose(-2, -3)
         mask = mask.transpose(-1, -2)
     x = module.layer_norm(x)
+    weight = weights_by_dtype.get(x.dtype)
+    if weight is None:
+        weight = packed_weight(module, x.dtype)
+        weights_by_dtype[x.dtype] = weight
     with torch.amp.autocast("cuda", enabled=False):
         packed = F.linear(x, weight)
     q, k, v, gate, triangle_bias = unpack_packed_projection(packed, module)
@@ -318,12 +322,15 @@ def main() -> None:
     torch.manual_seed(args.seed)
     module = make_module(args)
     x, mask = make_inputs(args)
-    dtype = getattr(torch, args.input_dtype)
-    weight = packed_weight(module, dtype)
+    input_dtype = getattr(torch, args.input_dtype)
+    weights_by_dtype = {
+        input_dtype: packed_weight(module, input_dtype),
+        torch.float32: packed_weight(module, torch.float32),
+    }
 
     with torch.inference_mode(), cuda_autocast(args.compute_dtype):
         reference, module_ms = cuda_time(lambda: module_forward(module, x, mask), args.warmup, args.iters)
-        candidate, packed_ms = cuda_time(lambda: packed_forward(module, x, mask, weight), args.warmup, args.iters)
+        candidate, packed_ms = cuda_time(lambda: packed_forward(module, x, mask, weights_by_dtype), args.warmup, args.iters)
 
     print(
         json.dumps(
