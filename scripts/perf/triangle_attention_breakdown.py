@@ -117,16 +117,29 @@ def manual_cueq_forward(
     module: TriangleAttention,
     x_in: torch.Tensor,
     mask_in: torch.Tensor,
+    *,
+    ending_norm_before_transpose: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
     x = x_in
     mask = mask_in
 
-    if not module.starting:
+    if not module.starting and ending_norm_before_transpose:
+        # LayerNorm is applied independently over the channel dimension, so it
+        # commutes with swapping the two residue axes:
+        #     LN(x.transpose(I, J)) == LN(x).transpose(I, J)
+        # The default ending-node path normalizes the transposed view.  This
+        # probe measures whether normalizing the original contiguous layout
+        # first is a good boundary for a production rewrite.
+        x = timed("layer_norm_pretranspose", lambda: module.layer_norm(x), events)
+        x = timed("input_transpose_after_norm", lambda: x.transpose(-2, -3), events)
+        mask = timed("mask_transpose", lambda: mask.transpose(-1, -2), events)
+    elif not module.starting:
         x = timed("input_transpose", lambda: x.transpose(-2, -3), events)
         mask = timed("mask_transpose", lambda: mask.transpose(-1, -2), events)
-
-    x = timed("layer_norm", lambda: module.layer_norm(x), events)
+        x = timed("layer_norm", lambda: module.layer_norm(x), events)
+    else:
+        x = timed("layer_norm", lambda: module.layer_norm(x), events)
 
     # The cuequivariance kernel consumes a bool mask, but the generic module
     # first builds the additive -inf mask used by the torch/deepspeed paths and
@@ -347,6 +360,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-tf32", type=str_bool, default=True)
     parser.add_argument("--randomize-zero-weights", type=str_bool, default=True)
     parser.add_argument(
+        "--ending-norm-before-transpose",
+        type=str_bool,
+        default=False,
+        help=(
+            "Diagnostic only: for ending-node attention, time the mathematically "
+            "equivalent path LN(x).transpose(...) instead of LN(x.transpose(...))."
+        ),
+    )
+    parser.add_argument(
         "--ncu-capture",
         choices=["none", "module", "manual"],
         default="none",
@@ -383,7 +405,12 @@ def main() -> None:
             if args.ncu_capture == "module":
                 capture_fn = lambda: module_forward(module, x, mask)
             else:
-                capture_fn = lambda: manual_cueq_forward(module, x, mask)[0]
+                capture_fn = lambda: manual_cueq_forward(
+                    module,
+                    x,
+                    mask,
+                    ending_norm_before_transpose=args.ending_norm_before_transpose,
+                )[0]
             out = cuda_profiler_capture(
                 (
                     f"triangle_attention_{args.ncu_capture}_"
@@ -414,10 +441,20 @@ def main() -> None:
             return
 
         for _ in range(args.warmup):
-            manual_cueq_forward(module, x, mask)
+            manual_cueq_forward(
+                module,
+                x,
+                mask,
+                ending_norm_before_transpose=args.ending_norm_before_transpose,
+            )
 
         reference = module_forward(module, x, mask)
-        split, _ = manual_cueq_forward(module, x, mask)
+        split, _ = manual_cueq_forward(
+            module,
+            x,
+            mask,
+            ending_norm_before_transpose=args.ending_norm_before_transpose,
+        )
         parity = max_abs_error(reference, split)
         layout = layout_probe(module, x, mask)
 
@@ -427,7 +464,12 @@ def main() -> None:
 
         torch.cuda.reset_peak_memory_stats()
         for _ in range(args.iters):
-            _, timings = manual_cueq_forward(module, x, mask)
+            _, timings = manual_cueq_forward(
+                module,
+                x,
+                mask,
+                ending_norm_before_transpose=args.ending_norm_before_transpose,
+            )
             for name, elapsed_ms in timings.items():
                 totals[name] += elapsed_ms
 
