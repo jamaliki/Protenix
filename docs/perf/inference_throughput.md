@@ -639,6 +639,27 @@ pairformer and confidence stay flat.  The current mixed-sequence `N_sample=5`
 headline is therefore `212.51s -> 44.36s` predict and `0.753 -> 3.607`
 generated samples/s, or `4.79x` over the old low-sample boundary.
 
+Pairformer token-attention follow-up: job `96365`
+(`runs/token_attention_gate_n200_20260703_015502_0dda88a`) tested an opt-in
+reuse of the existing Triton `TriAttentionFunction` for dense pairformer token
+attention.  The mechanism looked plausible in isolation: for one long padded
+batch (`N=220`, `B=16`, `H=16`, `D=24`) pre-padded TriAttention was `6.4x`
+faster than PyTorch math SDPA, and even with naive pad/copy overhead the
+attention subrange improved `0.460 -> 0.403 ms`.  The shorter padded batch
+(`N=124`) was neutral/slower, so the representative gate used a conservative
+`N_token >= 160` guard.
+
+The full mixed-sequence `N_sample=5`, `N_step=200`, batch-16 gate did not move
+enough to promote.  Two alternating repeats gave default `44.63s` and `45.69s`
+versus guarded TriAttention `44.81s` and `44.96s`; the averages are `45.16s`
+and `44.89s`, only `0.6%` apart.  The candidate did reduce the long-batch
+pairformer subtotal slightly, but pad/copy traffic plus ordinary diffusion and
+atom-path variance erased the isolated win.  The opt-in code was removed rather
+than kept as dormant complexity.  A future token-attention attempt should be a
+true `D=24` dense-bias kernel that reads the existing layouts directly; reusing
+the triangle-attention kernel through a padded dummy axis is not a meaningful
+end-to-end optimization.
+
 Launch-level follow-up: job `96110`
 (`runs/flat_bf16_batch_profile_20260702_221601_c8a532d`) proved the profiler
 wrapper needed to catch `SystemExit` before exporting artifacts.  Corrected job
@@ -1871,6 +1892,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Whole confidence head under AMP | 2.9-5.6% slower at `N_sample=128`, `N_step=20` | lower dtype is not automatically faster when FP32 uses TF32 tensor cores and casts/library paths change |
 | Generic full-token Triton attention | slower than cuDNN/SDPA | vendor kernels win unless the shape mismatch is severe |
 | Materializing pairformer token-attention bias as contiguous `[B, H, Q, K]` | traced pairformer SDPA shape `[16, 16, 124, 24]` moved from math-dispatch attempt to a cuDNN frontend "no valid execution plans" error; fallback timing then segfaulted in the isolated screen | the non-contiguous bias layout is not the only blocker; head_dim 24 plus dense additive bias lacks a safe cuDNN plan in this runtime, so do not pay a bias copy hoping for a backend flip |
+| Reusing Triton `TriAttentionFunction` for pairformer token attention | isolated `N=220` hotspot improved, but the full mixed-sequence gate averaged only `45.16s -> 44.89s` predict (`+0.6%`) and one repeat regressed | padding `D=24` to `D=32` and copying layouts is too much integration overhead; if revisited, write a direct dense-bias `D=24` kernel instead |
 | Fused self-attention `q/k/v/g` projection | exact parity but trunk block slowed from about 14.1 ms to 14.9 ms | fewer launches are not enough if the wider GEMM/cache/layout is worse |
 | Fused transition `a1/a2` projection without split-aware consumer | transition slowed from about 5.3 ms to 7.0 ms | fusing the producer can break the consumer by creating non-contiguous halves |
 | Custom Triton transition input GEMM+SiLU | synthetic +12%, but real transition input path slowed from 3.09 ms to 3.54 ms | custom GEMM screens must use real module weights/autocast; cuBLAS efficiency is the bottleneck to match |
