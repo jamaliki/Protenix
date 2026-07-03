@@ -225,6 +225,37 @@ answering a different launch-level question.  Keep `gpu-canary`, one H100,
 14 CPUs, and `--mem=128G` unless a measured capture requires a different
 resource shape.
 
+First capture: job `98942`, run directory
+`runs/pairformer_block_ncu_20260703_223817_169b21b`, commit `169b21b`,
+completed on `gpu-canary-0`.  The raw export can be summarized with:
+
+```bash
+scripts/perf/summarize_ncu_raw.py \
+  runs/pairformer_block_ncu_20260703_223817_169b21b/ncu_raw.csv
+```
+
+The captured block had `37.83 ms` of kernel time, matching the CUDA-event block
+screen closely enough for launch attribution.  Top launch families:
+
+| family | launches | total ms | signal | interpretation |
+| --- | ---: | ---: | --- | --- |
+| cuDNN SDPA | 2 | 6.36 | ~56% SM, ~81% compute-memory throughput | vendor attention mainloop; not the first custom-kernel target |
+| PyTorch vectorized elementwise | 54 | 6.18 | several launches at ~90-92% DRAM | residuals, gates, and activation products remain real HBM boundaries |
+| PyTorch `_layer_norm_kernel` | 6 | 4.89 | ~68% SM, ~76% compute-memory throughput | normalization traffic is material but spread across the block |
+| CUEQ `fused_sigmoid_gated_dual_gemm` | 4 | 3.72 | ~74-76% memory throughput | triangle multiplication is still material, but the fused CUEQ kernel is not obviously weak |
+| CUTLASS/PyTorch GEMM `Kernel2` | 7 | 3.31 | mixed tensor/memory, low occupancy | library GEMMs are secondary; preserve their mainloops if fusing epilogues |
+| CUEQ q/k/v layout helper | 2 | 2.16 | ~85% DRAM | layout traffic around attention is still visible |
+| CUEQ `layer_norm_transpose` | 4 | 2.08 | ~78-79% memory throughput | producer/consumer layout boundary, but isolated norm movement did not move full gates |
+| triangle-attention gate epilogue | 2 | 1.00 | ~91% DRAM | already fused to one Triton launch; residual opportunity is small alone |
+
+Decision: this capture argues against a naive whole-attention "mega-kernel".
+The dominant attention mainloop is already cuDNN, and the remaining time is
+spread across memory-bound layout/LN/elementwise boundaries plus CUEQ and
+transition work.  The next credible custom-kernel target must preserve
+vendor-quality GEMM/attention mainloops while removing a broader producer or
+epilogue boundary; replacing a cuBLAS/cuDNN mainloop with a slower custom matmul
+has already lost more than the fused epilogue could recover.
+
 This is intentionally a measurement hook, not a production path.  The promotion
 bar remains a paired full `N_step=200` same-token variable-atom gate after the
 candidate moves a material pairformer subtotal.
