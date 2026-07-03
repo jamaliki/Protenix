@@ -1287,6 +1287,7 @@ class Protenix(nn.Module):
             with dm._profile_block("transformer"), torch.profiler.record_function(
                 "protenix/batched_token_diffusion_transformer"
             ):
+                dm.maybe_compile_diffusion_transformer()
                 with dm._diffusion_core_autocast(transformer_dtype):
                     a_transformer = dm.diffusion_transformer(
                         a=a_transformer,
