@@ -1379,6 +1379,28 @@ pairformer work, and the smaller long-token second batch does not recover
 enough diffusion throughput to compensate.  Keep B16 as the documented fixed
 batch-size default for this mixed-length N5 campaign.
 
+The token-bucket scheduler was also gated after this fixed-batch sweep.  The
+hypothesis was reasonable: keep `--batch_size 16` as the maximum launch group,
+but split the length-sorted queue into approximate token-width buckets so the
+pairformer sees less padded `O(B * N_max^2)` work.  Job `96904`
+(`runs/token_bucket_gate_n200_20260703_080414_8cb1e6d`) rejected that idea for
+the representative mixed-token campaign:
+
+| case | queue buckets | predict sec | generated samples/s | pairformer | diffusion | diffusion transformer | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| sorted default | 2 | 43.850 | 3.649 | 15.794 | 23.604 | 14.010 | keep |
+| bucket96 | 3 | 48.930 | 3.270 | 16.283 | 28.164 | 15.733 | reject |
+| bucket64 | 4 | 52.370 | 3.055 | 15.367 | 32.384 | 18.880 | reject |
+| bucket48 | 5 | 62.670 | 2.553 | 19.151 | 39.679 | 22.925 | reject |
+| bucket32 | 6 | 69.350 | 2.307 | 18.787 | 46.040 | 27.456 | reject |
+
+Bucket64 is the clearest mechanism check: pairformer improves slightly, but
+diffusion grows by `8.78s` because the token transformer, atom encoder, and atom
+decoder run as four smaller groups instead of two fuller groups.  Narrower
+buckets make this worse.  So the next batching win is not a queue heuristic; it
+needs a ragged or segmented kernel/schedule that preserves large diffusion
+launch groups while avoiding padded pairformer work.
+
 Ending-node triangle attention looked like a more attractive layout boundary in
 isolation.  Job `96838`
 (`runs/triangle_attention_current_breakdown_20260703_070352_8c3409e`) first
@@ -2399,6 +2421,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Generic full-token Triton attention | slower than cuDNN/SDPA | vendor kernels win unless the shape mismatch is severe |
 | Raising mixed-token `N_sample=5` batch size from 16 to 32 | current full gate slowed from `3.64` to `2.93` generated samples/s because pairformer and diffusion transformer ran on a much larger padded physical shape | bigger batches only help when bucketing keeps token ranges tight; memory headroom alone is not a throughput argument |
 | Lowering mixed-token `N_sample=5` batch size from 16 to 8 | current full gate slowed from `3.56` to `3.0-3.1` generated samples/s because diffusion/atom work split into four smaller launch groups | tighter token ranges are useful only if the saved padding beats the lost batching efficiency |
+| Explicit mixed-token bucket sizes `96`, `64`, `48`, and `32` at B16 | all slowed the representative N200 gate; best explicit bucket fell from `3.649` to `3.270` generated samples/s and narrower buckets reached `2.307` generated samples/s | queue bucketing saves some padded pairformer work only by fragmenting diffusion/atom batches; the real solution needs ragged kernels or segmented schedules, not more launch groups |
 | Materializing pairformer token-attention bias as contiguous `[B, H, Q, K]` | traced pairformer SDPA shape `[16, 16, 124, 24]` moved from math-dispatch attempt to a cuDNN frontend "no valid execution plans" error; fallback timing then segfaulted in the isolated screen | the non-contiguous bias layout is not the only blocker; head_dim 24 plus dense additive bias lacks a safe cuDNN plan in this runtime, so do not pay a bias copy hoping for a backend flip |
 | CUEQ `attention_pair_bias` for diffusion token attention | native pair-bias projection needed an explicit zero LayerNorm bias, then CUEQ's internal SDPA failed with `No valid execution plans built`; forced PyTorch fallback was slower than the current full conv2d+SDPA baseline | CUEQ's wrapper is not a drop-in win here; use it only if we can call a narrower fused pair-bias producer while keeping Protenix's SDPA fallback policy |
 | Reusing Triton `TriAttentionFunction` for pairformer token attention | isolated `N=220` hotspot improved, but the full mixed-sequence gate averaged only `45.16s -> 44.89s` predict (`+0.6%`) and one repeat regressed | padding `D=24` to `D=32` and copying layouts is too much integration overhead; if revisited, write a direct dense-bias `D=24` kernel instead |

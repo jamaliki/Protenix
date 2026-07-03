@@ -186,7 +186,10 @@ tight ranges such as
 token_pad_eff 96.9%`.  The optional `--token_bucket_size N` knob additionally
 splits the streaming queue into approximate token buckets for advanced callers;
 leave it at the default `0` for the normal CLI path, which already length-sorts
-the raw campaign records.
+the raw campaign records.  On the representative 32-record, 40-220-token,
+`N_sample=5`, `N_step=200` H100 gate, explicit buckets of `96`, `64`, `48`,
+and `32` tokens were all slower than the sorted default because they fragmented
+the diffusion/atom work into too many small launch groups.
 
 Directory inputs are campaign-aware in this branch:
 
