@@ -1441,6 +1441,30 @@ attention, do not stop at commuting LayerNorm; the likely larger boundary is a
 contiguous ending-node producer that writes CUEQ's swapped q/k/v and bias
 layouts directly while preserving the current CUEQ attention throughput.
 
+A more ambitious CUEQ-adjacent producer fusion was then screened without
+touching production.  Commit `7806ec0` added
+`scripts/perf/triangle_attention_packed_projection_probe.py`, which replaces
+the separate q/k/v, gate, and triangle-bias projections with one wider packed
+projection, then unpacks q/k/v, gate, and FP32 CUEQ bias in one Triton layout
+kernel.  This preserves the CUEQ attention mainloop, but tests whether the
+three projection launches and repeated reads of the normalized pair tensor are
+worth fusing.  Job `96936`
+(`runs/triangle_packed_projection_probe_20260703_082814_7806ec0`) rejected it:
+
+| shape | module forward ms | packed producer ms | speedup | parity |
+| --- | ---: | ---: | ---: | --- |
+| `B=16`, `N=124`, start | 0.8545 | 1.0807 | 0.7907x | exact |
+| `B=16`, `N=124`, end | 1.4751 | 2.9951 | 0.4925x | max abs `0.00195` |
+| `B=16`, `N=220`, start | 3.1363 | 3.7570 | 0.8348x | exact |
+| `B=16`, `N=220`, end | 5.0170 | 9.7878 | 0.5126x | max abs `0.00195` |
+
+Interpretation: CUEQ's surrounding projections are already better served as
+separate cuBLAS calls plus narrow layout kernels than as one oversized producer
+followed by a custom scatter.  For triangle attention, the remaining credible
+kernel work must either fuse LayerNorm with the projection mainloop in a
+vendor-quality schedule or attack ragged/padded work directly; simply widening
+the projection boundary is the wrong shape.
+
 A refreshed one-block profile on the current promoted path explains why that
 one-line boundary was too small.  Job `96864`
 (`runs/pairformer_block_current_b16_20260703_073024_a03319e`) timed a single
@@ -2429,6 +2453,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Fused self-attention `q/k/v/g` projection | exact parity but trunk block slowed from about 14.1 ms to 14.9 ms | fewer launches are not enough if the wider GEMM/cache/layout is worse |
 | Fused ordinary self-attention q/k/v projection | hotspot moved the intended `qkv+sdpa+gate+out` subrange, but the full mixed `N_sample=5`, `N_step=200` gate averaged flat/slower (`44.69s -> 44.86s`) and one repeat regressed | producer fusion must still move the full workload; local launch savings can disappear in wider GEMM/layout/cache effects |
 | Ending-node triangle attention `LN(x).transpose(...)` | ending-attention module screens improved about `21-22%`, but the full mixed `N_sample=5`, `N_step=200` gate was flat/noisy (`44.49 -> 44.23s`, repeat `44.06 -> 44.40s`) and pairformer did not consistently move | channel-wise LayerNorm commutes with the pair-axis transpose, but moving only this boundary is not enough; revisit only as part of a larger contiguous ending-node q/k/v+bias producer |
+| Packed CUEQ triangle-attention q/k/v+gate+bias producer | exact or near-exact isolated screen, but slower on every actual shape: start attention `0.79-0.83x`, ending attention `0.49-0.51x` | one oversized projection plus a custom unpack/scatter loses to separate cuBLAS projections plus narrow Triton layout kernels; do not widen this producer boundary without a vendor-quality fused LayerNorm+GEMM schedule |
 | Fused `AdaptiveLayerNorm` conditioning projections | AdaLN subrange shrank slightly in some hotspot shapes, but full diffusion blocks were flat/slower, e.g. `1.416 -> 1.494 ms` at `N_token=220` | do not carry default-off concatenated-GEMM knobs unless the enclosing block moves |
 | Fused transition `a1/a2` projection without split-aware consumer | transition slowed from about 5.3 ms to 7.0 ms | fusing the producer can break the consumer by creating non-contiguous halves |
 | Custom Triton transition input GEMM+SiLU | synthetic +12%, but real transition input path slowed from 3.09 ms to 3.54 ms | custom GEMM screens must use real module weights/autocast; cuBLAS efficiency is the bottleneck to match |
