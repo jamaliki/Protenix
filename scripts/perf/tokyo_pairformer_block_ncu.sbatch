@@ -33,6 +33,7 @@ PROTENIX_REPO=${PROTENIX_REPO:?set PROTENIX_REPO to the Protenix checkout}
 RUN_DIR=${RUN_DIR:?set RUN_DIR to a writable profiling run directory}
 PY=${PY:-/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/env-boltz2/bin/python}
 NCU=${NCU:-/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/env-nsight/bin/ncu}
+DEV_BIN=${DEV_BIN:-/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/dev/bin}
 TOKENS=${TOKENS:-251}
 BATCH=${BATCH:-32}
 WARMUP=${WARMUP:-3}
@@ -45,8 +46,10 @@ mkdir -p "$RUN_DIR" "$RUN_DIR/torchinductor_cache" "$RUN_DIR/triton_cache"
 PY_BIN_DIR=${PY%/*}
 PY_PREFIX=${PY_BIN_DIR%/*}
 NCU_BIN_DIR=${NCU%/*}
-export PATH="$NCU_BIN_DIR:$PY_BIN_DIR:${PATH:-/usr/local/bin:/usr/bin:/bin}"
+export PATH="$DEV_BIN:$NCU_BIN_DIR:$PY_BIN_DIR:${PATH:-/usr/local/bin:/usr/bin:/bin}"
 export LD_LIBRARY_PATH="$PY_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+export CC=${CC:-"$DEV_BIN/x86_64-conda-linux-gnu-gcc"}
+export CXX=${CXX:-"$DEV_BIN/x86_64-conda-linux-gnu-g++"}
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
 export WANDB_MODE=disabled
@@ -65,6 +68,7 @@ export PROTENIX_TRITON_TRIANGLE_ATTENTION_EPILOGUE=${PROTENIX_TRITON_TRIANGLE_AT
 echo "job_id=${SLURM_JOB_ID:-none} host=$(hostname) date_utc=$(date -u --iso-8601=seconds)"
 echo "repo=$(pwd) branch=$(git rev-parse --abbrev-ref HEAD) commit=$(git rev-parse HEAD)"
 echo "python=$("$PY" --version 2>&1)"
+echo "cc=$CC"
 echo "ncu=$("$NCU" --version | head -5 | tr '\n' '; ')"
 nvidia-smi
 
