@@ -144,6 +144,14 @@ when you need the old conservative atom path.  Do not enable
 kernel experiments, but the full gate did not show a robust win over the
 flattened BF16 path.
 
+For normal multi-step inference, the diffusion transformer also caches the
+step-invariant token pair-attention bias once per block.  This spends a few GiB
+on long mixed batches, but removes repeated pair-bias projection and sample-lane
+repeat work from the `N_step=200` denoising loop.  Set
+`PROTENIX_CACHE_DIFFUSION_PAIR_BIAS=0` if you are memory-constrained or auditing
+the older path; one-step scout runs skip the cache automatically because there
+is no reuse window.
+
 Do not set the experimental Triton elementwise/residual/transition flags for
 this mixed-campaign path unless you are running a new benchmark.  On the B16
 mixed-length gate they slowed the representative predict section from `41.6s`
@@ -173,7 +181,7 @@ pairformer trunk at each record's real token length and then batches the
 diffusion tail.  It is slower than `auto`, but it is the right compromise when
 you want mixed-length batching without changing the largest trunk reduction
 boundary.  On the 32-record, 40-220-token, `N_sample=5`, `N_step=200` H100 gate,
-`trunk_exact` was about `100.8s` predict time versus `44-45s` for default
+`trunk_exact` was about `100.8s` predict time versus `41-42s` for default
 padded `auto`, so treat it as a numerical-audit or strict-trunk mode rather
 than the maximum-throughput setting.
 
@@ -218,7 +226,7 @@ dumping:
 | One combined JSON with 32 same-shape records | 361.8 s runner time | 69.3 s runner time | 5.2x after initialization |
 | 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.9 s summed predict, 0.943 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.70x predict, 5.69x throughput |
-| 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 44.4 s, 3.61 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, BF16 diffusion core, BF16 atom attention, Triton local atom attention, and default Triton LayerNorm fallback | 4.79x over the old branch boundary |
+| 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 41.6 s, 3.85 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, BF16 diffusion core, BF16 atom attention, Triton local atom attention, default Triton LayerNorm fallback, and cached diffusion pair bias | 5.11x over the old branch boundary |
 
 For the mixed-token, low-sample workload, keep `--batch_size 16` as the current
 fixed-batch default: B8 loses diffusion/atom batching efficiency, while B32

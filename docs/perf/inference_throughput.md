@@ -637,7 +637,9 @@ window directly, and the fused bias producer writes the layout that kernel
 expects.  The atom encoder+decoder subtotal falls from `14.83s` to `5.06s`;
 pairformer and confidence stay flat.  The current mixed-sequence `N_sample=5`
 headline is therefore `212.51s -> 44.36s` predict and `0.753 -> 3.607`
-generated samples/s, or `4.79x` over the old low-sample boundary.
+generated samples/s, or `4.79x` over the old low-sample boundary.  The later
+diffusion pair-bias cache gate below supersedes this headline with a `5.11x`
+default by reducing the remaining diffusion-transformer subtotal.
 
 Pairformer token-attention follow-up: job `96365`
 (`runs/token_attention_gate_n200_20260703_015502_0dda88a`) tested an opt-in
@@ -780,13 +782,45 @@ also reports `cached_bias_rebuild_each_call` as a control: if rebuilding the
 cache every call is flat but reusing it wins, the mechanism is specifically
 cross-step reuse rather than a faster rewritten block.  The memory tradeoff is
 explicit: at `B=16`, `N_sample=5`, `N=220`, storing 24 expanded BF16 biases is
-roughly three GiB.  The queued H100 screen is Slurm job `97022` under
-`runs/diffusion_pair_bias_cache_probe_20260703_090631_d43e0a0`, using the real
-`N=124` and `N=220` padded bucket shapes.  Promote only if a follow-up full
-`N_step=200` gate proves the saved projection/repeat work beats the higher live
-memory and one-time cache build.
+roughly three GiB.
 
-Current promoted trace: job `96456`
+The H100 screen completed as canary job `97036`
+(`runs/diffusion_pair_bias_cache_probe_canary_20260703_091034_dfc5ebd`) on the
+two real sorted B16 bucket shapes:
+
+| shape | eager transformer | cached reuse | rebuild cache each call | cache size | decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `B=16`, `N_sample=5`, `N=124` | 26.28 ms | 20.89 ms (`1.26x`) | 23.31 ms (`1.13x`) | 0.90 GiB | advance to model gate |
+| `B=16`, `N_sample=5`, `N=220` | 43.59 ms | 33.96 ms (`1.28x`) | 43.61 ms (`1.00x`) | 2.84 GiB | advance to model gate |
+
+The `N=220` rebuild control is the important proof: rebuilding the cache every
+call is flat, while reusing it wins.  The mechanism is not a better attention
+block; it is deleting repeated, step-invariant projection/repeat/mask traffic
+across the denoising loop.
+
+The representative model gate then completed as job `97060`
+(`runs/pair_bias_cache_gate_n200_20260703_091804_024d284`) with the same
+32-record mixed 40-220-token campaign, `N_sample=5`, `N_step=200`,
+`--batch_size 16`, confidence enabled, no MSA/template, and alternating
+default/cache repeats:
+
+| case | predict sec | generated samples/s | pairformer | diffusion | diffusion transformer | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| default | 45.13 | 3.545 | 15.77 | 24.70 | 14.75 | 2.55 | baseline |
+| cached pair bias | 41.99 | 3.810 | 15.74 | 21.62 | 11.35 | 2.54 | promote |
+| default repeat | 44.83 | 3.569 | 15.74 | 24.49 | 14.63 | 2.51 | baseline repeat |
+| cached pair bias repeat | 41.23 | 3.881 | 15.71 | 20.91 | 11.18 | 2.53 | promote |
+
+The paired result improves the intended diffusion-transformer subtotal by about
+`1.30x` and the whole predict section by `1.08x` without moving pairformer or
+confidence.  The current practical mixed-sequence `N_sample=5` headline is now
+`212.51s -> 41.61s` predict on average and `0.753 -> 3.85` generated samples/s,
+or `5.11x` over the old low-sample boundary.  The cache is now default-on for
+multi-step batched diffusion and can be disabled with
+`PROTENIX_CACHE_DIFFUSION_PAIR_BIAS=0`; `N_step=1` scout runs skip it because
+there is no reuse window.
+
+Pre-cache promoted trace: job `96456`
 (`runs/current_batched_profile_n20_20260703_031951_3d1adcd`) profiled the
 actual `runner/batch_inference.py` campaign path after the atom-attention
 promotion and transition-compile cleanup.  The workload was the same sorted
@@ -2493,12 +2527,22 @@ variants:
 
 This distinction matters for kernel design.  A win only in the first row says
 "rewrite a larger ragged pairformer boundary"; a win after scatter says "this
-one local MLP is worth integrating now."  The current H100 run is queued as
-Slurm job `96985` under
-`runs/pair_transition_ragged_hotspot_fast_20260703_085818_6dee304` for the two
-real sorted B16 token groups (`40-124` and `136-220`).  Do not promote code from
-this screen until it has both a representative model gate and clear numerical
-guardrails.
+one local MLP is worth integrating now."  The completed H100 canary was job
+`97035`
+(`runs/pair_transition_ragged_hotspot_canary_20260703_091034_dfc5ebd`) for the
+two real sorted B16 token groups (`40-124` and `136-220`):
+
+| token group | valid-pair efficiency | padded transition | compact compute only | gather + compute | gather + compute + scatter | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `40-124` | 48.6% | 0.954 ms | 0.482 ms (`1.98x`) | 0.559 ms (`1.71x`) | 0.634 ms (`1.50x`) | useful isolated signal |
+| `136-220` | 67.0% | 2.905 ms | 1.944 ms (`1.49x`) | 2.270 ms (`1.28x`) | 2.548 ms (`1.14x`) | too small alone |
+
+All variants matched the padded result on valid pairs.  The result is positive,
+but not a direct 10x lever: this transition MLP is only a fraction of each
+pairformer block, and inserting one compact island would add gather/scatter
+traffic around kernels that still consume padded pair tensors.  Keep this as
+evidence for a future larger ragged pairformer boundary, not as a promoted
+single-module optimization.
 
 ## Negative results worth remembering
 
@@ -2563,8 +2607,9 @@ Production code touched by the throughput stack:
   pairformer `Transition` input-projection fusion.
 - `protenix/model/modules/transformer.py`: token/atom key-mask plumbing for
   padded mixed-length batching, masked atom-to-token aggregation, local-attention
-  bias fusion, and attention/transition residual fusion hooks plus guarded
-  transition input-projection fusion.
+  bias fusion, cached step-invariant diffusion pair-bias projection, and
+  attention/transition residual fusion hooks plus guarded transition
+  input-projection fusion.
 - `protenix/model/modules/local_attention_triton.py`: narrow Triton atom local
   attention forward kernel, including optional local-attention gate fusion.
 - `protenix/model/modules/local_attention_bias_triton.py`: fused LayerNorm +
@@ -2586,7 +2631,8 @@ Production code touched by the throughput stack:
 - `protenix/model/modules/confidence.py` and `protenix/model/protenix.py`:
   confidence-logit chunk iteration, streaming summary consumption, and the
   mixed-token diffusion sampler that pads/masks conditioning, token-transformer,
-  and atom-transformer activations across records.
+  and atom-transformer activations across records while reusing diffusion
+  transformer pair biases across denoising steps.
 - `runner/campaign_inputs.py`, `runner/inference.py`,
   `runner/batch_inference.py`, and `configs/configs_inference.py`: public
   campaign inference batching.  The CLI length-sorts raw campaign records before

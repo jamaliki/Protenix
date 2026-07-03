@@ -879,7 +879,16 @@ class Protenix(nn.Module):
         _sync_cuda_for_timing(sync_timings)
         step_start = time.time()
         token_mask = _make_token_mask(token_counts, max_tokens, device)
-        cache_pair_bias = _env_flag_enabled("PROTENIX_CACHE_DIFFUSION_PAIR_BIAS")
+        # z and the token mask are invariant across the denoising loop, but the
+        # diffusion transformer normally re-projects them into one attention
+        # bias per block on every step.  Caching spends GPU memory once, then
+        # removes that projection/repeat traffic from the remaining steps.  It
+        # is useful for normal N_step=200 inference, but a one-step scout has
+        # no reuse window and should not build the cache by default.
+        cache_pair_bias = (
+            N_step > 1
+            and _env_flag_enabled_by_default("PROTENIX_CACHE_DIFFUSION_PAIR_BIAS")
+        )
         pair_bias_cache: Optional[list[torch.Tensor]] = None
         caches = [
             self._prepare_diffusion_cache(feature_dict, z_i)
