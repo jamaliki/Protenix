@@ -40,17 +40,6 @@ START_RE = re.compile(r"TIMED_START worker=(?P<worker>\d+) repeat=(?P<repeat>\d+
 DONE_RE = re.compile(r"TIMED_DONE worker=(?P<worker>\d+) repeat=(?P<repeat>\d+)")
 
 
-def str_bool(value: str | bool) -> bool:
-    if isinstance(value, bool):
-        return value
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "y", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "n", "off"}:
-        return False
-    raise argparse.ArgumentTypeError(f"expected boolean, got {value!r}")
-
-
 def configure_logging(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
@@ -68,6 +57,27 @@ def configure_logging(path: Path) -> None:
 def set_steps(runner: Any, n_step: int) -> None:
     runner.configs.sample_diffusion.N_step = n_step
     runner.model.configs.sample_diffusion.N_step = n_step
+
+
+def set_output_dir(runner: Any, path: Path) -> None:
+    """Move Protenix's stateful dumper before each measured pass.
+
+    ``InferenceRunner`` captures ``dump_dir`` inside both ``runner`` and its
+    ``DataDumper`` at construction time.  Reusing that directory after warmup
+    lets Protenix skip or overwrite already-produced outputs, which measures
+    filesystem bookkeeping instead of model work.  Retargeting all three pieces
+    keeps warmup and timed repeats independent while preserving one loaded
+    model per worker.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    runner.configs.dump_dir = str(path)
+    runner.dump_dir = str(path)
+    runner.error_dir = str(path / "ERR")
+    Path(runner.error_dir).mkdir(parents=True, exist_ok=True)
+    runner.init_dumper(
+        need_atom_confidence=runner.configs.need_atom_confidence,
+        sorted_by_ranking_score=runner.configs.sorted_by_ranking_score,
+    )
 
 
 def make_runner(args: argparse.Namespace, worker_dir: Path) -> Any:
@@ -116,6 +126,7 @@ def worker_main(
         logging.info("WORKER_INIT worker=%s pid=%s", worker, os.getpid())
         runner = make_runner(args, worker_dir)
         set_steps(runner, args.warmup_step)
+        set_output_dir(runner, worker_dir / "warmup_predictions")
         runner.configs.seeds = [args.seed + 10_000 + worker]
         logging.info("WARMUP_START worker=%s", worker)
         infer_predict(runner, runner.configs)
@@ -127,6 +138,7 @@ def worker_main(
         for repeat in range(args.repeats):
             runner.configs.seeds = [args.seed + 100_000 * repeat + worker]
             set_steps(runner, args.n_step)
+            set_output_dir(runner, worker_dir / f"timed_predictions_r{repeat}")
             barrier.wait(timeout=args.barrier_timeout_sec)
             start_epoch = time.time()
             start_perf = time.perf_counter()
@@ -235,8 +247,16 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     wall_sec = end - start
     parsed_records = sum(row["timed_items"] for row in parsed)
     configured_records = args.workers * args.repeats * args.records_per_campaign
-    records = parsed_records or configured_records
-    generated = records * args.n_sample
+    if parsed_records != configured_records:
+        return {
+            "ok": False,
+            "args": vars(args),
+            "workers": parsed,
+            "timed_records": parsed_records,
+            "configured_records": configured_records,
+            "error": "timed model logs did not cover the expected records",
+        }
+    generated = parsed_records * args.n_sample
     predict_sec = sum(row["predict_sec"] for row in parsed)
     return {
         "ok": True,
@@ -245,7 +265,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         "start_utc": dt.datetime.fromtimestamp(start, dt.timezone.utc).isoformat(),
         "end_utc": dt.datetime.fromtimestamp(end, dt.timezone.utc).isoformat(),
         "wall_sec": wall_sec,
-        "timed_records": records,
+        "timed_records": parsed_records,
         "configured_records": configured_records,
         "generated_samples": generated,
         "wall_samples_per_sec": generated / wall_sec,
