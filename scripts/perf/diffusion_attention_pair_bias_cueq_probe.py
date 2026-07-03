@@ -4,17 +4,19 @@
 The promoted low-sample diffusion path currently does this in Python/PyTorch:
 
 1. project q/k/v from the normalized token activation;
-2. project pair ``z`` to per-head attention bias with a 1x1 ``conv2d``;
+2. use the diffusion module's once-normalized pair ``z`` and project it to
+   per-head attention bias with a 1x1 ``conv2d``;
 3. repeat that bias over diffusion samples;
 4. run cuDNN/SDPA;
 5. apply the attention gate and output projection.
 
-CUEQ 0.10 ships an ``attention_pair_bias`` primitive for this exact algebra.
-If it can keep cuDNN-class attention speed while folding the pair-bias/gate/out
-boundary, it is a legitimate "meat of the problem" candidate.  If it loses,
-the reason is also useful: Protenix's diffusion head dimension is 48, while the
-CUEQ docs say the fastest path prefers head dimensions that are multiples of
-32.
+CUEQ 0.10 ships an ``attention_pair_bias`` primitive for closely related
+algebra.  One important difference is where LayerNorm happens.  Production
+``enable_efficient_fusion`` normalizes ``z`` once before the 24-block diffusion
+transformer; each block then applies only its own per-head projection scale.
+CUEQ's primitive always normalizes inside the primitive, so replacing the full
+boundary would move normalization back inside every block.  That can still be
+worth screening, but it is not a free wrapper swap.
 
 This is only a hotspot screen.  A win here must still pass the full
 mixed-sequence ``N_sample=5``, ``N_step=200`` inference gate before promotion.
@@ -153,7 +155,7 @@ def _make_inputs(args: argparse.Namespace) -> dict[str, torch.Tensor]:
         args.tokens,
         args.c_s,
     ).reshape(args.batch * args.samples, args.tokens, args.c_s)
-    z = scale * torch.randn(
+    z_raw = scale * torch.randn(
         args.batch,
         args.tokens,
         args.tokens,
@@ -161,12 +163,20 @@ def _make_inputs(args: argparse.Namespace) -> dict[str, torch.Tensor]:
         device="cuda",
         dtype=dtype,
     )
+    # DiffusionModule.forward does this once before entering the transformer
+    # when enable_efficient_fusion=True.  AttentionPairBias.standard_multihead_
+    # attention then folds each block's scale-only LayerNorm into the 1x1
+    # projection.  Keep the same convention in the baseline timing.
+    z_norm = F.layer_norm(z_raw.float(), (args.c_z,), weight=None, bias=None).to(
+        dtype=dtype
+    )
     token_mask_record = _token_mask(args.batch, args.tokens, args.valid_fraction)
     return {
         "a": a.contiguous(),
         "s": s.contiguous(),
-        "z": z.contiguous(),
-        "z_channel_first": z.permute(0, 3, 1, 2).contiguous(),
+        "z_raw": z_raw.contiguous(),
+        "z_norm": z_norm.contiguous(),
+        "z_channel_first": z_norm.permute(0, 3, 1, 2).contiguous(),
         "token_mask_record": token_mask_record,
         "token_mask_flat": _flatten_mask(token_mask_record, args.samples),
     }
@@ -345,7 +355,7 @@ def main() -> None:
                 current_q,
                 current_k,
                 current_v,
-                inputs["z"],
+                inputs["z_raw"],
                 inputs["token_mask_record"],
                 layernorm_z_bias,
                 return_z_proj=False,
@@ -359,7 +369,7 @@ def main() -> None:
                 q,
                 k,
                 v,
-                inputs["z"],
+                inputs["z_raw"],
                 inputs["token_mask_record"],
                 layernorm_z_bias,
                 return_z_proj=False,

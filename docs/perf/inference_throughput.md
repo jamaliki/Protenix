@@ -804,6 +804,42 @@ pair-bias projection, attention, gate, and output projection, but must be
 screened because Protenix's diffusion head dimension is `48` and CUEQ documents
 its fastest path for head dimensions that are multiples of `32`.
 
+That CUEQ `attention_pair_bias` screen was rejected.  Probe commit `514ab88`
+added `scripts/perf/diffusion_attention_pair_bias_cueq_probe.py`; follow-up
+commits `a28fb39`, `da86115`, and `bfdfce7` made the screen robust enough to
+isolate native CUEQ failures.  There are three useful lessons:
+
+1. The production efficient-fusion convention matters.  `DiffusionModule`
+   normalizes `z_pair` once before the 24-block transformer with a no-scale,
+   no-bias LayerNorm, then each block's 1x1 `conv2d` applies only that block's
+   learned per-head scale.  CUEQ's full `attention_pair_bias` primitive always
+   performs LayerNorm inside the primitive, so replacing the full wrapper would
+   move normalization back inside every block.
+2. CUEQ 0.10's pair-bias Triton kernel cannot compile Protenix's no-offset
+   LayerNorm call directly: weight is present but bias is `None`, and the
+   kernel still reads the bias pointer.  Passing an explicit zero bias is
+   mathematically equivalent and fixes that compilation issue in the probe.
+3. After the zero-bias workaround, the CUEQ wrapper still fails its internal
+   SDPA call on our H100/PyTorch 2.11/CUDA 13 stack with
+   `cuDNN Frontend error: No valid execution plans built`.  Setting the probe's
+   `--disable-cudnn-sdpa` flag did not help because the CUEQ wrapper opens its
+   own `sdpa_kernel` context.  The failure appears at both actual Protenix
+   head dimension `48` and a diagnostic head dimension `32`.
+
+Representative isolated results:
+
+| job/run | case | result | decision |
+| --- | --- | --- | --- |
+| `96780`, `runs/cueq_attention_pair_bias_isolated_20260703_062404_a28fb39` | forced PyTorch fallback CUEQ after q/k/v, `N=124` | `1.165 ms` after q/k/v versus baseline full `0.645 ms`; no native kernel | reject fallback |
+| `96782`, `runs/cueq_attention_pair_bias_zerobias_20260703_062642_da86115` | zero-bias native CUEQ, `N=124/220`, head_dim `48` | pair-bias kernel compiles, then internal CUEQ SDPA fails with no cuDNN plan | reject wrapper |
+| `96782` | zero-bias native CUEQ, diagnostic head_dim `32` | same internal SDPA no-plan failure | not a head_dim-48-only issue |
+| `96787`, `runs/cueq_attention_pair_bias_no_cudnn_20260703_062842_bfdfce7` | zero-bias CUEQ with global cuDNN SDPA disabled | same CUEQ internal no-plan failure | no model integration |
+
+Do not add a production CUEQ `attention_pair_bias` path unless the package
+exposes a way to call only the fused pair-bias projection while using
+Protenix's existing SDPA fallback policy, or unless the CUEQ wrapper itself
+learns to handle cuDNN frontend plan failures.
+
 A later scoped-pairformer trace, job `96710`
 (`runs/profile_b16_mixed_n20_d9b8cab_20260703_051515`), added
 `record_function` ranges around the pairformer block internals.  It confirmed
@@ -2196,6 +2232,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Raising mixed-token `N_sample=5` batch size from 16 to 32 | current full gate slowed from `3.64` to `2.93` generated samples/s because pairformer and diffusion transformer ran on a much larger padded physical shape | bigger batches only help when bucketing keeps token ranges tight; memory headroom alone is not a throughput argument |
 | Lowering mixed-token `N_sample=5` batch size from 16 to 8 | current full gate slowed from `3.56` to `3.0-3.1` generated samples/s because diffusion/atom work split into four smaller launch groups | tighter token ranges are useful only if the saved padding beats the lost batching efficiency |
 | Materializing pairformer token-attention bias as contiguous `[B, H, Q, K]` | traced pairformer SDPA shape `[16, 16, 124, 24]` moved from math-dispatch attempt to a cuDNN frontend "no valid execution plans" error; fallback timing then segfaulted in the isolated screen | the non-contiguous bias layout is not the only blocker; head_dim 24 plus dense additive bias lacks a safe cuDNN plan in this runtime, so do not pay a bias copy hoping for a backend flip |
+| CUEQ `attention_pair_bias` for diffusion token attention | native pair-bias projection needed an explicit zero LayerNorm bias, then CUEQ's internal SDPA failed with `No valid execution plans built`; forced PyTorch fallback was slower than the current full conv2d+SDPA baseline | CUEQ's wrapper is not a drop-in win here; use it only if we can call a narrower fused pair-bias producer while keeping Protenix's SDPA fallback policy |
 | Reusing Triton `TriAttentionFunction` for pairformer token attention | isolated `N=220` hotspot improved, but the full mixed-sequence gate averaged only `45.16s -> 44.89s` predict (`+0.6%`) and one repeat regressed | padding `D=24` to `D=32` and copying layouts is too much integration overhead; if revisited, write a direct dense-bias `D=24` kernel instead |
 | `torch.compile` around the diffusion-token transformer | isolated 24-block screens improved `1.29-1.34x`; the first model gate failed in a cuDNN SDPA plan, and the safer no-cuDNN-SDPA gate was flat/slower (`44.59 -> 44.92s`, repeat `43.87 -> 43.95s`) | block-level fusion remains attractive, but a generic Inductor wrapper does not move the real campaign path |
 | Fused self-attention `q/k/v/g` projection | exact parity but trunk block slowed from about 14.1 ms to 14.9 ms | fewer launches are not enough if the wider GEMM/cache/layout is worse |
