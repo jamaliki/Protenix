@@ -647,13 +647,25 @@ Mining the trace metadata showed the remaining `aten::native_layer_norm` calls
 are not unsupported BF16 shapes; they are FP32 diffusion-token shapes such as
 `[80, 124, 768]`, `[80, 124, 384]`, `[80, 220, 768]`, and `[80, 220, 384]`
 with last-dimension-contiguous strides.  That explains why the conservative
-default (`auto`) is slower than the earlier `PROTENIX_TRITON_LAYER_NORM=1`
-forced run: `auto` leaves FP32 on PyTorch.  A paired N200 gate,
-job `96214`
-(`runs/layer_norm_force_fp32_gate_n200_20260702_235207_88afbbe`), is queued to
-compare default `auto` against forced-all Triton LayerNorm in the same job.  Do
-not promote FP32 LayerNorm by default unless that gate beats the conservative
-default cleanly; the isolated FP32 microbenchmarks were mixed.
+default (`auto`) can be slower than the earlier `PROTENIX_TRITON_LAYER_NORM=1`
+forced run: `auto` leaves FP32 on PyTorch.
+
+An initial paired N200 gate, job `96214`
+(`runs/layer_norm_force_fp32_gate_n200_20260702_235207_88afbbe`), compared
+default `auto` against forced-all Triton LayerNorm in one job:
+
+| case | predict sec | generated samples/s | pairformer | diffusion | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `auto` first, fresh Triton cache | 72.22 | 2.215 | 20.05 | 41.30 | 9.45 | not a fair baseline; likely paid first-use Triton compile/load overhead |
+| `force_all` second | 58.53 | 2.734 | 16.10 | 37.62 | 2.56 | promising but order/cache-confounded |
+
+This result is not enough to promote FP32 LayerNorm by default because the
+faster case ran second after the low-precision Triton kernels had already been
+compiled/loaded.  Warmed-cache gates `96218` on `gpu-canary` and `96219` on the
+main `gpu` partition were submitted to prewarm both policies, then measure
+`force_all` first and `auto` second.  Do not promote FP32 LayerNorm by default
+unless one of those warmed gates beats the conservative default cleanly; the
+isolated FP32 microbenchmarks were mixed.
 
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`
@@ -1899,10 +1911,10 @@ Profiling and reproducibility helpers:
 Do not expect another large gain from config changes.  The next proper
 same-output campaign should be one of:
 
-1. finish queued job `96214`, the paired default-`auto` versus forced-all
-   LayerNorm N200 gate.  If forced-all wins cleanly, consider a narrower policy
-   that enables Triton for the observed large-row FP32 diffusion-token
-   LayerNorms without enabling every FP32 shape;
+1. finish queued warmed-cache jobs `96218`/`96219`, the paired default-`auto`
+   versus forced-all LayerNorm N200 gate.  If forced-all wins cleanly, consider
+   a narrower policy that enables Triton for the observed large-row FP32
+   diffusion-token LayerNorms without enabling every FP32 shape;
 2. a deliberate atom/trunk kernel-layout rewrite, especially around producers
    feeding attention kernels;
 3. a confidence-pairformer precision/tiling campaign with explicit numerical
