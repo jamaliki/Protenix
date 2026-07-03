@@ -743,6 +743,28 @@ subtotal was slightly slower.  The opt-in model hook was therefore removed.
 Future work on this boundary should be explicit kernel/epilogue fusion, not a
 generic `torch.compile` wrapper.
 
+CUDA graph follow-up: job `96799`
+(`runs/diffusion_transformer_cudagraph_20260703_063822_b9023d0`) tested a
+narrower replay-only version of the same diffusion-token transformer boundary.
+The goal was to separate real Python/launch overhead from the cost of copying
+changing denoising-step inputs into graph-static buffers.  The probe captures
+the 24-block transformer once, then measures both pure `graph.replay()` and
+`copy_(a,s,z) + graph.replay()` against eager PyTorch in the same process.
+
+| shape | eager | graph replay only | graph with changed-input copies | decision |
+| --- | ---: | ---: | ---: | --- |
+| `B=16`, `N_sample=5`, `N_token=124` | 33.45 ms | 31.21 ms (`1.072x`) | 31.28 ms (`1.070x`) | low-priority |
+| `B=16`, `N_sample=5`, `N_token=220` | 73.73 ms | 71.85 ms (`1.026x`) | 72.01 ms (`1.024x`) | reject for now |
+
+The graph path was exactly equal to eager for these deterministic inputs.  The
+copies were not the limiter; the issue is ceiling.  The current representative
+gate spends roughly `14s` of `44s` in the diffusion transformer, so even a
+perfectly integrated transformer-only graph would be expected to save well
+under 2% end to end on the long padded batches that dominate the campaign.  A
+larger graph over conditioning, atom encode/decode, and the diffusion update
+could be revisited, but the narrow transformer graph is not enough to justify
+model-level graph machinery.
+
 Current promoted trace: job `96456`
 (`runs/current_batched_profile_n20_20260703_031951_3d1adcd`) profiled the
 actual `runner/batch_inference.py` campaign path after the atom-attention
@@ -2252,7 +2274,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Logical ending-node triangle attention without explicit pair transposes | bitwise exact one-block screen but only `1.0076-1.0089x` at B32/B64/B96 | explicit pair-tensor orientation copies are measurable but not the dominant pairformer boundary |
 | Default BF16 full-token attention after the promoted stack | isolated trunk-attention hotspot improved, but full exact-shape gates moved only +0.16% at B64 and +0.27% at B96 | do not promote dtype-policy changes unless the representative throughput gate moves, not just the local kernel |
 | Inference DataLoader workers for exact-shape batches | B8 had a small screen win, but B32 hit tensor-sharing failures unless switched to slower file-system sharing; clean B32 no-worker batching was better | do not add host-pipeline complexity unless it survives the actual many-input gate |
-| CUDA graph capture of the denoiser | slower in this setup | graph overhead/constraints can outweigh launch savings |
+| CUDA graph replay of the diffusion-token transformer | exact and mildly faster in isolation (`1.07x` at `N=124`, `1.02x` at `N=220`), but the long-shape ceiling is under 2% e2e | launch overhead is not the meat of the remaining transformer bottleneck; revisit only as part of a larger full-denoising graph |
 | Merging campaign JSONs before preprocessing | 64-file directory gate moved only from 197.54 s to 195.70 s (`1.009x`) and worsened preprocessing failure granularity | the remaining e2e gap is not mainly per-file JSON preprocessing |
 | Naive padded mixed-shape pairformer batching | valid-region differences accumulated over 48 blocks: FP32 `s/z` mean abs `0.012/0.006`, BF16 `0.236/0.168` for 245 -> 384 tokens | do not claim bitwise parity; the promoted path masks all token readers, sorts by length to reduce physical-shape drift/waste, and keeps exact mode available |
 
