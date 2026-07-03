@@ -680,6 +680,40 @@ probe as evidence that block-level fusion is attractive, but do not enable
 `torch.compile` in the production path until the compiled SDPA backend is
 controlled or replaced.
 
+Narrow transition compile follow-up: job `96429`
+(`runs/diffusion_transition_compile_probe_20260703_025244_ce590b5`) tested the
+feed-forward transition boundary only, leaving SDPA eager:
+
+```text
+ConditionedTransitionBlock(attn_out, s) + attn_out
+```
+
+That avoids the invalid compiled-cuDNN-SDPA failure above.  The isolated H100
+screen used the promoted/default BF16 path and the actual flattened
+low-sample campaign shapes `[B * N_sample, N_token, C] = [80, N, 768]`:
+
+| shape | eager boundary | compiled boundary | speedup | parity |
+| --- | ---: | ---: | ---: | --- |
+| `N_token=124`, mode `default` | 0.365 ms | 0.295 ms | 1.24x | max abs 0.03125 |
+| `N_token=220`, mode `default` | 0.588 ms | 0.473 ms | 1.24x | max abs 0.03125 |
+| `N_token=124`, mode `reduce-overhead` | 0.364 ms | 0.307 ms | 1.19x | max abs 0.03125 |
+| `N_token=220`, mode `reduce-overhead` | 0.593 ms | 0.496 ms | 1.19x | max abs 0.015625 |
+
+This is a real sub-block win, but the ceiling is modest because the transition
+is only part of the 24-block diffusion transformer.  The follow-up model change
+adds an opt-in hook:
+
+```bash
+export PROTENIX_COMPILE_DIFFUSION_TRANSITION=1
+export PROTENIX_COMPILE_DIFFUSION_TRANSITION_MODE=default
+```
+
+The hook compiles only full-token diffusion transition blocks in CUDA no-grad
+eval mode with identity DropPath.  It deliberately excludes atom-local
+transformer blocks and all SDPA calls.  Status: validation pending; promote it
+only if the representative mixed-sequence `N_sample=5`, `N_step=200` gate moves
+the diffusion-transformer subtotal in the intended direction.
+
 Launch-level follow-up: job `96110`
 (`runs/flat_bf16_batch_profile_20260702_221601_c8a532d`) proved the profiler
 wrapper needed to catch `SystemExit` before exporting artifacts.  Corrected job

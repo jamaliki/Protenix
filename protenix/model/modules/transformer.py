@@ -143,6 +143,19 @@ def fused_transition_input_projection_enabled() -> bool:
     }
 
 
+def compile_diffusion_transition_enabled() -> bool:
+    return os.getenv("PROTENIX_COMPILE_DIFFUSION_TRANSITION", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
+def diffusion_transition_compile_mode() -> str:
+    return os.getenv("PROTENIX_COMPILE_DIFFUSION_TRANSITION_MODE", "default")
+
+
 class AttentionPairBias(nn.Module):
     """
     Implements Algorithm 24 in AF3
@@ -497,6 +510,53 @@ class DiffusionTransformerBlock(nn.Module):
         self.drop_path = (
             DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
         )
+        self._compiled_transition_plus_residual: list[Callable] = []
+
+    def _can_compile_transition(
+        self,
+        a: torch.Tensor,
+        n_queries: Optional[int],
+        n_keys: Optional[int],
+    ) -> bool:
+        """Keep the experimental compile boundary away from SDPA/local attention.
+
+        Whole-transformer compilation is attractive in isolated screens, but it
+        failed a real model gate when Inductor rewrote SDPA into an invalid
+        cuDNN plan.  This guard tests only the feed-forward transition after the
+        attention result is materialized.  Atom-local transformer blocks pass
+        ``n_queries``/``n_keys`` and stay eager.
+        """
+        return (
+            compile_diffusion_transition_enabled()
+            and not self.training
+            and not torch.is_grad_enabled()
+            and a.is_cuda
+            and n_queries is None
+            and n_keys is None
+            and isinstance(self.drop_path, nn.Identity)
+            and hasattr(torch, "compile")
+        )
+
+    def _compiled_transition(self) -> Callable:
+        if self._compiled_transition_plus_residual:
+            return self._compiled_transition_plus_residual[0]
+
+        wrapper = _TransitionPlusResidual(self.conditioned_transition_block)
+        # ``dynamic=False`` deliberately specializes to each padded token
+        # bucket.  Campaign inference reuses a small number of bucket shapes over
+        # hundreds of denoising steps, so paying one compile per shape can be
+        # worthwhile if the representative gate confirms it.
+        compiled = torch.compile(
+            wrapper,
+            mode=diffusion_transition_compile_mode(),
+            dynamic=False,
+        )
+        # Keep the compiled callable out of PyTorch module registration.
+        # Registering it would duplicate the wrapped transition weights in
+        # state_dict() after opt-in inference, even though this cache is only an
+        # execution artifact.
+        self._compiled_transition_plus_residual.append(compiled)
+        return compiled
 
     def forward(
         self,
@@ -572,7 +632,13 @@ class DiffusionTransformerBlock(nn.Module):
                 attn_out += a
             else:
                 attn_out = attn_out + a
-        if (
+        if self._can_compile_transition(
+            attn_out,
+            n_queries=n_queries,
+            n_keys=n_keys,
+        ):
+            out_a = self._compiled_transition()(attn_out, s)
+        elif (
             fused_transition_residual_enabled()
             and not self.training
             and isinstance(self.drop_path, nn.Identity)
@@ -893,6 +959,23 @@ class ConditionedTransitionBlock(nn.Module):
         else:
             a = fused_sigmoid_mul(gate, projected)
         return a
+
+
+class _TransitionPlusResidual(nn.Module):
+    """Compile target for the diffusion transition boundary.
+
+    The wrapper includes the residual add because that is the actual block
+    boundary in inference.  Compiling the smaller ``ConditionedTransitionBlock``
+    alone would save some elementwise launches but leave a separate residual
+    read/write immediately afterwards.
+    """
+
+    def __init__(self, block: ConditionedTransitionBlock) -> None:
+        super().__init__()
+        self.block = block
+
+    def forward(self, a: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        return self.block(a=a, s=s, residual=a)
 
 
 class AtomAttentionEncoder(nn.Module):
