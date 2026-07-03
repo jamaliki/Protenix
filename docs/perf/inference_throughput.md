@@ -1116,6 +1116,49 @@ keep the branch as an audit trail, but do not merge it into `main`.  The lesson
 is the same as above: a local subrange win is only a hypothesis until the
 measured full-workload subtotal moves in the expected direction.
 
+The current stack was retested after the later triangle-attention and BF16
+diffusion promotions because the pair-transition boundary is still about one
+fifth of a B16/N220 Pairformer block.  Job `96871`
+(`runs/pair_transition_current_hotspot_20260703_073500_cec3101`) reproduced the
+isolated transition win at the actual B16 padded buckets:
+
+| shape | default transition | transition input fusion | local result |
+| --- | ---: | ---: | --- |
+| `B=16`, `N=124` | 1.053 ms | 0.859 ms | 1.23x transition |
+| `B=16`, `N=220` | 3.218 ms | 2.617 ms | 1.23x transition |
+
+The paired `PairformerBlock` screen, job `96884`
+(`runs/pair_transition_block_flag_gate_20260703_074144_cec3101`), showed the
+expected small block-level ceiling:
+
+| shape | default block | transition flags block | default transition | flagged transition |
+| --- | ---: | ---: | ---: | ---: |
+| `B=16`, `N=124` | 4.91-4.93 ms | 4.71 ms | 0.996-0.997 ms | 0.806 ms |
+| `B=16`, `N=220` | 14.91-14.95 ms | 14.27-14.36 ms | 3.062 ms | 2.464 ms |
+
+That was still not enough to promote.  A representative full mixed-token gate,
+job `96889`
+(`runs/transition_flags_trunkexact_gate_n200_20260703_074435_cec3101`), used
+the 32-record, 40-220-token, `N_sample=5`, `N_step=200`, `batch_size=16`
+campaign with confidence enabled.  To avoid repeating the old broad-elementwise
+failure, the candidate enabled transition input fusion but set
+`PROTENIX_TRITON_FUSED_ELEMENTWISE_MIN_ELEMENTS=100000000`, so only the huge
+pair-transition elementwise consumer should pass the size guard:
+
+| setting | predict sec | generated samples/s | pairformer | diffusion | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| default auto | 44.880 | 3.565 | 15.713 | 24.486 | 2.531 | control |
+| transition flags | 44.710 | 3.579 | 15.338 | 24.727 | 2.545 | flat |
+| default auto repeat | 44.190 | 3.621 | 15.685 | 23.914 | 2.504 | control |
+| transition flags repeat | 44.770 | 3.574 | 15.362 | 24.797 | 2.528 | reject |
+
+Decision: reject pair-transition input fusion as a default for the practical
+mixed-token gate.  It consistently moves the intended pairformer subrange, but
+the full run gives that back in diffusion and scheduling noise; mean predict
+time was `44.54s` for default auto versus `44.74s` with transition flags.  A
+future transition kernel would need to fuse the output/residual boundary or
+otherwise reduce more than the input-projection epilogue to matter end to end.
+
 Another narrow epilogue branch, `codex/transition-addmm-residual`, tried to
 fold the pairformer transition residual add into the final transition GEMM with
 `torch.addmm(beta=1)`.  This was the right kind of small boundary experiment:
@@ -1487,7 +1530,16 @@ content.  The problem is that cuDNN SDPA, CUEQ, and related matmul reductions ar
 not bitwise invariant to padded physical length.  The runner therefore exposes
 masked padded-token batching as the default throughput path for campaign runs,
 with `--batch_mode exact --batch_size 1` remaining available for strict
-singleton/parity debugging.
+singleton/parity debugging.  The intermediate `--batch_mode trunk_exact
+--batch_size 16` mode was measured in job `96889` on the same 32-record,
+40-220-token, `N_sample=5`, `N_step=200` gate: it preserves the pairformer
+trunk's real physical token length for each record and still batches the
+diffusion tail, but predict time was `100.77s` (`1.588` generated samples/s)
+versus `44.19-44.88s` (`3.57-3.62` generated samples/s) for default padded
+`auto`.  That makes `trunk_exact` a correctness/audit escape hatch, not the
+throughput default.  A true exact-and-fast mixed-token solution needs a ragged
+pairformer schedule or custom kernels that reduce over each sequence's real
+length while sharing launches across records.
 
 ## Reproducing the benchmark
 

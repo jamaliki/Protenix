@@ -172,7 +172,10 @@ token counts, use `--batch_mode trunk_exact --batch_size 16`.  This keeps the
 pairformer trunk at each record's real token length and then batches the
 diffusion tail.  It is slower than `auto`, but it is the right compromise when
 you want mixed-length batching without changing the largest trunk reduction
-boundary.
+boundary.  On the 32-record, 40-220-token, `N_sample=5`, `N_step=200` H100 gate,
+`trunk_exact` was about `100.8s` predict time versus `44-45s` for default
+padded `auto`, so treat it as a numerical-audit or strict-trunk mode rather
+than the maximum-throughput setting.
 
 For mixed token lengths, input order matters unless records are packed by
 length.  This branch automatically writes a transient length-sorted campaign
