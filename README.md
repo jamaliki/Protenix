@@ -126,6 +126,14 @@ For tightly bucketed or same-shape 245-token `7r6r`-like inputs, `32-64` is the
 practical knee: larger batches consume much more memory but add little
 throughput.  If you hit OOM, try `--batch_size 8`.
 
+The `5-6x` public CLI speedup below is the exact-shape case: every feature
+tensor, including atom-shaped tensors, has the same shape.  Real design
+campaigns often have equal token counts but different atom counts.  Those still
+batch, but the log line will read
+`token-trunk+diffusion-token-atom-batch`, not `exact-model-batch`; the shared
+pairformer trunk then becomes the main cost, so the ceiling is lower than the
+repeated-`7r6r` headline unless the records are also atom-shape identical.
+
 For the common low-sample campaign range (`N_sample=1-5`), leave
 `PROTENIX_BATCH_DIFFUSION_MAX_SAMPLES` at its default `5` so the diffusion tail
 can batch records and samples together.  For maximum throughput on H100, also
@@ -224,6 +232,7 @@ dumping:
 | --- | ---: | ---: | ---: |
 | 32 one-record JSON files in a directory | 342.7 s, 0.093 seq/s | 121.5 s, 0.263 seq/s | 2.82x end to end |
 | One combined JSON with 32 same-shape records | 361.8 s runner time | 69.3 s runner time | 5.2x after initialization |
+| 32 same-token, variable-atom 251-token records | 301.9 s summed predict at `--batch_size 1` | 44.4 s predict, 42.6 s model-forward at `--batch_size 32`; pairformer is 30.1 s | 6.8x predict vs current unbatched path |
 | 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.1 s wall, 29.9 s summed predict, 0.968 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.83x single-process throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 41.6 s, 3.85 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, BF16 diffusion core, BF16 atom attention, Triton local atom attention, default Triton LayerNorm fallback, and cached diffusion pair bias | 5.11x over the old branch boundary |

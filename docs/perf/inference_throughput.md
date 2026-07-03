@@ -161,6 +161,32 @@ The smaller B8 public gate also passed correctness (8 CIFs) but only reached
 `1.9x` wrapper speedup because checkpoint/model initialization dominated such a
 short run.
 
+That exact-shape gate is the best case.  A real design campaign can have the
+same token count but different atom counts; in that case the runner still
+batches the token trunk and the diffusion token/atom/conditioning work, but the
+log line is `token-trunk+diffusion-token-atom-batch`, not `exact-model-batch`.
+The practical ceiling is then set mostly by the shared pairformer trunk, not by
+the atom/diffusion tail.
+
+Issue-shaped same-token, variable-atom gate: job `97763`, run directory
+`runs/same_token_var_atom_valid_gate_20260703_144816_7c7af5b`, one H100,
+commit `7c7af5b`, base checkpoint, 32 one-chain records with `N_token=251`,
+`N_atom=1834-1940`, `N_sample=1`, `N_step=200`, confidence enabled, normal
+CIF/JSON dumping:
+
+| run | inputs | predict sec | seq/s | model-forward sec | pairformer | diffusion | path |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| current unbatched | 32 x B1 | 301.85 | 0.106 | 301.03 | 82.31 | 217.78 | exact singleton calls |
+| same-token variable-atom batch | B32 | 44.42 | 0.720 | 42.57 | 30.07 | 11.69 | `token-trunk+diffusion-token-atom-batch` |
+| same atom count control | B32 | 50.92 | 0.628 | 49.94 | 30.64 | 18.88 | `exact-model-batch` |
+
+The B32 same-token variable-atom case is a `6.8x` predict speedup over the
+current unbatched path, but it is not the same measurement as the public
+repeated-`7r6r` wrapper/runner gate.  If an older build reports roughly
+`78s` model-forward per 32 records on this shape, rebuild from a newer commit
+before interpreting the gap as a missing flag; current optimized code measured
+`42.57s` model-forward on the comparable base-checkpoint gate.
+
 The real campaign shape is often a directory containing one JSON file per
 design.  That used to defeat batching because the runner called
 `infer_predict()` once per file.  The directory path now resolves the whole
@@ -1631,6 +1657,26 @@ attention, do not stop at commuting LayerNorm; the likely larger boundary is a
 contiguous ending-node producer that writes CUEQ's swapped q/k/v and bias
 layouts directly while preserving the current CUEQ attention throughput.
 
+The same idea was re-tested after the real same-token, variable-atom campaign
+issue exposed `B=32, N_token=251, N_sample=1` as an important endpoint.  Job
+`97828`
+(`runs/ending_norm_first_issue_gate_20260703_152626_2a91943`) used commit
+`2a91943` and alternated `PROTENIX_ENDING_ATTENTION_NORM_FIRST=0/1` on the
+32-record, `N_atom=1834-1940`, `N_step=200` issue-shaped gate.  The first
+baseline was cold (`79.19s` predict), so the warmed pair is the useful
+comparison:
+
+| case | predict sec | model-forward sec | pairformer | diffusion | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| norm-first off repeat | 44.98 | 43.152 | 30.123 | 12.234 | 0.795 | baseline repeat |
+| norm-first on repeat | 44.80 | 42.965 | 30.050 | 12.137 | 0.777 | +0.4%, below promotion bar |
+
+Decision: reject again and revert commit `2a91943`.  This is the right
+scientific failure mode: the isolated ending-attention module win is real, but
+commuting only LayerNorm changes the representative full path by less than
+normal gate variance.  The next legitimate triangle-attention attempt needs a
+larger fused producer/consumer boundary.
+
 A more ambitious CUEQ-adjacent producer fusion was then screened without
 touching production.  Commit `7806ec0` added
 `scripts/perf/triangle_attention_packed_projection_probe.py`, which replaces
@@ -2877,7 +2923,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Fused self-attention `q/k/v/g` projection | exact parity but trunk block slowed from about 14.1 ms to 14.9 ms | fewer launches are not enough if the wider GEMM/cache/layout is worse |
 | Fused ordinary self-attention q/k/v projection | hotspot moved the intended `qkv+sdpa+gate+out` subrange, but the full mixed `N_sample=5`, `N_step=200` gate averaged flat/slower (`44.69s -> 44.86s`) and one repeat regressed | producer fusion must still move the full workload; local launch savings can disappear in wider GEMM/layout/cache effects |
 | Cached packed BF16 triangle-attention qkv weight | isolated qkv subrange improved (`B16, N220` qkv projection `0.301 -> 0.290 ms`), but the N200 gate did not move pairformer (`15.717s` off versus `15.672/15.740s` on) | Python-side weight materialization is visible but too small; do not carry a cache path without a clean pairformer subtotal win |
-| Ending-node triangle attention `LN(x).transpose(...)` | ending-attention module screens improved about `21-22%`, but the full mixed `N_sample=5`, `N_step=200` gate was flat/noisy (`44.49 -> 44.23s`, repeat `44.06 -> 44.40s`) and pairformer did not consistently move | channel-wise LayerNorm commutes with the pair-axis transpose, but moving only this boundary is not enough; revisit only as part of a larger contiguous ending-node q/k/v+bias producer |
+| Ending-node triangle attention `LN(x).transpose(...)` | ending-attention module screens improved about `21-22%`, but the full mixed `N_sample=5`, `N_step=200` gate was flat/noisy (`44.49 -> 44.23s`, repeat `44.06 -> 44.40s`), and the issue-shaped same-token variable-atom `B32, N_sample=1` retest was only `44.98 -> 44.80s` predict | channel-wise LayerNorm commutes with the pair-axis transpose, but moving only this boundary is not enough; revisit only as part of a larger contiguous ending-node q/k/v+bias producer |
 | Packed CUEQ triangle-attention q/k/v+gate+bias producer | exact or near-exact isolated screen, but slower on every actual shape: start attention `0.79-0.83x`, ending attention `0.49-0.51x` | one oversized projection plus a custom unpack/scatter loses to separate cuBLAS projections plus narrow Triton layout kernels; do not widen this producer boundary without a vendor-quality fused LayerNorm+GEMM schedule |
 | Fused `AdaptiveLayerNorm` conditioning projections | AdaLN subrange shrank slightly in some hotspot shapes, but full diffusion blocks were flat/slower, e.g. `1.416 -> 1.494 ms` at `N_token=220` | do not carry default-off concatenated-GEMM knobs unless the enclosing block moves |
 | Fused transition `a1/a2` projection without split-aware consumer | transition slowed from about 5.3 ms to 7.0 ms | fusing the producer can break the consumer by creating non-contiguous halves |
