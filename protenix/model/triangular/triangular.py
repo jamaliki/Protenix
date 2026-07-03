@@ -758,7 +758,14 @@ class TriangleAttention(nn.Module):
 
         # The output projection is computed in logical ending orientation
         # [J, I].  Return [I, J] to match the public TriangleAttention contract.
-        return self.mha.linear_o(gated).transpose(-2, -3)
+        out = self.mha.linear_o(gated).transpose(-2, -3)
+        if x.dim() == 3 and out.dim() == 4 and out.shape[0] == 1:
+            # With no explicit leading batch dimension, the CUEQ bias broadcast
+            # can leave a synthetic singleton batch axis.  The public module
+            # contract follows the input rank, so remove only that artificial
+            # axis before the caller performs an in-place residual add.
+            out = out.squeeze(0)
+        return out
 
     def forward(
         self,
