@@ -23,6 +23,7 @@ mixed-sequence ``N_sample=5``, ``N_step=200`` inference gate before promotion.
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import math
 import time
@@ -228,10 +229,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--case",
+        choices=[
+            "all",
+            "baseline_full",
+            "baseline_after_qkv",
+            "cueq_full",
+            "cueq_after_qkv",
+        ],
+        default="all",
+        help=(
+            "Run one row in its own process. Useful because native CUEQ "
+            "segfaults terminate Python before the full JSON summary is written."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
+    faulthandler.enable()
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("diffusion_attention_pair_bias_cueq_probe requires CUDA")
@@ -327,24 +344,38 @@ def main() -> None:
                 return_z_proj=False,
             )
 
-    reference, baseline_ms, baseline_peak = _cuda_time(
-        baseline_full,
-        args.warmup,
-        args.iters,
-    )
-    rows: list[dict[str, Any]] = [
-        {
-            "name": "baseline_full_conv2d_sdpa",
-            "ok": True,
-            "mean_ms": baseline_ms,
-            "peak_allocated_mib": baseline_peak,
-            "output_shape": list(reference.shape),
-            "output_dtype": str(reference.dtype),
-        }
-    ]
-    rows.append(_record("baseline_after_qkv_projection", baseline_after_qkv, args, reference))
-    rows.append(_record("cueq_full", cueq_full, args, reference))
-    rows.append(_record("cueq_after_qkv_projection", cueq_after_qkv, args, reference))
+    rows: list[dict[str, Any]] = []
+    reference: torch.Tensor | None = None
+    if args.case in {"all", "baseline_full", "baseline_after_qkv"}:
+        reference, baseline_ms, baseline_peak = _cuda_time(
+            baseline_full,
+            args.warmup,
+            args.iters,
+        )
+        rows.append(
+            {
+                "name": "baseline_full_conv2d_sdpa",
+                "ok": True,
+                "mean_ms": baseline_ms,
+                "peak_allocated_mib": baseline_peak,
+                "output_shape": list(reference.shape),
+                "output_dtype": str(reference.dtype),
+            }
+        )
+
+    if args.case in {"all", "baseline_after_qkv"}:
+        rows.append(
+            _record(
+                "baseline_after_qkv_projection",
+                baseline_after_qkv,
+                args,
+                reference,
+            )
+        )
+    if args.case in {"all", "cueq_full"}:
+        rows.append(_record("cueq_full", cueq_full, args, reference))
+    if args.case in {"all", "cueq_after_qkv"}:
+        rows.append(_record("cueq_after_qkv_projection", cueq_after_qkv, args, reference))
 
     result = {
         "args": vars(args),

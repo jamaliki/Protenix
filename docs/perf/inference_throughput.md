@@ -776,6 +776,34 @@ were only tens of milliseconds.  The next atom win is therefore not another
 local-attention kernel rewrite; it would need to remove many small launches or
 copies around the atom blocks.
 
+Roofline follow-up: Nsight Compute job `96769`
+(`runs/ncu_roofline_next_bottleneck_20260703_060615_cecf4ae`) captured
+filtered one-H100 launch ranges for the diffusion token transformer and one
+CUEQ pairformer block.  It used NCU's `LaunchStats`, `Occupancy`,
+`SpeedOfLight`, `SpeedOfLight_RooflineChart`, and `MemoryWorkloadAnalysis`
+sections.  The absolute timings are replay-profiler timings, so use these rows
+to classify kernels rather than as end-to-end latency.
+
+| range/kernel | avg duration | memory pipe | DRAM | SM | achieved occupancy | interpretation |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| diffusion `fmha_cutlassF_bf16_aligned_64x64_rf_sm80` | `250.9 us` | `70.1%` | `27.7%` | `54.2%` | `24.3%` | already a strong mixed compute/cache attention kernel; a naive attention replacement is unlikely to win |
+| diffusion skinny NVJET GEMM `512x16...NNT` | `78.0 us` | `84.1%` | `84.1%` | `5.7%` | `13.9%` | HBM dominated skinny GEMM; reduce bytes or fuse the producer/epilogue, do not rewrite as a generic matmul |
+| diffusion BF16 vectorized elementwise | `49.8 us` | `57.5%` | `56.9%` | `10.3%` | `68.2%` | memory-bound launch traffic; standalone Triton elementwise kernels already failed the full gate |
+| pairformer CUEQ `layer_norm_transpose_forward_kernel` | `204.7 us` | `84.5%` | `59.9%` | `48.6%` | `48.4%` | CUEQ layout/normalization boundary is bandwidth limited and still attractive |
+| pairformer CUEQ-adjacent NVJET GEMM `192x192...TNN` | `283.8 us` | `81.2%` | `81.2%` | `27.8%` | `14.8%` | triangle-multiplication wrapper work is HBM dominated |
+| pairformer CUEQ-adjacent NVJET GEMM `128x256...TNN` | `139.2 us` | `80.4%` | `80.4%` | `18.9%` | `14.9%` | same: bytes and layout dominate more than tensor-core math |
+
+The roofline result changes the kernel-design bar.  Broad `torch.compile`,
+generic elementwise fusion, or a monolithic "mega-kernel" that reimplements
+vendor attention/GEMM is not justified: the remaining attention mainloops are
+not the obviously weak link.  The credible next experiments are narrower
+producer/consumer boundaries that remove HBM trips while preserving cuDNN,
+CUEQ, or cuBLAS-class math throughput.  One such screen is CUEQ 0.10's
+`attention_pair_bias` primitive for diffusion token attention: it may fold
+pair-bias projection, attention, gate, and output projection, but must be
+screened because Protenix's diffusion head dimension is `48` and CUEQ documents
+its fastest path for head dimensions that are multiples of `32`.
+
 A later scoped-pairformer trace, job `96710`
 (`runs/profile_b16_mixed_n20_d9b8cab_20260703_051515`), added
 `record_function` ranges around the pairformer block internals.  It confirmed
