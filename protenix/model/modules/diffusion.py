@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import os
-import warnings
 from contextlib import nullcontext
 from typing import Optional, Union
 
@@ -81,30 +80,6 @@ def atom_attention_bf16_enabled() -> bool:
     value = os.getenv("PROTENIX_BF16_ATOM_ATTENTION")
     if value is None or value.strip().lower() in _AUTO_ENV_VALUES:
         return _cuda_bf16_supported()
-    return value.strip().lower() not in _FALSE_ENV_VALUES
-
-
-def compile_diffusion_transformer_enabled() -> bool:
-    """Return whether to `torch.compile` the diffusion token transformer.
-
-    The isolated H100 screen showed a 1.29-1.34x steady-state speedup for the
-    full 24-block flattened low-sample transformer boundary.  Each new token
-    shape still pays substantial Inductor compile time, so this remains opt-in
-    until a representative prewarmed throughput gate proves that real campaigns
-    amortize the cost.
-    """
-
-    value = os.getenv("PROTENIX_COMPILE_DIFFUSION_TRANSFORMER", "0")
-    return value.strip().lower() not in _FALSE_ENV_VALUES
-
-
-def compile_diffusion_transformer_mode() -> str:
-    mode = os.getenv("PROTENIX_COMPILE_DIFFUSION_TRANSFORMER_MODE", "default")
-    return mode if mode else "default"
-
-
-def compile_diffusion_transformer_fullgraph() -> bool:
-    value = os.getenv("PROTENIX_COMPILE_DIFFUSION_TRANSFORMER_FULLGRAPH", "0")
     return value.strip().lower() not in _FALSE_ENV_VALUES
 
 
@@ -445,7 +420,6 @@ class DiffusionModule(nn.Module):
         )
         self.normalize = LayerNorm(c_z, create_offset=False, create_scale=False)
         self._perf_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
-        self._diffusion_transformer_compile_attempted = False
 
     def reset_perf_stats(self) -> None:
         self._perf_events = {}
@@ -481,39 +455,6 @@ class DiffusionModule(nn.Module):
         if not diffusion_core_bf16_enabled() or not torch.cuda.is_available():
             return nullcontext()
         return torch.autocast(device_type="cuda", dtype=dtype)
-
-    def maybe_compile_diffusion_transformer(self) -> None:
-        """Lazily compile the token transformer after checkpoint/device setup.
-
-        Wrapping in ``__init__`` would change checkpoint loading/state-dict
-        behavior.  Delaying until the first inference call keeps normal model
-        construction unchanged while letting Inductor cache the static padded
-        token shapes that repeat across diffusion steps.
-        """
-
-        if self._diffusion_transformer_compile_attempted:
-            return
-        if (
-            not compile_diffusion_transformer_enabled()
-            or self.training
-            or torch.is_grad_enabled()
-            or not hasattr(torch, "compile")
-        ):
-            return
-        self._diffusion_transformer_compile_attempted = True
-        try:
-            self.diffusion_transformer = torch.compile(
-                self.diffusion_transformer,
-                mode=compile_diffusion_transformer_mode(),
-                fullgraph=compile_diffusion_transformer_fullgraph(),
-                dynamic=False,
-            )
-        except Exception as exc:  # pragma: no cover - environment-dependent.
-            warnings.warn(
-                "Could not wrap diffusion transformer with torch.compile; "
-                f"continuing eagerly. Original error: {exc!r}",
-                RuntimeWarning,
-            )
 
     def _atom_attention_autocast(self):
         if not atom_attention_bf16_enabled() or not torch.cuda.is_available():
@@ -682,7 +623,6 @@ class DiffusionModule(nn.Module):
         with self._profile_block("transformer"), torch.profiler.record_function(
             "protenix/diffusion_transformer"
         ):
-            self.maybe_compile_diffusion_transformer()
             with self._diffusion_core_autocast(transformer_dtype):
                 a_token = self.diffusion_transformer(
                     a=a_token,

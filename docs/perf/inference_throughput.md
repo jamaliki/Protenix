@@ -660,6 +660,26 @@ true `D=24` dense-bias kernel that reads the existing layouts directly; reusing
 the triangle-attention kernel through a padded dummy axis is not a meaningful
 end-to-end optimization.
 
+Diffusion-transformer compile follow-up: job `96407`
+(`runs/diffusion_compile_probe_20260703_022616_47460d6`) screened
+`torch.compile` on the exact flattened low-sample diffusion-token transformer
+boundary.  The isolated steady-state result looked real: for the full 24-block
+stack, `N=124` improved `24.29 -> 18.82 ms` (`1.29x`) and `N=220` improved
+`48.35 -> 36.09 ms` (`1.34x`), with BF16-level output differences.  This was
+the right next question because the post-atom profile shows thousands of
+linears, SDPA launches, LayerNorms, sigmoid/gate kernels, residual adds, and
+copy kernels rather than one bad attention implementation.
+
+The actual model integration was rejected.  Commit `9679867` briefly added an
+opt-in lazy compile hook, but the warmed representative gate job `96412`
+(`runs/diffusion_compile_gate_n200_20260703_023303_9679867`) failed in the
+compiled graph before timing: cuDNN frontend could not build a valid execution
+plan for the SDPA call emitted by Inductor.  The diagnostic job was cancelled
+after that failure point, and the model hook was removed.  Keep the isolated
+probe as evidence that block-level fusion is attractive, but do not enable
+`torch.compile` in the production path until the compiled SDPA backend is
+controlled or replaced.
+
 Launch-level follow-up: job `96110`
 (`runs/flat_bf16_batch_profile_20260702_221601_c8a532d`) proved the profiler
 wrapper needed to catch `SystemExit` before exporting artifacts.  Corrected job
@@ -1893,6 +1913,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Generic full-token Triton attention | slower than cuDNN/SDPA | vendor kernels win unless the shape mismatch is severe |
 | Materializing pairformer token-attention bias as contiguous `[B, H, Q, K]` | traced pairformer SDPA shape `[16, 16, 124, 24]` moved from math-dispatch attempt to a cuDNN frontend "no valid execution plans" error; fallback timing then segfaulted in the isolated screen | the non-contiguous bias layout is not the only blocker; head_dim 24 plus dense additive bias lacks a safe cuDNN plan in this runtime, so do not pay a bias copy hoping for a backend flip |
 | Reusing Triton `TriAttentionFunction` for pairformer token attention | isolated `N=220` hotspot improved, but the full mixed-sequence gate averaged only `45.16s -> 44.89s` predict (`+0.6%`) and one repeat regressed | padding `D=24` to `D=32` and copying layouts is too much integration overhead; if revisited, write a direct dense-bias `D=24` kernel instead |
+| `torch.compile` around the diffusion-token transformer | isolated 24-block screen improved `1.29-1.34x`, but the real model gate failed in the compiled graph with a cuDNN frontend "no valid execution plans" error before producing candidate timings | block-level fusion remains attractive, but Inductor's emitted SDPA path is not yet a safe production mechanism for this model boundary |
 | Fused self-attention `q/k/v/g` projection | exact parity but trunk block slowed from about 14.1 ms to 14.9 ms | fewer launches are not enough if the wider GEMM/cache/layout is worse |
 | Fused transition `a1/a2` projection without split-aware consumer | transition slowed from about 5.3 ms to 7.0 ms | fusing the producer can break the consumer by creating non-contiguous halves |
 | Custom Triton transition input GEMM+SiLU | synthetic +12%, but real transition input path slowed from 3.09 ms to 3.54 ms | custom GEMM screens must use real module weights/autocast; cuBLAS efficiency is the bottleneck to match |
