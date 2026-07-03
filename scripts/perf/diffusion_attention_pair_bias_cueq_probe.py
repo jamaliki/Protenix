@@ -231,6 +231,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument(
+        "--disable-cudnn-sdpa",
+        action="store_true",
+        help="Disable cuDNN SDPA before calling CUEQ's internal attention wrapper.",
+    )
+    parser.add_argument(
         "--case",
         choices=[
             "all",
@@ -257,6 +262,11 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    if args.disable_cudnn_sdpa and hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+        # CUEQ's attention_pair_bias wrapper does not catch cuDNN frontend
+        # plan-build failures.  Protenix's own SDPA wrapper does, so keep this
+        # as an explicit diagnostic rather than silently changing defaults.
+        torch.backends.cuda.enable_cudnn_sdp(False)
 
     dtype = _dtype(args.dtype)
     module = _make_module(args)
