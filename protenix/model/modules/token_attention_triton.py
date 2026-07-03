@@ -40,12 +40,23 @@ _SUPPORTED_DTYPES = {torch.bfloat16}
 _HEADS = 16
 _HEAD_DIM = 24
 _PADDED_HEAD_DIM = 32
+_DEFAULT_MIN_TOKENS = 160
 _MAX_TOKENS = 256
 
 
 def triton_token_attention_enabled() -> bool:
     value = os.getenv("PROTENIX_TRITON_TOKEN_ATTENTION", "0")
     return value.lower() not in _FALSE_ENV_VALUES
+
+
+def _min_tokens() -> int:
+    value = os.getenv(
+        "PROTENIX_TRITON_TOKEN_ATTENTION_MIN_TOKENS", str(_DEFAULT_MIN_TOKENS)
+    )
+    try:
+        return max(1, int(value))
+    except ValueError:
+        return _DEFAULT_MIN_TOKENS
 
 
 def _signature(q: torch.Tensor, attn_bias: torch.Tensor) -> tuple:
@@ -79,7 +90,12 @@ def _can_try_token_attention(
         return False
     if q.shape[1] != _HEADS or q.shape[-1] != _HEAD_DIM:
         return False
-    if q.shape[-2] <= 0 or q.shape[-2] > _MAX_TOKENS:
+    # The current reuse path pads/copies D=24 heads to D=32 for the existing
+    # TriAttention kernel.  That overhead is measurable: it lost at N=124 but
+    # won at N=220 in the H100 hotspot screen.  Keep a conservative token gate
+    # so opt-in end-to-end tests exercise only the shape range where the kernel
+    # has evidence of being beneficial.
+    if q.shape[-2] < _min_tokens() or q.shape[-2] > _MAX_TOKENS:
         return False
     if q.dtype not in _SUPPORTED_DTYPES or attn_bias.dtype != q.dtype:
         return False
