@@ -256,6 +256,49 @@ vendor-quality GEMM/attention mainloops while removing a broader producer or
 epilogue boundary; replacing a cuBLAS/cuDNN mainloop with a slower custom matmul
 has already lost more than the fused epilogue could recover.
 
+Triangle-attention follow-up: commit `9476e28` made
+`scripts/perf/triangle_attention_breakdown.py` production-accurate for CUEQ by
+timing `_prep_qkv(..., cueq_heads_first=True)` in the manual split path, and
+added `scripts/perf/submit_tokyo_triangle_attention_ncu.sh` /
+`scripts/perf/tokyo_triangle_attention_ncu.sbatch` for focused module-level NCU
+captures.  The representative issue shape was captured on `gpu-canary-0`:
+
+```bash
+BATCH=32 TOKENS=251 ENDING=false CAPTURE=module \
+  scripts/perf/submit_tokyo_triangle_attention_ncu.sh
+BATCH=32 TOKENS=251 ENDING=true CAPTURE=module \
+  scripts/perf/submit_tokyo_triangle_attention_ncu.sh
+```
+
+Jobs `99100` and `99101` completed in
+`runs/triangle_attention_ncu_module_start_20260703_230949_9476e28` and
+`runs/triangle_attention_ncu_module_end_20260703_230950_9476e28`.  The harness
+confirmed the production helpers were active: q/k/v were contiguous
+`[32, 251, 4, 251, 32]` BF16 tensors, the CUEQ qkv layout helper returned, and
+the triangle-attention gate epilogue returned a contiguous
+`[32, 251, 251, 128]` BF16 tensor.
+
+| module | captured kernel ms | main SDPA | LayerNorm / transpose-related traffic | CUEQ qkv layout | gate epilogue | interpretation |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| starting attention | 7.79 | 3.14 | 1.22 | 1.08 | 0.50 | baseline producer is mostly contiguous; SDPA is the largest single launch |
+| ending attention | 12.67 | 3.15 | about 4.7 across LayerNorm and copy/layout launches | 1.08 | 0.50 | same SDPA, but non-contiguous ending layout makes LN and projections much more expensive |
+
+The paired CUDA-event split without NCU replay was:
+
+| module | module ms | manual ms | largest split subranges |
+| --- | ---: | ---: | --- |
+| starting attention | 7.81 | 7.85 | CUEQ attention 3.15 ms, qkv projection+layout 1.85 ms, LayerNorm 1.26 ms |
+| ending attention | 12.67 | 12.74 | LayerNorm 4.56 ms, CUEQ attention 3.19 ms, qkv projection+layout 2.35 ms, gate projection 0.88 ms, triangle-bias projection 0.80 ms |
+
+Decision: this refines the next triangle-attention target.  Do **not** revisit
+the already-rejected LN-only ending rewrite; it fixed one symptom while leaving
+the qkv/gate/bias projections on a transposed pair layout.  A credible
+ending-attention rewrite must be broader: normalize and project the original
+contiguous `[I, J, C]` pair tensor, then produce the ending-node CUEQ layouts
+with swapped pair axes at the qkv/bias/gate epilogue boundaries.  That preserves
+the cuDNN SDPA mainloop while attacking the measured non-contiguous producer
+traffic.
+
 This is intentionally a measurement hook, not a production path.  The promotion
 bar remains a paired full `N_step=200` same-token variable-atom gate after the
 candidate moves a material pairformer subtotal.
@@ -3111,6 +3154,9 @@ Profiling and reproducibility helpers:
   dense-pair-bias token-attention screen for the pairformer `D=24` head shape.
 - `scripts/perf/triangle_attention_breakdown.py`: per-launch/subrange screen
   for CUEQ triangle attention and its layout/epilogue boundaries.
+- `scripts/perf/submit_tokyo_triangle_attention_ncu.sh` and
+  `scripts/perf/tokyo_triangle_attention_ncu.sbatch`: Tokyo one-H100 Nsight
+  Compute capture for one starting or ending CUEQ triangle-attention module.
 - `scripts/perf/diffusion_pair_bias_cache_probe.py`: tests whether caching the
   step-invariant projected diffusion pair bias for each transformer block can
   remove repeated work across the denoising loop.
