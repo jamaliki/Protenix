@@ -20,7 +20,7 @@ import unittest
 import torch
 
 os.environ["LAYERNORM_TYPE"] = "torch"
-from protenix.model.modules.primitives import Attention
+from protenix.model.modules.primitives import AdaptiveLayerNorm, Attention
 from protenix.model.modules.transformer import AttentionPairBias
 
 
@@ -164,6 +164,31 @@ class TestAttentionPairBias(unittest.TestCase):
                 os.environ.pop("PROTENIX_FUSED_SELF_QKV_PROJECTION", None)
             else:
                 os.environ["PROTENIX_FUSED_SELF_QKV_PROJECTION"] = old
+
+    def test_fused_adaptive_layernorm_projection_matches_separate_projections(
+        self,
+    ) -> None:
+        torch.manual_seed(4)
+        old = os.environ.get("PROTENIX_FUSED_ADAPTIVE_LAYERNORM_PROJECTION")
+        try:
+            module = AdaptiveLayerNorm(c_a=24, c_s=12).to(self.device)
+            module.eval()
+            a = torch.randn(3, 5, 24, device=self.device)
+            # A singleton leading dimension exercises the diffusion-style case
+            # where conditioning is shared across multiple sample lanes.
+            s = torch.randn(1, 5, 12, device=self.device)
+            with torch.no_grad():
+                os.environ["PROTENIX_FUSED_ADAPTIVE_LAYERNORM_PROJECTION"] = "0"
+                ref = module(a=a, s=s)
+                os.environ["PROTENIX_FUSED_ADAPTIVE_LAYERNORM_PROJECTION"] = "1"
+                self.assertTrue(module._can_fuse_s_projection())
+                fused = module(a=a, s=s)
+            torch.testing.assert_close(fused, ref, rtol=2e-3, atol=2e-3)
+        finally:
+            if old is None:
+                os.environ.pop("PROTENIX_FUSED_ADAPTIVE_LAYERNORM_PROJECTION", None)
+            else:
+                os.environ["PROTENIX_FUSED_ADAPTIVE_LAYERNORM_PROJECTION"] = old
 
     def tearDown(self):
         elapsed_time = time.time() - self._start_time

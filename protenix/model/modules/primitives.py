@@ -104,6 +104,17 @@ def fused_self_qkv_projection_enabled() -> bool:
     }
 
 
+def fused_adaptive_layernorm_projection_enabled() -> bool:
+    return os.getenv(
+        "PROTENIX_FUSED_ADAPTIVE_LAYERNORM_PROJECTION", "0"
+    ).lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
 def transition_input_projection_fusion_enabled() -> bool:
     return os.getenv("PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION", "0").lower() not in {
         "0",
@@ -281,6 +292,47 @@ class AdaptiveLayerNorm(nn.Module):
         self.linear_nobias_s = LinearNoBias(
             in_features=c_s, out_features=c_a, initializer="zeros"
         )
+        self._s_projection_cache_key = None
+        self._s_projection_weight = None
+        self._s_projection_bias = None
+
+    def _can_fuse_s_projection(self) -> bool:
+        if not fused_adaptive_layernorm_projection_enabled():
+            return False
+        if self.training or torch.is_grad_enabled():
+            return False
+        if self.linear_s.precision is not None:
+            return False
+        if self.linear_nobias_s.precision is not None:
+            return False
+        return (
+            self.linear_s.weight.shape == self.linear_nobias_s.weight.shape
+            and self.linear_s.weight.shape[0] == self.linear_s.out_features
+        )
+
+    def _s_projection_params(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        weights = (self.linear_s.weight, self.linear_nobias_s.weight)
+        bias = self.linear_s.bias
+        cache_key = (
+            tuple((weight.data_ptr(), weight._version) for weight in weights),
+            None if bias is None else (bias.data_ptr(), bias._version),
+        )
+        if cache_key != self._s_projection_cache_key:
+            # AdaLN uses the same normalized conditioning vector for both the
+            # sigmoid gate and additive offset.  Concatenating the two weights
+            # keeps the GEMM in cuBLAS, but removes one launch and one reread of
+            # the normalized s activation.  The second projection is bias-free,
+            # so append zeros after the gate bias when the gate has one.
+            self._s_projection_weight = torch.cat(weights, dim=0).contiguous()
+            if bias is None:
+                self._s_projection_bias = None
+            else:
+                zeros = torch.zeros(
+                    bias.numel(), dtype=bias.dtype, device=bias.device
+                )
+                self._s_projection_bias = torch.cat((bias, zeros), dim=0)
+            self._s_projection_cache_key = cache_key
+        return self._s_projection_weight, self._s_projection_bias
 
     def forward(self, a: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         """
@@ -296,7 +348,13 @@ class AdaptiveLayerNorm(nn.Module):
         """
         a = self.layernorm_a(a)
         s = self.layernorm_s(s)
-        a = fused_sigmoid_mul_add(self.linear_s(s), a, self.linear_nobias_s(s))
+        if self._can_fuse_s_projection():
+            weight, bias = self._s_projection_params()
+            gate, offset = F.linear(s, weight, bias).chunk(2, dim=-1)
+        else:
+            gate = self.linear_s(s)
+            offset = self.linear_nobias_s(s)
+        a = fused_sigmoid_mul_add(gate, a, offset)
         return a
 
 
