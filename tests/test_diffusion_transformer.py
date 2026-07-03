@@ -237,6 +237,35 @@ class TestDiffusionTransformer(unittest.TestCase):
 
                 torch.testing.assert_close(out_sample_axis, out_repeated)
 
+                pair_biases = model.precompute_pair_biases(
+                    z=z_shared,
+                    token_mask=token_mask[:, None],
+                    enable_efficient_fusion=efficient,
+                    z_sample_count=n_sample,
+                    z_sample_axis=True,
+                )
+                for pair_bias in pair_biases:
+                    # Pair features are identical for every denoising sample
+                    # of a record.  The optimized path keeps that invariant
+                    # visible to attention as a singleton sample axis instead
+                    # of materializing N_sample identical bias matrices.
+                    self.assertEqual(
+                        pair_bias.shape,
+                        (n_records, 1, n_heads, n_token, n_token),
+                    )
+                out_cached = model(
+                    a=a,
+                    s=s,
+                    z=z_shared,
+                    enable_efficient_fusion=efficient,
+                    token_mask=token_mask[:, None],
+                    z_sample_count=n_sample,
+                    z_sample_axis=True,
+                    pair_biases=pair_biases,
+                )
+
+                torch.testing.assert_close(out_cached, out_repeated)
+
     def tearDown(self):
         elapsed_time = time.time() - self._start_time
         print(f"Test {self.id()} took {elapsed_time:.6f}s")

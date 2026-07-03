@@ -1239,7 +1239,7 @@ class Protenix(nn.Module):
             use_sample_axis_transformer = (
                 N_sample > 1 and _diffusion_transformer_sample_axis_enabled()
             )
-            can_use_pair_bias_cache = cache_pair_bias and not use_sample_axis_transformer
+            can_use_pair_bias_cache = cache_pair_bias
             if pair_bias_cache is not None and can_use_pair_bias_cache:
                 # Once the final per-block attention biases are cached, the
                 # transformer no longer reads z.  Pass the current pair tensor
@@ -1281,6 +1281,9 @@ class Protenix(nn.Module):
                 # pair bias can stay [record, 1, head, token, token].  Flattening
                 # to [record * sample, ...] is robust and still the default, but
                 # it materializes N_sample copies of the same pair/padding bias.
+                # When the step-invariant pair-bias cache is enabled, each
+                # diffusion block stores only that compact broadcastable bias
+                # once and reuses it across all denoising steps.
                 # The transformer code broadcasts the singleton axis and relies
                 # on PROTENIX_RANK5_FULL_ATTENTION_BF16=1 to keep full token
                 # attention on tensor-core BF16 SDPA instead of the generic
@@ -1310,7 +1313,7 @@ class Protenix(nn.Module):
                             token_mask=token_mask_transformer,
                             enable_efficient_fusion=self.enable_efficient_fusion,
                             z_sample_count=N_sample,
-                            z_sample_axis=False,
+                            z_sample_axis=use_sample_axis_transformer,
                         )
                 pair_biases = pair_bias_cache
 
