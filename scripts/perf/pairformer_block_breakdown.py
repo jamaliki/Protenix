@@ -20,6 +20,9 @@ from typing import Callable, Iterator
 import torch
 
 from protenix.model.modules.pairformer import PairformerBlock
+from protenix.model.triangular.triangular import (
+    cueq_ending_contiguous_producer_enabled,
+)
 
 
 def str_bool(value: str | bool) -> bool:
@@ -134,6 +137,11 @@ def run_once(
     s = s0.clone()
     z = z0.clone()
     events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+    use_contiguous_ending = (
+        args.triangle_attention == "cuequivariance"
+        and args.chunk_size is None
+        and cueq_ending_contiguous_producer_enabled()
+    )
 
     z = timed_step(
         "tri_mul_out",
@@ -169,28 +177,36 @@ def run_once(
         ),
         events,
     )
-    z = timed_step(
-        "transpose_after_start",
-        lambda: z.transpose(-2, -3).contiguous(),
-        events,
-    )
-    z = timed_step(
-        "tri_att_end",
-        lambda: z
-        + block.tri_att_end(
-            z,
-            mask=pair_mask.transpose(-1, -2),
-            triangle_attention=args.triangle_attention,
-            inplace_safe=True,
-            chunk_size=args.chunk_size,
-        ),
-        events,
-    )
-    z = timed_step(
-        "transpose_after_end",
-        lambda: z.transpose(-2, -3).contiguous(),
-        events,
-    )
+    if use_contiguous_ending:
+        z = timed_step(
+            "tri_att_end_contiguous_producer",
+            lambda: z
+            + block.tri_att_end._cueq_ending_contiguous_forward(z, pair_mask),
+            events,
+        )
+    else:
+        z = timed_step(
+            "transpose_after_start",
+            lambda: z.transpose(-2, -3).contiguous(),
+            events,
+        )
+        z = timed_step(
+            "tri_att_end",
+            lambda: z
+            + block.tri_att_end(
+                z,
+                mask=pair_mask.transpose(-1, -2),
+                triangle_attention=args.triangle_attention,
+                inplace_safe=True,
+                chunk_size=args.chunk_size,
+            ),
+            events,
+        )
+        z = timed_step(
+            "transpose_after_end",
+            lambda: z.transpose(-2, -3).contiguous(),
+            events,
+        )
     z = timed_step("pair_transition", lambda: z + block.pair_transition(z), events)
     s = timed_step(
         "token_attention",

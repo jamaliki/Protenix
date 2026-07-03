@@ -31,6 +31,7 @@ from protenix.model.triangular.triangular import (
     TriangleAttention,
     TriangleMultiplicationIncoming,
     TriangleMultiplicationOutgoing,
+    cueq_ending_contiguous_producer_enabled,
 )
 from protenix.model.utils import (
     checkpoint_blocks,
@@ -168,6 +169,12 @@ class PairformerBlock(nn.Module):
                 [..., N_token, c_s] | None
                 [..., N_token, N_token, c_z]
         """
+        use_contiguous_ending = (
+            triangle_attention == "cuequivariance"
+            and chunk_size is None
+            and not torch.is_grad_enabled()
+            and cueq_ending_contiguous_producer_enabled()
+        )
         if inplace_safe:
             with _pairformer_scope("pairformer_block/triangle_mul_out"):
                 z = self.tri_mul_out(
@@ -193,18 +200,29 @@ class PairformerBlock(nn.Module):
                     inplace_safe=inplace_safe,
                     chunk_size=chunk_size,
                 )
-            with _pairformer_scope("pairformer_block/transpose_to_end"):
-                z = z.transpose(-2, -3).contiguous()
-            with _pairformer_scope("pairformer_block/triangle_attention_end"):
-                z += self.tri_att_end(
-                    z,
-                    mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
-                    triangle_attention=triangle_attention,
-                    inplace_safe=inplace_safe,
-                    chunk_size=chunk_size,
-                )
-            with _pairformer_scope("pairformer_block/transpose_to_start"):
-                z = z.transpose(-2, -3).contiguous()
+            if use_contiguous_ending:
+                with _pairformer_scope("pairformer_block/triangle_attention_end"):
+                    z += self.tri_att_end._cueq_ending_contiguous_forward(
+                        z,
+                        pair_mask,
+                    )
+            else:
+                with _pairformer_scope("pairformer_block/transpose_to_end"):
+                    z = z.transpose(-2, -3).contiguous()
+                with _pairformer_scope("pairformer_block/triangle_attention_end"):
+                    z += self.tri_att_end(
+                        z,
+                        mask=(
+                            pair_mask.transpose(-1, -2)
+                            if pair_mask is not None
+                            else None
+                        ),
+                        triangle_attention=triangle_attention,
+                        inplace_safe=inplace_safe,
+                        chunk_size=chunk_size,
+                    )
+                with _pairformer_scope("pairformer_block/transpose_to_start"):
+                    z = z.transpose(-2, -3).contiguous()
             with _pairformer_scope("pairformer_block/pair_transition"):
                 z += self.pair_transition(z)
         else:
@@ -241,27 +259,39 @@ class PairformerBlock(nn.Module):
                     self.p_drop,
                     self.training,
                 )
-            with _pairformer_scope("pairformer_block/transpose_to_end"):
-                z = z.transpose(-2, -3).contiguous()
-            with _pairformer_scope("pairformer_block/triangle_attention_end"):
-                z = dropout_add_rowwise(
-                    z,
-                    self.tri_att_end(
+            if use_contiguous_ending:
+                with _pairformer_scope("pairformer_block/triangle_attention_end"):
+                    z = dropout_add_rowwise(
                         z,
-                        mask=(
-                            pair_mask.transpose(-1, -2)
-                            if pair_mask is not None
-                            else None
+                        self.tri_att_end._cueq_ending_contiguous_forward(
+                            z,
+                            pair_mask,
                         ),
-                        triangle_attention=triangle_attention,
-                        inplace_safe=inplace_safe,
-                        chunk_size=chunk_size,
-                    ),
-                    self.p_drop,
-                    self.training,
-                )
-            with _pairformer_scope("pairformer_block/transpose_to_start"):
-                z = z.transpose(-2, -3).contiguous()
+                        self.p_drop,
+                        self.training,
+                    )
+            else:
+                with _pairformer_scope("pairformer_block/transpose_to_end"):
+                    z = z.transpose(-2, -3).contiguous()
+                with _pairformer_scope("pairformer_block/triangle_attention_end"):
+                    z = dropout_add_rowwise(
+                        z,
+                        self.tri_att_end(
+                            z,
+                            mask=(
+                                pair_mask.transpose(-1, -2)
+                                if pair_mask is not None
+                                else None
+                            ),
+                            triangle_attention=triangle_attention,
+                            inplace_safe=inplace_safe,
+                            chunk_size=chunk_size,
+                        ),
+                        self.p_drop,
+                        self.training,
+                    )
+                with _pairformer_scope("pairformer_block/transpose_to_start"):
+                    z = z.transpose(-2, -3).contiguous()
 
             with _pairformer_scope("pairformer_block/pair_transition"):
                 z = z + self.pair_transition(z)
