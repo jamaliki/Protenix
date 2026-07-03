@@ -206,9 +206,11 @@ def parse_worker_log(path: Path) -> dict[str, Any]:
     return {"timed_batches": batches, "timed_items": items, "predict_sec": predict_sec}
 
 
-def collect_results(queue: mp.Queue, expected: int) -> list[dict[str, Any]]:
+def collect_results(
+    queue: mp.Queue, expected: int, timeout_sec: float
+) -> list[dict[str, Any]]:
     results = []
-    deadline = time.time() + 24 * 3600
+    deadline = time.time() + timeout_sec
     while len(results) < expected and time.time() < deadline:
         try:
             results.append(queue.get(timeout=10))
@@ -230,9 +232,15 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     ]
     for process in processes:
         process.start()
-    results = collect_results(queue, args.workers)
-    for process in processes:
-        process.join()
+    results = collect_results(queue, args.workers, args.result_timeout_sec)
+    if len(results) == args.workers:
+        for process in processes:
+            process.join()
+    else:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=30)
 
     if len(results) != args.workers or any(not row.get("ok") for row in results):
         return {"ok": False, "workers": results}
@@ -286,6 +294,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=600.0,
         help="Fail rather than hang forever if a peer dies before a timed repeat.",
+    )
+    parser.add_argument(
+        "--result-timeout-sec",
+        type=float,
+        default=24 * 3600.0,
+        help="Maximum time to wait for worker results before terminating survivors.",
     )
     parser.add_argument("--model-name", default="protenix_base_default_v1.0.0")
     parser.add_argument("--seed", type=int, default=101)
