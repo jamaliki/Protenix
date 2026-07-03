@@ -68,21 +68,6 @@ def _try_triton_local_attention(
     )
 
 
-def _try_triton_dense_bias_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    attn_bias: Optional[torch.Tensor],
-) -> Optional[torch.Tensor]:
-    try:
-        from protenix.model.modules.dense_attention_triton import (
-            triton_dense_bias_attention,
-        )
-    except Exception:
-        return None
-    return triton_dense_bias_attention(q=q, k=k, v=v, attn_bias=attn_bias)
-
-
 def _local_attention_gate_fusion_requested() -> bool:
     return os.getenv("PROTENIX_TRITON_LOCAL_ATTN_FUSE_GATE", "0").lower() not in {
         "0",
@@ -485,13 +470,6 @@ def _attention(
     assert k.shape == v.shape
 
     input_dtype = q.dtype
-    if use_efficient_implementation:
-        triton_attention = _try_triton_dense_bias_attention(
-            q=q, k=k, v=v, attn_bias=attn_bias
-        )
-        if triton_attention is not None:
-            return triton_attention
-
     # Local atom attention has small 32x128 windows. On H100/cuDNN this path is
     # faster and more reliable in FP32, while full token attention benefits from
     # BF16 when PROTENIX_ATTENTION_FORCE_FP32=0.

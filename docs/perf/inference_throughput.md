@@ -863,13 +863,35 @@ The corrected exact scope aggregate ranked pairformer subpaths by wall interval:
 | diffusion token transformer | 1433.3 | 40 | no longer the leading target after pair-bias reuse |
 | pair transition | 823.8 | 1840 | comparatively small after prior transition work |
 
-Decision: keep the next experiments focused on pairformer kernels/layouts.  The
-direct dense-bias D=24 token-attention screen is queued as job `97137`
-(`runs/dense_bias_attention_d24_probe_20260703_094447_9e62026`) and the remote
-worktree was updated to commit `b039f9a` before it runs.  That probe tests the
-specific missing boundary from the earlier failed padded TriAttention attempt:
-read the existing `B x H x N x 24` q/k/v tensors plus non-contiguous dense pair
-bias directly, without D=32 padding or copy overhead.
+Decision: keep the next experiments focused on pairformer kernels/layouts, but
+do not promote a standalone replacement for pairformer token attention.  The
+direct dense-bias D=24 token-attention screen tested the specific missing
+boundary from the earlier failed padded TriAttention attempt: read the existing
+`B x H x N x 24` q/k/v tensors plus non-contiguous dense pair bias directly,
+without D=32 padding or copy overhead.  The isolated canary was encouraging:
+the attention core was about `5.3-5.7x` faster and the full
+`AttentionPairBias.attention` boundary was `1.6-2.3x` faster on the profiled
+`N=124/220` buckets.
+
+The representative model gate rejected the production hook.  Job `97256`
+(`runs/d24_dense_attention_gate_n200_20260703_105346_e7ced70`) compared the
+current promoted default with `PROTENIX_TRITON_D24_DENSE_ATTN=1` on the real
+32-record mixed 40-220-token campaign, `N_sample=5`, `N_step=200`,
+`--batch_size 16`, confidence enabled:
+
+| case | predict sec | generated samples/s | pairformer | diffusion | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| default | 41.78 | 3.830 | 16.18 | 20.95 | 2.54 | baseline |
+| direct D24 attention | 41.96 | 3.813 | 15.96 | 21.34 | 2.57 | reject |
+| default repeat | 40.97 | 3.905 | 16.03 | 20.39 | 2.46 | baseline repeat |
+| direct D24 attention repeat | 41.87 | 3.821 | 15.93 | 21.37 | 2.49 | reject |
+
+The mechanism moved the intended pairformer subtotal slightly
+(`16.11s -> 15.95s` on average), but the whole predict section slowed
+(`41.38s -> 41.92s`, `0.987x`).  The default-off runtime hook was removed
+rather than carrying dead experimental code.  The probe remains as a useful
+learning artifact: it shows why isolated kernel wins must be gated against the
+actual campaign path before promotion.
 
 Pre-cache promoted trace: job `96456`
 (`runs/current_batched_profile_n20_20260703_031951_3d1adcd`) profiled the
@@ -2615,6 +2637,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Materializing pairformer token-attention bias as contiguous `[B, H, Q, K]` | traced pairformer SDPA shape `[16, 16, 124, 24]` moved from math-dispatch attempt to a cuDNN frontend "no valid execution plans" error; fallback timing then segfaulted in the isolated screen | the non-contiguous bias layout is not the only blocker; head_dim 24 plus dense additive bias lacks a safe cuDNN plan in this runtime, so do not pay a bias copy hoping for a backend flip |
 | CUEQ `attention_pair_bias` for diffusion token attention | native pair-bias projection needed an explicit zero LayerNorm bias, then CUEQ's internal SDPA failed with `No valid execution plans built`; forced PyTorch fallback was slower than the current full conv2d+SDPA baseline | CUEQ's wrapper is not a drop-in win here; use it only if we can call a narrower fused pair-bias producer while keeping Protenix's SDPA fallback policy |
 | Reusing Triton `TriAttentionFunction` for pairformer token attention | isolated `N=220` hotspot improved, but the full mixed-sequence gate averaged only `45.16s -> 44.89s` predict (`+0.6%`) and one repeat regressed | padding `D=24` to `D=32` and copying layouts is too much integration overhead; if revisited, write a direct dense-bias `D=24` kernel instead |
+| Direct dense-bias D24 Triton token attention | isolated core improved about `5.3-5.7x` and the full attention boundary `1.6-2.3x`, but the representative mixed `N_sample=5`, `N_step=200` gate slowed from `41.38s` to `41.92s` on average | even a good narrow attention kernel is too small after pair-bias caching; remove rejected default-off runtime hooks and target larger pairformer/triangle boundaries |
 | `torch.compile` around the diffusion-token transformer | isolated 24-block screens improved `1.29-1.34x`; the first model gate failed in a cuDNN SDPA plan, and the safer no-cuDNN-SDPA gate was flat/slower (`44.59 -> 44.92s`, repeat `43.87 -> 43.95s`) | block-level fusion remains attractive, but a generic Inductor wrapper does not move the real campaign path |
 | Fused self-attention `q/k/v/g` projection | exact parity but trunk block slowed from about 14.1 ms to 14.9 ms | fewer launches are not enough if the wider GEMM/cache/layout is worse |
 | Fused ordinary self-attention q/k/v projection | hotspot moved the intended `qkv+sdpa+gate+out` subrange, but the full mixed `N_sample=5`, `N_step=200` gate averaged flat/slower (`44.69s -> 44.86s`) and one repeat regressed | producer fusion must still move the full workload; local launch savings can disappear in wider GEMM/layout/cache effects |
