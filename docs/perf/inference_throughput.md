@@ -718,6 +718,52 @@ so the model hook was removed.  Keep the isolated probe as evidence that the
 transition boundary has launch/elementwise overhead, but do not use
 `torch.compile` as the production mechanism for it.
 
+Current promoted trace: job `96456`
+(`runs/current_batched_profile_n20_20260703_031951_3d1adcd`) profiled the
+actual `runner/batch_inference.py` campaign path after the atom-attention
+promotion and transition-compile cleanup.  The workload was the same sorted
+32-record mixed-token campaign, `N_sample=5`, `N_step=20`, `--batch_size 16`,
+confidence enabled, no MSA/template, and the promoted default flags.  The
+profile is for launch attribution only; representative promotion still uses
+`N_step=200`.
+
+Top global CUDA kernel classes in that trace were:
+
+| kernel class | self CUDA ms | calls | avg us | interpretation |
+| --- | ---: | ---: | ---: | --- |
+| cuDNN full-token SDPA/FMHA | 1868.8 | 2400 | 778.7 | full attention remains the largest single vendor-kernel class |
+| Triton LayerNorm fallback | 1680.4 | 11600 | 144.9 | promoted fallback is doing real work, not just overhead |
+| CUEQ fused gated dual GEMM | 1045.3 | 5760 | 181.5 | pairformer fused MLP path remains material |
+| BF16 direct-copy kernel | 1013.1 | 7268 | 139.4 | layout/dtype traffic is still a first-order cost |
+| PyTorch FP32 LayerNorm | 892.7 | 9296 | 96.0 | conservative FP32 policy still leaves native LayerNorm launches |
+| BF16 multiply | 820.1 | 10964 | 74.8 | generic elementwise launch floor |
+| BF16 add | 805.6 | 12344 | 65.3 | generic elementwise launch floor |
+| QKV-to-heads layout kernel | 666.0 | 2400 | 277.5 | attention-adjacent layout is material |
+| CUEQ `layer_norm_transpose` | 581.7 | 5760 | 101.0 | CUEQ layout/normalization boundary remains material |
+| BF16 SiLU | 449.5 | 3516 | 127.8 | transition/gating epilogues still launch-heavy |
+
+The per-scope aggregates clarify where not to spend effort.  The batched token
+diffusion transformer scope was `2.38s` in the N20 trace and was dominated by
+direct-copy, SDPA, small/medium GEMMs, BF16 add/mul/sigmoid, and launch
+overhead.  The atom encoder and decoder scopes were `2.45s` and `0.43s`; after
+the promoted Triton local-attention path, the local-attention kernels themselves
+were only tens of milliseconds.  The next atom win is therefore not another
+local-attention kernel rewrite; it would need to remove many small launches or
+copies around the atom blocks.
+
+This profile motivates one narrow follow-up instead of re-enabling the rejected
+broad fusion flag.  Commit `b5c8c3e` adds
+`PROTENIX_TRITON_FUSED_ELEMENTWISE_MIN_ELEMENTS`, which keeps the default-off
+generic Triton elementwise fusions away from tiny tensors.  The planned gate is
+job `96592`
+(`runs/elementwise_threshold_gate_n200_20260703_034213_b5c8c3e`), comparing the
+current default with thresholds of `1,000,000` and `8,000,000` output elements
+on the same `N_sample=5`, `N_step=200`, batch-16 campaign.  The job was queued
+on the main `gpu` partition after `gpu-canary` was occupied by an unrelated
+interactive allocation.  Do not promote the threshold knob unless that same-job
+N200 gate improves generated samples/sec and the intended diffusion/pairformer
+subtotals move in the expected direction.
+
 Launch-level follow-up: job `96110`
 (`runs/flat_bf16_batch_profile_20260702_221601_c8a532d`) proved the profiler
 wrapper needed to catch `SystemExit` before exporting artifacts.  Corrected job
