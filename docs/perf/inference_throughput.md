@@ -1056,6 +1056,25 @@ main `gpu` partition were submitted to prewarm both policies, then measure
 unless one of those warmed gates beats the conservative default cleanly; the
 isolated FP32 microbenchmarks were mixed.
 
+The warmed-cache gate did show that FP32 LayerNorm still had a useful but
+shape-dependent signal.  Job `96218`
+(`runs/layer_norm_force_fp32_warm_gate_n200_20260703_000012_40e1c7e`) measured
+forced-all Triton LayerNorm before auto on the same 32-record, 40-220-token,
+`N_sample=5`, `N_step=200` campaign:
+
+| case | predict sec | generated samples/s | pairformer | diffusion | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| forced-all Triton LayerNorm | 57.08 | 2.803 | 16.47 | 36.21 | 2.51 | useful signal |
+| conservative auto | 61.67 | 2.594 | 16.52 | 41.15 | 2.52 | slower diffusion |
+
+Commit `a271f5e` promoted the narrow version of that finding instead of the
+force-all switch: in auto mode, Triton LayerNorm remains broad for BF16/FP16,
+but FP32 uses Triton only for large flattened diffusion-token shapes with
+feature widths `384` or `768` and at least `8192` rows.  This keeps the
+diffusion win without changing every small FP32 normalization in the model.
+The shape policy is covered by `tests.test_triton_layer_norm` and is already
+included in all later current-stack gates.
+
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`
 (`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/fusion_flags_pair_b16_n200_20260702_170343`)
@@ -1299,6 +1318,23 @@ campaign, B16 is the best fixed batch size because it keeps trunk padding
 tolerable without fragmenting the diffusion and atom work into too many small
 launch groups.  Better batching now means smarter token bucketing, not simply
 raising or lowering `--batch_size`.
+
+The older noisy B20 scout was rechecked after the current stack to make sure
+the B16 recommendation was not just missing a better split point.  Job `96811`
+(`runs/batch_size_16_20_gate_n200_20260703_064520_3e40e9f`) alternated
+`--batch_size 16` and `20` on the same current branch and input:
+
+| case | predict sec | generated samples/s | pairformer | diffusion | diffusion transformer | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| B16 | 44.07 | 3.631 | 15.71 | 23.80 | 14.07 | keep |
+| B20 | 44.77 | 3.574 | 16.02 | 24.21 | 14.47 | reject |
+| B16 repeat | 43.98 | 3.638 | 15.74 | 23.68 | 14.03 | keep |
+| B20 repeat | 44.64 | 3.584 | 16.18 | 23.96 | 14.29 | reject |
+
+B20 is about `1.5%` slower on average.  Its first batch carries more padded
+pairformer work, and the smaller long-token second batch does not recover
+enough diffusion throughput to compensate.  Keep B16 as the documented fixed
+batch-size default for this mixed-length N5 campaign.
 
 For this 245-token input, `B=32-64` is the practical knee.  Larger batches keep
 raising memory but add little throughput.  The low-sample workload is therefore
@@ -2357,15 +2393,11 @@ Profiling and reproducibility helpers:
 Do not expect another large gain from config changes.  The next proper
 same-output campaign should be one of:
 
-1. finish queued warmed-cache jobs `96218`/`96219`, the paired default-`auto`
-   versus forced-all LayerNorm N200 gate.  If forced-all wins cleanly, consider
-   a narrower policy that enables Triton for the observed large-row FP32
-   diffusion-token LayerNorms without enabling every FP32 shape;
-2. a deliberate atom/trunk kernel-layout rewrite, especially around producers
+1. a deliberate atom/trunk kernel-layout rewrite, especially around producers
    feeding attention kernels;
-3. a confidence-pairformer precision/tiling campaign with explicit numerical
+2. a confidence-pairformer precision/tiling campaign with explicit numerical
    acceptance criteria;
-4. vendor-quality fused epilogues for specific matmul-adjacent patterns.
+3. vendor-quality fused epilogues for specific matmul-adjacent patterns.
 
 The larger kernel-engineering projects should start with a
 fresh profile, an isolated hotspot screen, and a full same-output N1280/N2560
