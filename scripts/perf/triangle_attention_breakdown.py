@@ -175,27 +175,47 @@ def manual_cueq_forward(
         )
 
     scale = 1.0 / math.sqrt(module.c_hidden)
-    o = timed(
+    heads_first = timed(
         "cueq_attention",
         lambda: cuequivariance_triangular_attn(
             q, k, v, triangle_bias_fp32, mask_for_attention, scale
         ),
         events,
     )
-    if isinstance(o, tuple):
-        o = o[0]
-    o = timed("attention_transpose", lambda: o.transpose(-2, -3), events)
+    if isinstance(heads_first, tuple):
+        heads_first = heads_first[0]
 
     if module.mha.linear_g is not None:
         gate = timed("gate_projection", lambda: module.mha.linear_g(x), events)
-        gate = timed(
-            "gate_sigmoid_layout",
-            lambda: module.mha.sigmoid(gate).view(gate.shape[:-1] + (module.no_heads, -1)),
+        # This is the current production fast path.  CUEQ returns heads-first
+        # [..., H, Q, D] data; the Triton helper streams sigmoid(gate) * output
+        # directly into the flattened [..., Q, H*D] layout consumed by the
+        # output projection.  If the helper rejects the shape, the fallback
+        # below exposes the separate transpose/sigmoid/multiply/copy costs.
+        o = timed(
+            "gate_sigmoid_mul_flatten_triton",
+            lambda: triton_sigmoid_mul_heads_first(gate, heads_first),
             events,
         )
-        o = timed("gate_multiply", lambda: o * gate, events)
+        if o is None:
+            o = timed(
+                "attention_transpose",
+                lambda: heads_first.transpose(-2, -3),
+                events,
+            )
+            gate = timed(
+                "gate_sigmoid_layout",
+                lambda: module.mha.sigmoid(gate).view(
+                    gate.shape[:-1] + (module.no_heads, -1)
+                ),
+                events,
+            )
+            o = timed("gate_multiply", lambda: o * gate, events)
+            o = timed("flatten_heads", lambda: flatten_final_dims(o, 2), events)
+    else:
+        o = timed("attention_transpose", lambda: heads_first.transpose(-2, -3), events)
+        o = timed("flatten_heads", lambda: flatten_final_dims(o, 2), events)
 
-    o = timed("flatten_heads", lambda: flatten_final_dims(o, 2), events)
     o = timed("output_projection", lambda: module.mha.linear_o(o), events)
 
     if not module.starting:
