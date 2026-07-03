@@ -152,6 +152,13 @@ when you need the old conservative atom path.  Do not enable
 kernel experiments, but the full gate did not show a robust win over the
 flattened BF16 path.
 
+The CUEQ pairformer path also defaults to a contiguous ending-attention
+producer (`PROTENIX_CUEQ_ENDING_CONTIGUOUS_PRODUCER=1`).  This is a small
+throughput win, not a headline feature: it avoids two large pair-tensor copies
+around ending-node triangle attention and gave about `+1.5%` on the pairformer
+subtotal, or `+0.6%` on the full B32 same-token variable-atom predict gate.  Set
+it to `0` only when bisecting a numerical or shape-specific issue.
+
 For normal multi-step inference, the diffusion transformer also caches the
 step-invariant token pair-attention bias once per block.  This spends a few GiB
 on long mixed batches, but removes repeated pair-bias projection and sample-lane

@@ -290,18 +290,29 @@ The paired CUDA-event split without NCU replay was:
 | starting attention | 7.81 | 7.85 | CUEQ attention 3.15 ms, qkv projection+layout 1.85 ms, LayerNorm 1.26 ms |
 | ending attention | 12.67 | 12.74 | LayerNorm 4.56 ms, CUEQ attention 3.19 ms, qkv projection+layout 2.35 ms, gate projection 0.88 ms, triangle-bias projection 0.80 ms |
 
-Decision: this refines the next triangle-attention target.  Do **not** revisit
-the already-rejected LN-only ending rewrite; it fixed one symptom while leaving
-the qkv/gate/bias projections on a transposed pair layout.  A credible
-ending-attention rewrite must be broader: normalize and project the original
-contiguous `[I, J, C]` pair tensor, then produce the ending-node CUEQ layouts
-with swapped pair axes at the qkv/bias/gate epilogue boundaries.  That preserves
-the cuDNN SDPA mainloop while attacking the measured non-contiguous producer
-traffic.
+The resulting broad producer prototype became the default-on
+`PROTENIX_CUEQ_ENDING_CONTIGUOUS_PRODUCER` path in commits `47586e8` through
+`ddc6177`.  It avoids PairformerBlock's outer `z.transpose(...).contiguous()`
+copies for ending-node CUEQ attention, computes LayerNorm and qkv/gate/bias
+projections on the original contiguous `[I, J, C]` pair tensor, and writes the
+swapped CUEQ layouts at the qkv and gate epilogue boundaries.  Set
+`PROTENIX_CUEQ_ENDING_CONTIGUOUS_PRODUCER=0` to disable it.
 
-This is intentionally a measurement hook, not a production path.  The promotion
-bar remains a paired full `N_step=200` same-token variable-atom gate after the
-candidate moves a material pairformer subtotal.
+Correctness and timing gates:
+
+| gate | baseline | candidate | decision |
+| --- | ---: | ---: | --- |
+| standalone ending attention, B32/N251 | 12.70 ms | 8.04 ms | mechanism valid; BF16 max abs `9.8e-4` |
+| masked PairformerBlock parity, B8/N124 | exact | exact | `s` and `z` max abs `0.0` with variable valid lengths |
+| PairformerBlock hotspot, B32/N251 | 37.73 ms | 36.80 ms | `1.025x` block speedup |
+| full same-token variable-atom gate, predict avg | 42.61 s | 42.34 s | small but repeatable `+0.64%` predict |
+| full same-token variable-atom gate, pairformer avg | 28.45 s | 28.03 s | `+1.5%` pairformer subtotal |
+
+Decision: promote despite the small end-to-end size because the paired full gate
+moved in the predicted component and the path is guarded to CUEQ, no chunking,
+and no-grad inference.  This is not a headline gain, but it removes measured
+HBM copies in the current main throughput bottleneck without replacing the
+cuDNN/CUEQ attention mainloop.
 
 The real campaign shape is often a directory containing one JSON file per
 design.  That used to defeat batching because the runner called

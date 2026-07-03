@@ -49,7 +49,7 @@ def cueq_bool_mask_enabled() -> bool:
 
 
 def cueq_ending_contiguous_producer_enabled() -> bool:
-    value = os.getenv("PROTENIX_CUEQ_ENDING_CONTIGUOUS_PRODUCER", "0")
+    value = os.getenv("PROTENIX_CUEQ_ENDING_CONTIGUOUS_PRODUCER", "1")
     return value.lower() not in _FALSE_ENV_VALUES
 
 
