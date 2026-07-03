@@ -312,6 +312,7 @@ class AttentionPairBias(nn.Module):
         enable_efficient_fusion: bool = False,
         z_sample_count: Optional[int] = None,
         z_sample_axis: bool = False,
+        pair_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Used by Algorithm 7/20
 
@@ -330,7 +331,42 @@ class AttentionPairBias(nn.Module):
                 [..., N_token, c_a]
         """
 
-        # Multi-head attention bias
+        # Multi-head attention bias.  During diffusion sampling, z and the token
+        # mask are constant across denoising steps.  The caller may therefore
+        # pass the final bias tensor precomputed once per block; otherwise use
+        # the normal projection path.
+        if pair_bias is not None:
+            bias = pair_bias
+        else:
+            bias = self.project_pair_bias(
+                z=z,
+                token_mask=token_mask,
+                enable_efficient_fusion=enable_efficient_fusion,
+                z_sample_count=z_sample_count,
+                z_sample_axis=z_sample_axis,
+            )
+
+        # Line 11: Multi-head attention with attention bias & gating.
+        q = self.attention(q_x=q, kv_x=kv, attn_bias=bias, inplace_safe=inplace_safe)
+
+        return q
+
+    def project_pair_bias(
+        self,
+        z: torch.Tensor,
+        token_mask: Optional[torch.Tensor] = None,
+        enable_efficient_fusion: bool = False,
+        z_sample_count: Optional[int] = None,
+        z_sample_axis: bool = False,
+    ) -> torch.Tensor:
+        """Return the final attention bias tensor for full token attention.
+
+        This is factored out so inference can cache the step-invariant
+        diffusion pair bias across the denoising loop.  The efficient-fusion
+        branch expects the existing Protenix convention: z is already
+        LayerNorm-normalized and channel-first, so only the learned scale and
+        head projection remain.
+        """
         if enable_efficient_fusion:
             weight = (self.linear_nobias_z.weight * self.layernorm_z.weight[None, :])[
                 :, :, None, None
@@ -367,11 +403,7 @@ class AttentionPairBias(nn.Module):
             # the sample dimension.
             key_bias = (token_mask.to(dtype=bias.dtype) - 1) * 1e4
             bias = bias + key_bias[..., None, None, :]
-
-        # Line 11: Multi-head attention with attention bias & gating (and optionally local attention)
-        q = self.attention(q_x=q, kv_x=kv, attn_bias=bias, inplace_safe=inplace_safe)
-
-        return q
+        return bias
 
     def forward(
         self,
@@ -387,6 +419,7 @@ class AttentionPairBias(nn.Module):
         token_mask: Optional[torch.Tensor] = None,
         z_sample_count: Optional[int] = None,
         z_sample_axis: bool = False,
+        pair_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Details are given in local_forward and standard_forward"""
         # Input projections
@@ -405,6 +438,8 @@ class AttentionPairBias(nn.Module):
 
         # Multihead attention with pair bias
         if n_queries and n_keys:
+            if pair_bias is not None:
+                raise ValueError("precomputed pair_bias is only supported for full attention")
             if z_sample_count is not None and z_sample_count > 1:
                 raise ValueError("z_sample_count is only supported for full attention")
             if z_sample_axis:
@@ -429,6 +464,7 @@ class AttentionPairBias(nn.Module):
                 enable_efficient_fusion=enable_efficient_fusion,
                 z_sample_count=z_sample_count,
                 z_sample_axis=z_sample_axis,
+                pair_bias=pair_bias,
             )
 
         # Output projection (from adaLN-Zero [27])
@@ -511,6 +547,7 @@ class DiffusionTransformerBlock(nn.Module):
         token_mask: Optional[torch.Tensor] = None,
         z_sample_count: Optional[int] = None,
         z_sample_axis: bool = False,
+        pair_bias: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -551,6 +588,7 @@ class DiffusionTransformerBlock(nn.Module):
                 token_mask=token_mask,
                 z_sample_count=z_sample_count,
                 z_sample_axis=z_sample_axis,
+                pair_bias=pair_bias,
             )
         else:
             attn_out = self.drop_path(
@@ -566,6 +604,7 @@ class DiffusionTransformerBlock(nn.Module):
                     token_mask=token_mask,
                     z_sample_count=z_sample_count,
                     z_sample_axis=z_sample_axis,
+                    pair_bias=pair_bias,
                 )
             )
             if inplace_safe:
@@ -651,6 +690,7 @@ class DiffusionTransformer(nn.Module):
         token_mask: Optional[torch.Tensor] = None,
         z_sample_count: Optional[int] = None,
         z_sample_axis: bool = False,
+        pair_biases: Optional[list[torch.Tensor]] = None,
     ) -> list[Callable]:
         blocks = [
             partial(
@@ -663,10 +703,31 @@ class DiffusionTransformer(nn.Module):
                 token_mask=token_mask,
                 z_sample_count=z_sample_count,
                 z_sample_axis=z_sample_axis,
+                pair_bias=None if pair_biases is None else pair_biases[idx],
             )
-            for b in self.blocks
+            for idx, b in enumerate(self.blocks)
         ]
         return blocks
+
+    def precompute_pair_biases(
+        self,
+        z: torch.Tensor,
+        token_mask: Optional[torch.Tensor] = None,
+        enable_efficient_fusion: bool = False,
+        z_sample_count: Optional[int] = None,
+        z_sample_axis: bool = False,
+    ) -> list[torch.Tensor]:
+        """Precompute one full-attention pair bias per transformer block."""
+        return [
+            block.attention_pair_bias.project_pair_bias(
+                z=z,
+                token_mask=token_mask,
+                enable_efficient_fusion=enable_efficient_fusion,
+                z_sample_count=z_sample_count,
+                z_sample_axis=z_sample_axis,
+            ).contiguous()
+            for block in self.blocks
+        ]
 
     def forward(
         self,
@@ -681,6 +742,7 @@ class DiffusionTransformer(nn.Module):
         token_mask: Optional[torch.Tensor] = None,
         z_sample_count: Optional[int] = None,
         z_sample_axis: bool = False,
+        pair_biases: Optional[list[torch.Tensor]] = None,
     ) -> torch.Tensor:
         """
                 Args:
@@ -707,6 +769,7 @@ class DiffusionTransformer(nn.Module):
             token_mask=token_mask,
             z_sample_count=z_sample_count,
             z_sample_axis=z_sample_axis,
+            pair_biases=pair_biases,
         )
         blocks_per_ckpt = self.blocks_per_ckpt
         if not torch.is_grad_enabled():

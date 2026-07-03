@@ -878,6 +878,9 @@ class Protenix(nn.Module):
 
         _sync_cuda_for_timing(sync_timings)
         step_start = time.time()
+        token_mask = _make_token_mask(token_counts, max_tokens, device)
+        cache_pair_bias = _env_flag_enabled("PROTENIX_CACHE_DIFFUSION_PAIR_BIAS")
+        pair_bias_cache: Optional[list[torch.Tensor]] = None
         caches = [
             self._prepare_diffusion_cache(feature_dict, z_i)
             for feature_dict, z_i in zip(input_feature_dicts, z_list)
@@ -1224,11 +1227,17 @@ class Protenix(nn.Module):
                     max_size=max_tokens,
                 )
 
-            token_mask = _make_token_mask(token_counts, max_tokens, device)
             use_sample_axis_transformer = (
                 N_sample > 1 and _diffusion_transformer_sample_axis_enabled()
             )
-            if z_pair_padded is not None:
+            can_use_pair_bias_cache = cache_pair_bias and not use_sample_axis_transformer
+            if pair_bias_cache is not None and can_use_pair_bias_cache:
+                # Once the final per-block attention biases are cached, the
+                # transformer no longer reads z.  Pass the current pair tensor
+                # only to preserve the existing block/checkpoint signature and
+                # avoid rebuilding the normalized channel-first z every step.
+                z_batch = z_pair_padded if z_pair_padded is not None else z_pairs[0]
+            elif z_pair_padded is not None:
                 # Batched conditioning has already produced one padded
                 # [B, N, N, C] pair tensor.  Reusing it avoids a redundant
                 # slice/list/restack cycle on every diffusion step.
@@ -1283,6 +1292,18 @@ class Protenix(nn.Module):
                 token_mask_transformer = _flatten_record_sample_mask(
                     token_mask, N_sample
                 )
+            pair_biases = None
+            if can_use_pair_bias_cache:
+                if pair_bias_cache is None:
+                    with dm._diffusion_core_autocast(transformer_dtype):
+                        pair_bias_cache = dm.diffusion_transformer.precompute_pair_biases(
+                            z=z_batch,
+                            token_mask=token_mask_transformer,
+                            enable_efficient_fusion=self.enable_efficient_fusion,
+                            z_sample_count=N_sample,
+                            z_sample_axis=False,
+                        )
+                pair_biases = pair_bias_cache
 
             with dm._profile_block("transformer"), torch.profiler.record_function(
                 "protenix/batched_token_diffusion_transformer"
@@ -1302,6 +1323,7 @@ class Protenix(nn.Module):
                         token_mask=token_mask_transformer,
                         z_sample_count=N_sample,
                         z_sample_axis=use_sample_axis_transformer,
+                        pair_biases=pair_biases,
                     )
             if a_transformer.dtype != torch.float32:
                 a_transformer = a_transformer.to(dtype=torch.float32)
@@ -1398,6 +1420,7 @@ class Protenix(nn.Module):
         time_tracker: dict[str, Any] = {"diffusion": time.time() - step_start}
         time_tracker["diffusion_atom_transformer_batched"] = batch_atom_transformer
         time_tracker["diffusion_conditioning_batched"] = batch_diffusion_conditioning
+        time_tracker["diffusion_pair_bias_cached"] = pair_bias_cache is not None
         if hasattr(dm, "consume_perf_stats"):
             time_tracker.update(dm.consume_perf_stats())
         return x_list, time_tracker

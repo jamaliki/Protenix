@@ -149,6 +149,24 @@ class TestDiffusionTransformer(unittest.TestCase):
 
                 torch.testing.assert_close(out_shared, out_repeated)
 
+                pair_biases = model.precompute_pair_biases(
+                    z=z_shared,
+                    token_mask=token_mask_flat,
+                    enable_efficient_fusion=efficient,
+                    z_sample_count=n_sample,
+                )
+                out_cached = model(
+                    a=a_flat,
+                    s=s_flat,
+                    z=z_shared,
+                    enable_efficient_fusion=efficient,
+                    token_mask=token_mask_flat,
+                    z_sample_count=n_sample,
+                    pair_biases=pair_biases,
+                )
+
+                torch.testing.assert_close(out_cached, out_shared)
+
     def test_sample_axis_pair_bias_matches_repeated_z(self) -> None:
         torch.manual_seed(11)
         n_heads = 2
