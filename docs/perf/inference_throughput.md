@@ -718,6 +718,31 @@ so the model hook was removed.  Keep the isolated probe as evidence that the
 transition boundary has launch/elementwise overhead, but do not use
 `torch.compile` as the production mechanism for it.
 
+Whole-transformer compile follow-up: the earlier 24-block isolated screen was
+repeated with cuDNN SDPA disabled only inside the compiled diffusion-token
+transformer, so Inductor could no longer choose the invalid cuDNN frontend
+plan.  The isolated boundary still looked promising: job `96748`
+(`runs/diffusion_compile_sdpa_backend_20260703_054221_6dabd86_retry`) measured
+`1.29x` at `N_token=124` and `1.33x` at `N_token=220`, with BF16-level parity.
+
+The representative gate did not promote it.  Job `96754`
+(`runs/diffusion_compile_nocudnn_gate_n200_20260703_055004_f606ac0`) ran the
+same 32 mixed 40-220-token records, `N_sample=5`, `N_step=200`, batch size 16,
+confidence enabled:
+
+| case | predict sec | generated samples/s | diffusion transformer sec | decision |
+| --- | ---: | ---: | ---: | --- |
+| default | 44.590 | 3.588 | 14.336 | keep |
+| compiled transformer, cuDNN SDPA disabled | 44.920 | 3.562 | 14.439 | reject |
+| default repeat | 43.870 | 3.647 | 13.993 | keep |
+| compiled transformer, cuDNN SDPA disabled repeat | 43.950 | 3.641 | 14.014 | reject |
+
+The compiled path is safe enough to run when cuDNN SDPA is disabled, but it
+does not improve the actual throughput gate; even the intended transformer
+subtotal was slightly slower.  The opt-in model hook was therefore removed.
+Future work on this boundary should be explicit kernel/epilogue fusion, not a
+generic `torch.compile` wrapper.
+
 Current promoted trace: job `96456`
 (`runs/current_batched_profile_n20_20260703_031951_3d1adcd`) profiled the
 actual `runner/batch_inference.py` campaign path after the atom-attention
@@ -2144,7 +2169,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Lowering mixed-token `N_sample=5` batch size from 16 to 8 | current full gate slowed from `3.56` to `3.0-3.1` generated samples/s because diffusion/atom work split into four smaller launch groups | tighter token ranges are useful only if the saved padding beats the lost batching efficiency |
 | Materializing pairformer token-attention bias as contiguous `[B, H, Q, K]` | traced pairformer SDPA shape `[16, 16, 124, 24]` moved from math-dispatch attempt to a cuDNN frontend "no valid execution plans" error; fallback timing then segfaulted in the isolated screen | the non-contiguous bias layout is not the only blocker; head_dim 24 plus dense additive bias lacks a safe cuDNN plan in this runtime, so do not pay a bias copy hoping for a backend flip |
 | Reusing Triton `TriAttentionFunction` for pairformer token attention | isolated `N=220` hotspot improved, but the full mixed-sequence gate averaged only `45.16s -> 44.89s` predict (`+0.6%`) and one repeat regressed | padding `D=24` to `D=32` and copying layouts is too much integration overhead; if revisited, write a direct dense-bias `D=24` kernel instead |
-| `torch.compile` around the diffusion-token transformer | isolated 24-block screen improved `1.29-1.34x`, but the real model gate failed in the compiled graph with a cuDNN frontend "no valid execution plans" error before producing candidate timings | block-level fusion remains attractive, but Inductor's emitted SDPA path is not yet a safe production mechanism for this model boundary |
+| `torch.compile` around the diffusion-token transformer | isolated 24-block screens improved `1.29-1.34x`; the first model gate failed in a cuDNN SDPA plan, and the safer no-cuDNN-SDPA gate was flat/slower (`44.59 -> 44.92s`, repeat `43.87 -> 43.95s`) | block-level fusion remains attractive, but a generic Inductor wrapper does not move the real campaign path |
 | Fused self-attention `q/k/v/g` projection | exact parity but trunk block slowed from about 14.1 ms to 14.9 ms | fewer launches are not enough if the wider GEMM/cache/layout is worse |
 | Fused ordinary self-attention q/k/v projection | hotspot moved the intended `qkv+sdpa+gate+out` subrange, but the full mixed `N_sample=5`, `N_step=200` gate averaged flat/slower (`44.69s -> 44.86s`) and one repeat regressed | producer fusion must still move the full workload; local launch savings can disappear in wider GEMM/layout/cache effects |
 | Fused `AdaptiveLayerNorm` conditioning projections | AdaLN subrange shrank slightly in some hotspot shapes, but full diffusion blocks were flat/slower, e.g. `1.416 -> 1.494 ms` at `N_token=220` | do not carry default-off concatenated-GEMM knobs unless the enclosing block moves |
