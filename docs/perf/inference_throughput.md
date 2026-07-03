@@ -2712,31 +2712,42 @@ Width and MPS gate:
 - job `97306`;
 - run dir
   `runs/concurrency_width_gate_20260703_114157_184a494`;
+- follow-up active-thread-cap job `97337`, run dir
+  `runs/mps_width_confirm_20260703_121232_100b240`;
+- high-width cap job `97504`, run dir
+  `runs/mps_width_hi_20260703_123707_100b240`;
 - CUDA MPS pipe/log directories must live on a node-local filesystem such as
   `/tmp`.  Putting `CUDA_MPS_PIPE_DIRECTORY` on Lustre created control logs but
   no live socket and should not be used.
 
-| mode | workers | generated samples | wall s | wall samples/s | decision |
-| --- | ---: | ---: | ---: | ---: | --- |
-| ordinary processes | 2 | 320 | 79.38 | 4.031 | small win |
-| ordinary processes | 3 | 480 | 115.86 | 4.143 | flattening |
-| ordinary processes | 4 | 640 | 152.56 | 4.195 | flattening |
-| CUDA MPS, `/tmp` socket | 2 | 320 | 66.36 | 4.822 | useful |
-| CUDA MPS, `/tmp` socket | 3 | 480 | 94.32 | 5.089 | near knee |
-| CUDA MPS, `/tmp` socket | 4 | 640 | 124.58 | 5.137 | best measured |
+| mode | workers | active thread % | generated samples | wall s | wall samples/s | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| ordinary processes | 2 | n/a | 320 | 79.38 | 4.031 | small win |
+| ordinary processes | 3 | n/a | 480 | 115.86 | 4.143 | flattening |
+| ordinary processes | 4 | n/a | 640 | 152.56 | 4.195 | flattening |
+| CUDA MPS, `/tmp` socket | 2 | default | 320 | 66.36 | 4.822 | useful |
+| CUDA MPS, `/tmp` socket | 3 | default | 480 | 94.32 | 5.089 | useful |
+| CUDA MPS, `/tmp` socket | 4 | default | 640 | 124.58 | 5.137 | reproduced at `5.140` |
+| CUDA MPS, `/tmp` socket | 5 | default | 800 | 151.54 | 5.279 | small gain |
+| CUDA MPS, `/tmp` socket | 4 | 25 | 640 | 120.58 | 5.308 | better scheduling |
+| CUDA MPS, `/tmp` socket | 5 | 20 | 800 | 144.62 | 5.532 | practical knee |
+| CUDA MPS, `/tmp` socket | 6 | 16 | 960 | 179.44 | 5.350 | regressed |
+| CUDA MPS, `/tmp` socket | 7 | 14 | 1120 | 201.98 | 5.545 | +0.2% vs 5-worker, likely noise |
 
 Interpretation:
 
 - Ordinary process concurrency proves there is some underfill, but context
   isolation and contention cap the win quickly.
-- CUDA MPS materially improves overlap across independent workers.  The best
-  measured point, four workers, is only slightly above three workers, so the
-  practical recommendation is **three to four MPS workers per H100** for large
-  campaign shards.
+- CUDA MPS materially improves overlap across independent workers.  Adding
+  `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` helps once there are enough workers:
+  five workers at `20%` reached `5.532` generated samples/s.  Seven workers at
+  `14%` produced the highest single measured number (`5.545`) but only by
+  `0.2%`, while adding more memory pressure and per-shard latency.  Treat
+  **five MPS workers per H100 at 20% each** as the practical knee.
 - Compared with the prior promoted single-process low-sample rate (`3.85`
-  generated samples/s), `5.137` generated samples/s is a `1.33x` operational
+  generated samples/s), `5.532` generated samples/s is a `1.44x` operational
   gain.  Compared with the original low-sample branch boundary (`0.753`
-  generated samples/s), it is about `6.8x` per-GPU throughput.
+  generated samples/s), it is about `7.3x` per-GPU throughput.
 - This is not a substitute for kernel work: each worker individually slows down
   as width increases, and the aggregate curve is already flattening.  The
   remaining route to the requested `10x` target still needs a larger true
