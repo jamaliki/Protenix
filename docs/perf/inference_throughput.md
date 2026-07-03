@@ -1401,6 +1401,32 @@ buckets make this worse.  So the next batching win is not a queue heuristic; it
 needs a ragged or segmented kernel/schedule that preserves large diffusion
 launch groups while avoiding padded pairformer work.
 
+Commit `2b8201b` tested that exact scheduler split: keep the outer sorted B16
+diffusion batches intact, but internally sub-batch only the pairformer trunk by
+token bucket.  The implementation added a temporary `--trunk_bucket_size`
+knob, ran the trunk on smaller padded token groups, restored output order, and
+then called the existing batched diffusion sampler on the original 16 records.
+Remote unit tests passed (`23` tests, `2` skipped), but the representative full
+gate rejected the idea, so the temporary production knob was removed rather
+than left as default-off complexity.  Job `96951`
+(`runs/trunk_bucket_gate_n200_20260703_083611_2b8201b`) produced:
+
+| case | outer batches | predict sec | generated samples/s | pairformer | diffusion | diffusion transformer | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| sorted default | 2 | 44.350 | 3.608 | 15.736 | 24.098 | 14.446 | keep |
+| trunk96 | 2 | 45.250 | 3.536 | 16.430 | 24.256 | 14.351 | reject |
+| trunk64 | 2 | 44.760 | 3.575 | 15.461 | 24.689 | 14.689 | reject |
+| trunk48 | 2 | 49.440 | 3.236 | 20.619 | 24.176 | 14.230 | reject |
+| trunk32 | 2 | 47.970 | 3.335 | 18.703 | 24.722 | 14.578 | reject |
+
+The best mechanism check is `trunk64`: pairformer moved in the intended
+direction by `0.28s`, but the extra trunk calls and changed memory/cache state
+made diffusion `0.59s` slower, so total throughput fell.  More aggressive
+trunk-only bucketing made the trunk itself worse.  This closes the cheap
+scheduler option: avoiding padded pairformer work without losing throughput
+needs a true segmented/ragged pairformer kernel or schedule, not Python-level
+sub-batching.
+
 Ending-node triangle attention looked like a more attractive layout boundary in
 isolation.  Job `96838`
 (`runs/triangle_attention_current_breakdown_20260703_070352_8c3409e`) first
@@ -2446,6 +2472,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Raising mixed-token `N_sample=5` batch size from 16 to 32 | current full gate slowed from `3.64` to `2.93` generated samples/s because pairformer and diffusion transformer ran on a much larger padded physical shape | bigger batches only help when bucketing keeps token ranges tight; memory headroom alone is not a throughput argument |
 | Lowering mixed-token `N_sample=5` batch size from 16 to 8 | current full gate slowed from `3.56` to `3.0-3.1` generated samples/s because diffusion/atom work split into four smaller launch groups | tighter token ranges are useful only if the saved padding beats the lost batching efficiency |
 | Explicit mixed-token bucket sizes `96`, `64`, `48`, and `32` at B16 | all slowed the representative N200 gate; best explicit bucket fell from `3.649` to `3.270` generated samples/s and narrower buckets reached `2.307` generated samples/s | queue bucketing saves some padded pairformer work only by fragmenting diffusion/atom batches; the real solution needs ragged kernels or segmented schedules, not more launch groups |
+| Internal pairformer-only trunk buckets while keeping diffusion B16 | best case `trunk64` improved pairformer `15.736 -> 15.461s`, but diffusion worsened `24.098 -> 24.689s` and throughput fell `3.608 -> 3.575` generated samples/s; narrower trunk buckets were much worse | Python-level sub-batching changes launch/cache balance and is not the segmented-pairformer solution; remove the knob and target true ragged kernels/schedules |
 | Materializing pairformer token-attention bias as contiguous `[B, H, Q, K]` | traced pairformer SDPA shape `[16, 16, 124, 24]` moved from math-dispatch attempt to a cuDNN frontend "no valid execution plans" error; fallback timing then segfaulted in the isolated screen | the non-contiguous bias layout is not the only blocker; head_dim 24 plus dense additive bias lacks a safe cuDNN plan in this runtime, so do not pay a bias copy hoping for a backend flip |
 | CUEQ `attention_pair_bias` for diffusion token attention | native pair-bias projection needed an explicit zero LayerNorm bias, then CUEQ's internal SDPA failed with `No valid execution plans built`; forced PyTorch fallback was slower than the current full conv2d+SDPA baseline | CUEQ's wrapper is not a drop-in win here; use it only if we can call a narrower fused pair-bias producer while keeping Protenix's SDPA fallback policy |
 | Reusing Triton `TriAttentionFunction` for pairformer token attention | isolated `N=220` hotspot improved, but the full mixed-sequence gate averaged only `45.16s -> 44.89s` predict (`+0.6%`) and one repeat regressed | padding `D=24` to `D=32` and copying layouts is too much integration overhead; if revisited, write a direct dense-bias `D=24` kernel instead |

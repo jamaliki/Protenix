@@ -27,7 +27,6 @@ from runner.inference import (
     _queue_batch_signature,
     _run_prediction_batch,
     _summarize_model_time_dicts,
-    _token_bucket_groups,
 )
 from runner.campaign_inputs import (
     estimate_record_token_count,
@@ -293,11 +292,8 @@ class TestCampaignJsonBatching(unittest.TestCase):
             def update_model_configs(self, configs):
                 self.configs_seen.append(configs)
 
-            def predict_token_batch(
-                self, data_items, *, exact_token_trunk=False, trunk_bucket_size=0
-            ):
+            def predict_token_batch(self, data_items, *, exact_token_trunk=False):
                 self.exact_token_trunk = exact_token_trunk
-                self.trunk_bucket_size = trunk_bucket_size
                 return [{"ok": data["N_token"].item()} for data in data_items]
 
         def make_data(n_token: int) -> dict:
@@ -324,7 +320,6 @@ class TestCampaignJsonBatching(unittest.TestCase):
 
         self.assertEqual(result, [{"ok": 32}, {"ok": 40}])
         self.assertTrue(runner.exact_token_trunk)
-        self.assertEqual(runner.trunk_bucket_size, 0)
         self.assertEqual(len(runner.configs_seen), 1)
 
     def test_token_padding_does_not_pad_restype_class_axis(self):
@@ -368,68 +363,6 @@ class TestCampaignJsonBatching(unittest.TestCase):
             _queue_batch_signature(len40, "auto", token_bucket_size=32),
             _queue_batch_signature(len96, "auto", token_bucket_size=32),
         )
-
-    def test_internal_trunk_buckets_keep_original_batch_group(self):
-        self.assertEqual(
-            _token_bucket_groups([40, 52, 64, 76, 88, 100, 112, 124], 64),
-            [[0, 1, 2], [3, 4, 5, 6, 7]],
-        )
-        self.assertEqual(
-            _token_bucket_groups([40, 220, 52, 208], 64),
-            [[0, 2], [1, 3]],
-        )
-
-    def test_trunk_bucket_knob_passes_to_token_batch_without_queue_split(self):
-        class DummyRunner:
-            def __init__(self):
-                self.calls = []
-
-            def update_model_configs(self, configs):
-                self.configs = configs
-
-            def predict_token_batch(
-                self, data_items, *, exact_token_trunk=False, trunk_bucket_size=0
-            ):
-                self.calls.append(
-                    {
-                        "items": [data["N_token"].item() for data in data_items],
-                        "exact": exact_token_trunk,
-                        "trunk_bucket_size": trunk_bucket_size,
-                    }
-                )
-                return [{"ok": data["N_token"].item()} for data in data_items]
-
-        def make_data(n_token: int) -> dict:
-            return {
-                "N_token": torch.tensor([n_token]),
-                "input_feature_dict": {
-                    "residue_index": torch.zeros(n_token, dtype=torch.long),
-                    "token_index": torch.zeros(n_token, dtype=torch.long),
-                    "token_bonds": torch.zeros(n_token, n_token),
-                    "msa": torch.zeros(1, n_token, dtype=torch.long),
-                    "restype": torch.zeros(n_token, 32),
-                },
-            }
-
-        configs = SimpleNamespace(
-            model_name="protenix_base_default_v1.0.0",
-            skip_amp=SimpleNamespace(),
-            inference_trunk_bucket_size=64,
-        )
-        runner = DummyRunner()
-
-        result = _run_prediction_batch(
-            runner,
-            configs,
-            [(make_data(40), None), (make_data(52), None), (make_data(124), None)],
-            "auto",
-        )
-
-        self.assertEqual(result, [{"ok": 40}, {"ok": 52}, {"ok": 124}])
-        self.assertEqual(len(runner.calls), 1)
-        self.assertEqual(runner.calls[0]["items"], [40, 52, 124])
-        self.assertFalse(runner.calls[0]["exact"])
-        self.assertEqual(runner.calls[0]["trunk_bucket_size"], 64)
 
     def test_singleton_prediction_batch_keeps_exact_path(self):
         class DummyRunner:

@@ -248,7 +248,6 @@ class InferenceRunner(object):
         data_items: list[Mapping[str, Any]],
         *,
         exact_token_trunk: bool = False,
-        trunk_bucket_size: int = 0,
     ) -> list[dict[str, torch.Tensor]]:
         """Batch the expensive token trunk for ragged campaign records.
 
@@ -297,7 +296,6 @@ class InferenceRunner(object):
             for feature_dict in feature_dicts
         ]
         pad_token_trunk = len(set(token_counts)) > 1 and not exact_token_trunk
-        trunk_bucket_size = max(0, int(trunk_bucket_size))
         max_tokens = max(token_counts)
         chunk_size = self.configs.infer_setting.chunk_size
         if (
@@ -348,99 +346,6 @@ class InferenceRunner(object):
                 trunk_sec_per_item = (
                     time.perf_counter() - trunk_start
                 ) / len(data_items)
-                trunk_source = "exact-trunk"
-            elif pad_token_trunk and trunk_bucket_size > 0:
-                # This is the scheduling boundary that queue-level bucketing
-                # could not express.  Queue buckets reduce pairformer padding,
-                # but also split diffusion into many small launch groups.  Here
-                # only the pairformer trunk is sub-batched by token length; the
-                # diffusion sampler below still sees the original large batch.
-                #
-                # Output order is preserved through the index lists, so the
-                # downstream diffusion/randomness path still consumes records in
-                # the same order as the caller-provided batch.
-                s_items: list[torch.Tensor | None] = [None] * len(data_items)
-                z_items: list[torch.Tensor | None] = [None] * len(data_items)
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                trunk_start = time.perf_counter()
-                for group_indices in _token_bucket_groups(
-                    token_counts, trunk_bucket_size
-                ):
-                    group_token_counts = [token_counts[idx] for idx in group_indices]
-                    group_max_tokens = max(group_token_counts)
-                    group_pad_token_trunk = len(set(group_token_counts)) > 1
-                    if group_pad_token_trunk:
-                        trunk_feature_dict = _stack_tree(
-                            [
-                                _pad_token_trunk_tree(
-                                    _trunk_feature_dict(prepared_features[idx]),
-                                    n_token=token_counts[idx],
-                                    max_tokens=group_max_tokens,
-                                )
-                                for idx in group_indices
-                            ]
-                        )
-                        s_inputs_batch = torch.stack(
-                            [
-                                _pad_tensor_token_axes(
-                                    s_inputs_list[idx],
-                                    token_axes=(0,),
-                                    max_tokens=group_max_tokens,
-                                )
-                                for idx in group_indices
-                            ],
-                            dim=0,
-                        )
-                        pair_mask = _make_pair_mask(
-                            token_counts=group_token_counts,
-                            max_tokens=group_max_tokens,
-                            device=s_inputs_batch.device,
-                            dtype=s_inputs_batch.dtype,
-                        )
-                    else:
-                        trunk_feature_dict = _stack_tree(
-                            [
-                                _trunk_feature_dict(prepared_features[idx])
-                                for idx in group_indices
-                            ]
-                        )
-                        s_inputs_batch = torch.stack(
-                            [s_inputs_list[idx] for idx in group_indices],
-                            dim=0,
-                        )
-                        pair_mask = None
-
-                    s_batch, z_batch = self.model.get_pairformer_output_from_s_inputs(
-                        input_feature_dict=trunk_feature_dict,
-                        s_inputs=s_inputs_batch,
-                        N_cycle=self.model.N_cycle,
-                        inplace_safe=inplace_safe,
-                        chunk_size=chunk_size,
-                        pair_mask=pair_mask,
-                    )
-                    for group_batch_idx, item_idx in enumerate(group_indices):
-                        n_token_i = token_counts[item_idx]
-                        if group_pad_token_trunk:
-                            s_items[item_idx] = s_batch[group_batch_idx, :n_token_i]
-                            z_items[item_idx] = z_batch[
-                                group_batch_idx, :n_token_i, :n_token_i
-                            ]
-                        else:
-                            s_items[item_idx] = s_batch[group_batch_idx]
-                            z_items[item_idx] = z_batch[group_batch_idx]
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                trunk_sec_per_item = (
-                    time.perf_counter() - trunk_start
-                ) / len(data_items)
-                if any(s_i is None for s_i in s_items) or any(
-                    z_i is None for z_i in z_items
-                ):
-                    raise RuntimeError("internal token trunk bucketing lost an item")
-                s_items = [s_i for s_i in s_items if s_i is not None]
-                z_items = [z_i for z_i in z_items if z_i is not None]
-                trunk_source = f"bucketed-token-trunk{trunk_bucket_size}"
             else:
                 if pad_token_trunk:
                     trunk_feature_dict = _stack_tree(
@@ -509,13 +414,13 @@ class InferenceRunner(object):
                     else z_batch[idx]
                     for idx in range(len(data_items))
                 ]
-                trunk_source = "token-trunk"
 
             use_batched_diffusion = _batched_token_diffusion_enabled(
                 self.configs, len(data_items)
             )
             batched_coordinates = None
             diffusion_time_per_item = None
+            trunk_source = "exact-trunk" if exact_token_trunk else "token-trunk"
             diffusion_batch_source = f"{trunk_source}-batch"
             if use_batched_diffusion:
                 batched_coordinates, batch_diffusion_time = (
@@ -622,19 +527,6 @@ def _inference_token_bucket_size(configs: Any) -> int:
         value = int(configs.get("inference_token_bucket_size", 0))
     except (TypeError, ValueError):
         logger.warning("Invalid inference_token_bucket_size; using input order.")
-        return 0
-    return max(0, value)
-
-
-def _inference_trunk_bucket_size(configs: Any) -> int:
-    """Return the optional internal pairformer-trunk bucket width."""
-    try:
-        if hasattr(configs, "get"):
-            value = int(configs.get("inference_trunk_bucket_size", 0))
-        else:
-            value = int(getattr(configs, "inference_trunk_bucket_size", 0))
-    except (TypeError, ValueError):
-        logger.warning("Invalid inference_trunk_bucket_size; disabling trunk buckets.")
         return 0
     return max(0, value)
 
@@ -977,27 +869,6 @@ def _token_bucket_id(n_token: int, bucket_size: int) -> int:
     return (n_token - 1) // bucket_size
 
 
-def _token_bucket_groups(token_counts: list[int], bucket_size: int) -> list[list[int]]:
-    """Group item indices by approximate token length while preserving order.
-
-    This is used *inside* one inference batch.  Unlike the streaming queue
-    bucket, it does not change which records share the diffusion sampler; it
-    only splits the pairformer trunk so padded ``N_token x N_token`` work can
-    be reduced without fragmenting the denoising loop.
-    """
-    if bucket_size <= 0:
-        return [list(range(len(token_counts)))]
-    groups: dict[int, list[int]] = {}
-    order: list[int] = []
-    for index, n_token in enumerate(token_counts):
-        bucket_id = _token_bucket_id(n_token, bucket_size)
-        if bucket_id not in groups:
-            groups[bucket_id] = []
-            order.append(bucket_id)
-        groups[bucket_id].append(index)
-    return [groups[bucket_id] for bucket_id in order]
-
-
 def _queue_batch_signature(
     data: Mapping[str, Any], batch_mode: str, token_bucket_size: int
 ) -> Any:
@@ -1218,7 +1089,6 @@ def _run_prediction_batch(
         return runner.predict_token_batch(
             [data for data, _atom_array in items],
             exact_token_trunk=effective_mode == "trunk_exact",
-            trunk_bucket_size=_inference_trunk_bucket_size(configs),
         )
     batch_data = first_data if len(items) == 1 else _stack_prediction_inputs(items)
     return runner.predict(batch_data)
