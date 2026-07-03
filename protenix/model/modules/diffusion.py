@@ -30,13 +30,39 @@ from protenix.model.triangular.layers import LayerNorm
 from protenix.model.utils import expand_at_dim, get_checkpoint_fn, permute_final_dims
 
 
+_FALSE_ENV_VALUES = {"0", "false", "off", "no"}
+_AUTO_ENV_VALUES = {"", "auto", "default"}
+
+
 def broadcast_diffusion_s_enabled() -> bool:
-    return os.getenv("PROTENIX_BROADCAST_DIFFUSION_S", "0").lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
+    return (
+        os.getenv("PROTENIX_BROADCAST_DIFFUSION_S", "0").lower()
+        not in _FALSE_ENV_VALUES
+    )
+
+
+def _cuda_bf16_supported() -> bool:
+    try:
+        return torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    except (AssertionError, RuntimeError):
+        return False
+
+
+def diffusion_core_bf16_enabled() -> bool:
+    """Return whether diffusion transformer activations should use BF16.
+
+    On H100, the mixed-sequence N_sample=5 gate showed that the diffusion
+    transformer was dominated by FP32/TF32 GEMMs.  Keeping its activations in
+    BF16 cut that subrange by about 40% without moving pairformer or confidence
+    time, so BF16-capable CUDA inference now takes the fast path by default.
+    Set ``PROTENIX_BF16_DIFFUSION_CORE=0`` to recover the old conservative FP32
+    core for numerical audits or unsupported deployments.
+    """
+
+    value = os.getenv("PROTENIX_BF16_DIFFUSION_CORE")
+    if value is None or value.strip().lower() in _AUTO_ENV_VALUES:
+        return _cuda_bf16_supported()
+    return value.strip().lower() not in _FALSE_ENV_VALUES
 
 
 def _can_broadcast_diffusion_s(
@@ -401,28 +427,16 @@ class DiffusionModule(nn.Module):
         return stats
 
     def _diffusion_core_dtype(self, fallback: torch.dtype) -> torch.dtype:
-        if os.getenv("PROTENIX_BF16_DIFFUSION_CORE", "0").lower() in {
-            "0",
-            "false",
-            "off",
-            "no",
-        }:
+        if not diffusion_core_bf16_enabled():
             return torch.float32
         if fallback == torch.float16:
             return torch.float16
         return torch.bfloat16
 
-    def _diffusion_core_autocast(self):
-        # Precision is a local performance knob.  The token diffusion core was
-        # profiled as safe and faster in BF16, but the flag keeps default
-        # behavior unchanged and gives unsupported GPUs a clean fallback.
-        if (
-            os.getenv("PROTENIX_BF16_DIFFUSION_CORE", "0").lower()
-            in {"0", "false", "off", "no"}
-            or not torch.cuda.is_available()
-        ):
+    def _diffusion_core_autocast(self, dtype: torch.dtype):
+        if not diffusion_core_bf16_enabled() or not torch.cuda.is_available():
             return nullcontext()
-        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return torch.autocast(device_type="cuda", dtype=dtype)
 
     def _atom_attention_autocast(self):
         # Atom attention dominates traffic at high sample counts.  BF16 reduces
@@ -598,7 +612,7 @@ class DiffusionModule(nn.Module):
         with self._profile_block("transformer"), torch.profiler.record_function(
             "protenix/diffusion_transformer"
         ):
-            with self._diffusion_core_autocast():
+            with self._diffusion_core_autocast(transformer_dtype):
                 a_token = self.diffusion_transformer(
                     a=a_token,
                     s=s_single.to(dtype=transformer_dtype),

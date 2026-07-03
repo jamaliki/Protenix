@@ -590,6 +590,30 @@ the conservative current-default number: `212.51s -> 61.41s` (`3.46x`) and
 `0.753 -> 2.605` generated samples/s (`3.46x`) over the old low-sample
 boundary.
 
+Job `96275`
+(`runs/bf16_diffusion_core_gate_n200_20260703_003400_8b51580`) then tested the
+next profile-driven precision change.  The post-LayerNorm trace showed the
+batched diffusion transformer's largest GPU bucket was FP32/TF32 GEMM work, so
+the gate compared FP32 versus BF16 diffusion-core activations while keeping the
+same 32 mixed 40-220-token records, `N_sample=5`, `N_step=200`, batch size 16,
+confidence enabled, and BF16 full attention.  It also crossed the old
+BF16/FP16-only LayerNorm policy with the new shape-gated FP32 LayerNorm policy:
+
+| case | predict sec | generated samples/s | pairformer | diffusion | diffusion transformer | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| BF16 LayerNorm policy, FP32 diffusion core | 61.78 | 2.590 | 16.53 | 41.23 | 24.28 | 2.47 | baseline repeat |
+| BF16 LayerNorm policy, BF16 diffusion core | 51.40 | 3.113 | 16.62 | 30.83 | 13.99 | 2.43 | core precision win |
+| shape-gated LayerNorm, FP32 diffusion core | 60.92 | 2.626 | 16.55 | 40.39 | 23.54 | 2.46 | LayerNorm shape gate alone is small here |
+| shape-gated LayerNorm, BF16 diffusion core | 51.16 | 3.127 | 16.53 | 30.59 | 13.93 | 2.50 | promoted default |
+
+This is the cleanest precision win so far: pairformer and confidence are flat,
+while the diffusion transformer subrange falls from about `23.5-24.3s` to
+`13.9-14.0s`.  The default policy now enables BF16 diffusion core on
+BF16-capable CUDA devices; set `PROTENIX_BF16_DIFFUSION_CORE=0` to recover the
+old conservative FP32 core.  The current mixed-sequence `N_sample=5` headline is
+therefore `212.51s -> 51.16s` predict and `0.753 -> 3.127` generated samples/s,
+or `4.15x` over the old low-sample boundary.
+
 Launch-level follow-up: job `96110`
 (`runs/flat_bf16_batch_profile_20260702_221601_c8a532d`) proved the profiler
 wrapper needed to catch `SystemExit` before exporting artifacts.  Corrected job
@@ -1524,11 +1548,14 @@ roughly 720-730 TFLOP/s GEMM throughput or it will lose the whole win.
 
 ### 4. Use lower precision only where profiling supports it
 
-`PROTENIX_BF16_DIFFUSION_CORE=1` and `PROTENIX_BF16_ATOM_ATTENTION=1` reduce
-traffic in the diffusion core and atom attention path.  Full token attention is
-allowed to stay BF16 with `PROTENIX_ATTENTION_FORCE_FP32=0`, but local atom
-attention still has guards and fallbacks because not every cuDNN/SDPA shape is
-safe or fast in BF16.
+The diffusion core now defaults to BF16 on BF16-capable CUDA devices after the
+mixed-sequence gate showed a clear end-to-end win concentrated in the diffusion
+transformer.  Set `PROTENIX_BF16_DIFFUSION_CORE=0` for conservative numerical
+audits.  `PROTENIX_BF16_ATOM_ATTENTION=1` remains opt-in: it reduces traffic in
+the atom attention path at high sample counts, but local atom attention still
+has guards and fallbacks because not every cuDNN/SDPA shape is safe or fast in
+BF16.  Full token attention is allowed to stay BF16 with
+`PROTENIX_ATTENTION_FORCE_FP32=0`.
 
 The lesson is to use precision as a local performance decision, not a global
 switch.

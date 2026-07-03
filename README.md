@@ -130,7 +130,11 @@ For the common low-sample campaign range (`N_sample=1-5`), leave
 `PROTENIX_BATCH_DIFFUSION_MAX_SAMPLES` at its default `5` so the diffusion tail
 can batch records and samples together.  For maximum throughput on H100, also
 set `PROTENIX_ATTENTION_FORCE_FP32=0`; this lets full token attention stay in
-BF16/cuDNN instead of upcasting q/k/v to FP32.  Do not enable
+BF16/cuDNN instead of upcasting q/k/v to FP32.  The diffusion transformer core
+now defaults to BF16 on BF16-capable CUDA GPUs because the representative mixed
+gate showed its FP32/TF32 GEMMs were the largest remaining diffusion bottleneck;
+set `PROTENIX_BF16_DIFFUSION_CORE=0` only for conservative numerical audits.  Do
+not enable
 `PROTENIX_DIFFUSION_TRANSFORMER_SAMPLE_AXIS=1` by default yet: it is useful for
 kernel experiments, but the full gate did not show a robust win over the
 flattened BF16 path.
@@ -203,7 +207,7 @@ dumping:
 | One combined JSON with 32 same-shape records | 361.8 s runner time | 69.3 s runner time | 5.2x after initialization |
 | 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.9 s summed predict, 0.943 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.70x predict, 5.69x throughput |
-| 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 61.4 s, 2.61 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, and default Triton LayerNorm fallback | 3.46x over the old branch boundary |
+| 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 51.2 s, 3.13 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, BF16 diffusion core, and default Triton LayerNorm fallback | 4.15x over the old branch boundary |
 
 Quick sanity check: a good campaign run should log messages like
 `Predicting 32 same-shape (auto) input(s)` or
