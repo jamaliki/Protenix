@@ -755,14 +755,14 @@ This profile motivates one narrow follow-up instead of re-enabling the rejected
 broad fusion flag.  Commit `b5c8c3e` adds
 `PROTENIX_TRITON_FUSED_ELEMENTWISE_MIN_ELEMENTS`, which keeps the default-off
 generic Triton elementwise fusions away from tiny tensors.  The planned gate is
-job `96592`
+job `96600`
 (`runs/elementwise_threshold_gate_n200_20260703_034213_b5c8c3e`), comparing the
 current default with thresholds of `1,000,000` and `8,000,000` output elements
-on the same `N_sample=5`, `N_step=200`, batch-16 campaign.  The job was queued
-on the main `gpu` partition after `gpu-canary` was occupied by an unrelated
-interactive allocation.  Do not promote the threshold knob unless that same-job
-N200 gate improves generated samples/sec and the intended diffusion/pairformer
-subtotals move in the expected direction.
+on the same `N_sample=5`, `N_step=200`, batch-16 campaign.  The job is queued
+on `gpu-canary` with `afterany:96494`, because an interactive allocation
+currently owns that node.  Do not promote the threshold knob unless that
+same-job N200 gate improves generated samples/sec and the intended
+diffusion/pairformer subtotals move in the expected direction.
 
 Launch-level follow-up: job `96110`
 (`runs/flat_bf16_batch_profile_20260702_221601_c8a532d`) proved the profiler
