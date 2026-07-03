@@ -58,6 +58,28 @@ def triton_fused_elementwise_enabled() -> bool:
     return _env_flag_enabled("PROTENIX_TRITON_FUSED_ELEMENTWISE", default=False)
 
 
+def _min_elementwise_elements() -> int:
+    raw = os.getenv("PROTENIX_TRITON_FUSED_ELEMENTWISE_MIN_ELEMENTS")
+    if raw is None:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _large_enough_for_elementwise_triton(n_elements: int) -> bool:
+    """Keep opt-in Triton fusion away from tiny tensors.
+
+    The global elementwise flag is intentionally default-off because a previous
+    representative gate showed that many small Triton launches can overwhelm
+    the memory-traffic savings.  The current profile still has large BF16
+    add/mul/silu kernels near the top, so experiments can set a minimum element
+    count and fuse only the HBM-bound cases worth a Triton launch.
+    """
+    return n_elements > 0 and n_elements >= _min_elementwise_elements()
+
+
 def triton_triangle_attention_epilogue_enabled() -> bool:
     """Whether to fuse cuequivariance triangle-attention's output epilogue.
 
@@ -105,7 +127,7 @@ def _can_use_triton(*tensors: torch.Tensor) -> bool:
             return False
         if not tensor.is_contiguous():
             return False
-    return tensors[0].numel() > 0
+    return _large_enough_for_elementwise_triton(tensors[0].numel())
 
 
 def _can_use_first_dim_broadcast_triton(
@@ -134,7 +156,9 @@ def _can_use_first_dim_broadcast_triton(
         return False
     if x.shape[0] != 1 or y.shape[0] <= 1:
         return False
-    return x.shape[1:] == y.shape[1:] and x.numel() > 0
+    return x.shape[1:] == y.shape[1:] and _large_enough_for_elementwise_triton(
+        y.numel()
+    )
 
 
 def _broadcast_z_mode(
@@ -441,7 +465,10 @@ def triton_silu_mul_split(
         return None
     if not x.is_cuda or x.dtype not in _SUPPORTED_DTYPES or not x.is_contiguous():
         return None
-    if x.shape[-1] != 2 * split_size or x.numel() == 0:
+    if x.shape[-1] != 2 * split_size:
+        return None
+    output_elements = x.numel() // 2
+    if not _large_enough_for_elementwise_triton(output_elements):
         return None
     out = torch.empty((*x.shape[:-1], split_size), dtype=x.dtype, device=x.device)
     _silu_mul_split_kernel[_grid(out.numel())](
