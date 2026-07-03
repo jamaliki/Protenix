@@ -1336,6 +1336,46 @@ pairformer work, and the smaller long-token second batch does not recover
 enough diffusion throughput to compensate.  Keep B16 as the documented fixed
 batch-size default for this mixed-length N5 campaign.
 
+Ending-node triangle attention looked like a more attractive layout boundary in
+isolation.  Job `96838`
+(`runs/triangle_attention_current_breakdown_20260703_070352_8c3409e`) first
+updated `scripts/perf/triangle_attention_breakdown.py` so its manual path times
+the same fused CUEQ epilogue as the production module.  At `B=16`, `N=220`, the
+starting-node module took `3.12 ms`, while the ending-node module took
+`5.01 ms`.  The split timer attributed most of the ending penalty to applying
+LayerNorm after the logical pair-axis transpose: `layer_norm` was `1.79 ms` in
+ending attention versus `0.52 ms` in starting attention.
+
+Because channel-wise LayerNorm commutes with swapping the two residue axes, the
+next screen tested `LN(x).transpose(...)` for ending-node attention instead of
+`LN(x.transpose(...))`.  The diagnostic-only path in commit `fede984` was a
+strong isolated win:
+
+| shape | default ending manual ms | norm-first manual ms | module gate off | module gate on | note |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `B=16`, `N=220` | 5.46-5.48 | 4.39-4.41 | 4.99 ms | 3.94 ms | `~21%` module-local win |
+| `B=16`, `N=148` | 2.50 | 2.02 | 2.23 ms | 1.75 ms | `~22%` module-local win |
+| `B=16`, `N=96` | 2.18-2.19 | 2.04-2.08 | 1.97 ms | 1.76 ms | smaller but still positive |
+
+The representative mixed-sequence gate rejected it.  Job `96851`
+(`runs/ending_norm_e2e_gate_n200_20260703_071455_b8e9e12`) alternated the
+production path off/on on the same 32-record, 40-220-token, `N_sample=5`,
+`N_step=200`, batch-16 campaign:
+
+| case | predict sec | generated samples/s | pairformer | diffusion | diffusion transformer | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| norm-first off | 44.49 | 3.596 | 15.78 | 24.13 | 14.44 | baseline |
+| norm-first on | 44.23 | 3.617 | 15.75 | 23.86 | 14.08 | within noise |
+| norm-first off repeat | 44.06 | 3.631 | 15.67 | 23.82 | 14.09 | baseline repeat |
+| norm-first on repeat | 44.40 | 3.604 | 15.75 | 24.06 | 14.28 | repeat regressed |
+
+Decision: reject the production path and remove it.  The local mechanism is
+real, but in the full workload the pairformer subtotal did not move
+consistently and total throughput averaged flat.  If revisiting ending-node
+attention, do not stop at commuting LayerNorm; the likely larger boundary is a
+contiguous ending-node producer that writes CUEQ's swapped q/k/v and bias
+layouts directly while preserving the current CUEQ attention throughput.
+
 For this 245-token input, `B=32-64` is the practical knee.  Larger batches keep
 raising memory but add little throughput.  The low-sample workload is therefore
 not the same bottleneck as the `N_sample=2560` same-output workload: `N_sample=1`
@@ -2295,6 +2335,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | `torch.compile` around the diffusion-token transformer | isolated 24-block screens improved `1.29-1.34x`; the first model gate failed in a cuDNN SDPA plan, and the safer no-cuDNN-SDPA gate was flat/slower (`44.59 -> 44.92s`, repeat `43.87 -> 43.95s`) | block-level fusion remains attractive, but a generic Inductor wrapper does not move the real campaign path |
 | Fused self-attention `q/k/v/g` projection | exact parity but trunk block slowed from about 14.1 ms to 14.9 ms | fewer launches are not enough if the wider GEMM/cache/layout is worse |
 | Fused ordinary self-attention q/k/v projection | hotspot moved the intended `qkv+sdpa+gate+out` subrange, but the full mixed `N_sample=5`, `N_step=200` gate averaged flat/slower (`44.69s -> 44.86s`) and one repeat regressed | producer fusion must still move the full workload; local launch savings can disappear in wider GEMM/layout/cache effects |
+| Ending-node triangle attention `LN(x).transpose(...)` | ending-attention module screens improved about `21-22%`, but the full mixed `N_sample=5`, `N_step=200` gate was flat/noisy (`44.49 -> 44.23s`, repeat `44.06 -> 44.40s`) and pairformer did not consistently move | channel-wise LayerNorm commutes with the pair-axis transpose, but moving only this boundary is not enough; revisit only as part of a larger contiguous ending-node q/k/v+bias producer |
 | Fused `AdaptiveLayerNorm` conditioning projections | AdaLN subrange shrank slightly in some hotspot shapes, but full diffusion blocks were flat/slower, e.g. `1.416 -> 1.494 ms` at `N_token=220` | do not carry default-off concatenated-GEMM knobs unless the enclosing block moves |
 | Fused transition `a1/a2` projection without split-aware consumer | transition slowed from about 5.3 ms to 7.0 ms | fusing the producer can break the consumer by creating non-contiguous halves |
 | Custom Triton transition input GEMM+SiLU | synthetic +12%, but real transition input path slowed from 3.09 ms to 3.54 ms | custom GEMM screens must use real module weights/autocast; cuBLAS efficiency is the bottleneck to match |

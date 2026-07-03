@@ -33,11 +33,6 @@ def cueq_bool_mask_enabled() -> bool:
     return value.lower() not in _FALSE_ENV_VALUES
 
 
-def ending_attention_norm_first_enabled() -> bool:
-    value = os.getenv("PROTENIX_ENDING_ATTENTION_NORM_FIRST", "1")
-    return value.lower() not in _FALSE_ENV_VALUES
-
-
 def kernel_triangular_mult(
     x: torch.Tensor,
     direction: str,
@@ -690,27 +685,12 @@ class TriangleAttention(nn.Module):
                 x.shape[:-1],
             )
 
-        norm_before_ending_transpose = (
-            not self.starting
-            and triangle_attention == "cuequivariance"
-            and ending_attention_norm_first_enabled()
-        )
-
-        if norm_before_ending_transpose:
-            # LayerNorm is pointwise over the channel dimension, so it commutes
-            # with swapping the two residue axes.  Normalizing the original
-            # contiguous pair layout avoids the slow strided-read LayerNorm
-            # kernel observed in ending-node CUEQ attention profiles.
-            x = self.layer_norm(x)
+        if not self.starting:
             x = x.transpose(-2, -3)
             mask = mask.transpose(-1, -2)
-        else:
-            if not self.starting:
-                x = x.transpose(-2, -3)
-                mask = mask.transpose(-1, -2)
 
-            # [*, I, J, C_in]
-            x = self.layer_norm(x)
+        # [*, I, J, C_in]
+        x = self.layer_norm(x)
 
         # CUEQ consumes a boolean mask, while the PyTorch/DeepSpeed paths
         # consume an additive attention bias.  The old CUEQ path built the
