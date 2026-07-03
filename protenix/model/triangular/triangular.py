@@ -687,7 +687,7 @@ class TriangleAttention(nn.Module):
     def _cueq_ending_contiguous_forward(
         self,
         x: torch.Tensor,
-        mask: torch.Tensor,
+        mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Ending-node CUEQ path that keeps expensive producers contiguous.
 
@@ -701,6 +701,9 @@ class TriangleAttention(nn.Module):
         layouts directly.  It preserves the vendor CUEQ/cuDNN attention
         mainloop; the only new work is memory-layout production around it.
         """
+        if mask is None:
+            mask = x.new_ones(x.shape[:-1])
+
         x = self.layer_norm(x)
 
         if cueq_bool_mask_enabled():
