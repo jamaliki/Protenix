@@ -78,6 +78,7 @@ if triton is not None and tl is not None:
         block_d: tl.constexpr,
         dot_input_precision: tl.constexpr,
     ):
+        input_dtype = q_ptr.dtype.element_ty
         query_block = tl.program_id(0)
         head = tl.program_id(1)
         batch = tl.program_id(2)
@@ -129,7 +130,6 @@ if triton is not None and tl is not None:
         # Cast probabilities down for the dot.  This mirrors flash-attention
         # style kernels: reductions stay in fp32, but the tensor-core matmul can
         # use the input dtype instead of spending the whole launch in scalar fp32.
-        input_dtype = q.dtype.element_ty
         out = tl.dot(
             probs.to(input_dtype),
             v,
