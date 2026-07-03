@@ -18,6 +18,17 @@ set -euo pipefail
 # answers the kernel-boundary question we care about: which launches dominate
 # B32/N251 many-sequence throughput after the diffusion path has been optimized?
 
+if [[ -z "${PROTENIX_REPO:-}" || -z "${RUN_DIR:-}" ]]; then
+  ENV_FILE=${NCU_JOB_ENV:-${SLURM_SUBMIT_DIR:-$PWD}/ncu_job_env.sh}
+  if [[ -f "$ENV_FILE" ]]; then
+    # Slurm on Tokyo has held jobs submitted with explicit --export=... before
+    # they reached the batch script.  Sourcing a tiny run-local env file keeps
+    # submission boring while still recording the exact parameters.
+    # shellcheck source=/dev/null
+    source "$ENV_FILE"
+  fi
+fi
+
 PROTENIX_REPO=${PROTENIX_REPO:?set PROTENIX_REPO to the Protenix checkout}
 RUN_DIR=${RUN_DIR:?set RUN_DIR to a writable profiling run directory}
 PY=${PY:-/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/env-boltz2/bin/python}

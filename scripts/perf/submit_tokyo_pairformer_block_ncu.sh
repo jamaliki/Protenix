@@ -19,13 +19,19 @@ NCU_SET=${NCU_SET:-full}
 
 mkdir -p "$RUN_DIR/slurm_logs"
 
-EXPORT_VARS="PROTENIX_REPO=$REPO,RUN_DIR=$RUN_DIR,TOKENS=$TOKENS,BATCH=$BATCH,WARMUP=$WARMUP,NCU_ITERS=$NCU_ITERS,NCU_SET=$NCU_SET,HOME=${HOME:-},USER=${USER:-}"
+cat > "$RUN_DIR/ncu_job_env.sh" <<EOF
+export PROTENIX_REPO=$REPO
+export RUN_DIR=$RUN_DIR
+export TOKENS=$TOKENS
+export BATCH=$BATCH
+export WARMUP=$WARMUP
+export NCU_ITERS=$NCU_ITERS
+export NCU_SET=$NCU_SET
+EOF
 
 JOB_ID=$(
   cd "$RUN_DIR"
-  sbatch --parsable \
-    --export="$EXPORT_VARS" \
-    "$REPO/scripts/perf/tokyo_pairformer_block_ncu.sbatch"
+  sbatch --parsable "$REPO/scripts/perf/tokyo_pairformer_block_ncu.sbatch"
 )
 
 echo "job_id=$JOB_ID"
