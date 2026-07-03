@@ -13,6 +13,7 @@
 # limitations under the License.
 # Copyright 2021 AlQuraishi Laboratory
 
+import math
 import os
 from abc import ABC, abstractmethod
 from functools import partial, partialmethod
@@ -21,8 +22,22 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 
-from protenix.model.triangular.layers import Attention, LayerNorm, OpenfoldLinear
-from protenix.model.utils import chunk_layer, is_fp16_enabled, permute_final_dims
+from protenix.model.modules.fused_elementwise_triton import (
+    triton_sigmoid_mul_heads_first,
+    triton_sigmoid_mul_heads_first_swapped_gate,
+)
+from protenix.model.triangular.layers import (
+    Attention,
+    LayerNorm,
+    OpenfoldLinear,
+    cuequivariance_triangular_attn,
+)
+from protenix.model.utils import (
+    chunk_layer,
+    flatten_final_dims,
+    is_fp16_enabled,
+    permute_final_dims,
+)
 
 
 _FALSE_ENV_VALUES = {"0", "false", "off", "no"}
@@ -30,6 +45,11 @@ _FALSE_ENV_VALUES = {"0", "false", "off", "no"}
 
 def cueq_bool_mask_enabled() -> bool:
     value = os.getenv("PROTENIX_CUEQ_BOOL_MASK", "1")
+    return value.lower() not in _FALSE_ENV_VALUES
+
+
+def cueq_ending_contiguous_producer_enabled() -> bool:
+    value = os.getenv("PROTENIX_CUEQ_ENDING_CONTIGUOUS_PRODUCER", "0")
     return value.lower() not in _FALSE_ENV_VALUES
 
 
@@ -664,6 +684,79 @@ class TriangleAttention(nn.Module):
             _out=x if inplace_safe else None,
         )
 
+    def _cueq_ending_contiguous_forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Ending-node CUEQ path that keeps expensive producers contiguous.
+
+        Ending-node triangle attention is equivalent to starting-node attention
+        over ``x.transpose(I, J)``.  The direct implementation makes LayerNorm
+        and the qkv/gate/bias projections read a transposed pair layout, which
+        NCU shows is the dominant ending-node overhead at large sequence batch.
+
+        This opt-in path computes all channel-wise producers on the original
+        contiguous ``[..., I, J, C]`` tensor, then writes the swapped CUEQ
+        layouts directly.  It preserves the vendor CUEQ/cuDNN attention
+        mainloop; the only new work is memory-layout production around it.
+        """
+        x = self.layer_norm(x)
+
+        if cueq_bool_mask_enabled():
+            mask_bias_or_bool = (mask.transpose(-1, -2) == 1)[..., :, None, None, :]
+        else:
+            mask_bias_or_bool = (self.inf * (mask.transpose(-1, -2) - 1))[
+                ..., :, None, None, :
+            ]
+
+        # Project bias on contiguous [I, J], then present it as [H, J, I] for
+        # the logical transposed problem consumed by ending-node attention.
+        triangle_bias = permute_final_dims(self.linear(x), (2, 1, 0)).unsqueeze(-4)
+
+        q, k, v = self.mha._prep_qkv(
+            x,
+            x,
+            apply_scale=False,
+            cueq_heads_first=True,
+            cueq_swap_pair_axes=True,
+        )
+
+        if cueq_bool_mask_enabled():
+            mask_for_attention = mask_bias_or_bool
+        else:
+            mask_for_attention = (mask_bias_or_bool == 0).bool()
+
+        scale = 1.0 / math.sqrt(self.c_hidden)
+        o = cuequivariance_triangular_attn(
+            q,
+            k,
+            v,
+            triangle_bias.float(),
+            mask_for_attention,
+            scale,
+        )
+        if isinstance(o, tuple):
+            o = o[0]
+
+        if self.mha.linear_g is not None:
+            gate = self.mha.linear_g(x)
+            gated = triton_sigmoid_mul_heads_first_swapped_gate(gate, o)
+            if gated is None:
+                gate = gate.transpose(-2, -3).contiguous()
+                gated = triton_sigmoid_mul_heads_first(gate, o)
+            if gated is None:
+                o = o.transpose(-2, -3)
+                gate = self.mha.sigmoid(gate)
+                gate = gate.view(gate.shape[:-1] + (self.no_heads, -1))
+                gated = flatten_final_dims(o * gate, 2)
+        else:
+            gated = flatten_final_dims(o.transpose(-2, -3), 2)
+
+        # The output projection is computed in logical ending orientation
+        # [J, I].  Return [I, J] to match the public TriangleAttention contract.
+        return self.mha.linear_o(gated).transpose(-2, -3)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -684,6 +777,15 @@ class TriangleAttention(nn.Module):
             mask = x.new_ones(
                 x.shape[:-1],
             )
+
+        if (
+            triangle_attention == "cuequivariance"
+            and not self.starting
+            and chunk_size is None
+            and not torch.is_grad_enabled()
+            and cueq_ending_contiguous_producer_enabled()
+        ):
+            return self._cueq_ending_contiguous_forward(x, mask)
 
         if not self.starting:
             x = x.transpose(-2, -3)
