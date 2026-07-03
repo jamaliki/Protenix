@@ -19,10 +19,12 @@ NCU_SET=${NCU_SET:-full}
 
 mkdir -p "$RUN_DIR/slurm_logs"
 
+EXPORT_VARS="PROTENIX_REPO=$REPO,RUN_DIR=$RUN_DIR,TOKENS=$TOKENS,BATCH=$BATCH,WARMUP=$WARMUP,NCU_ITERS=$NCU_ITERS,NCU_SET=$NCU_SET,HOME=${HOME:-},USER=${USER:-}"
+
 JOB_ID=$(
   sbatch --parsable \
     --chdir="$RUN_DIR" \
-    --export=ALL,PROTENIX_REPO="$REPO",RUN_DIR="$RUN_DIR",TOKENS="$TOKENS",BATCH="$BATCH",WARMUP="$WARMUP",NCU_ITERS="$NCU_ITERS",NCU_SET="$NCU_SET" \
+    --export="$EXPORT_VARS" \
     "$REPO/scripts/perf/tokyo_pairformer_block_ncu.sbatch"
 )
 

@@ -31,7 +31,11 @@ NCU_SET=${NCU_SET:-full}
 cd "$PROTENIX_REPO"
 mkdir -p "$RUN_DIR" "$RUN_DIR/torchinductor_cache" "$RUN_DIR/triton_cache"
 
-export PATH="$(dirname "$NCU"):$(dirname "$PY"):$PATH"
+PY_BIN_DIR=${PY%/*}
+PY_PREFIX=${PY_BIN_DIR%/*}
+NCU_BIN_DIR=${NCU%/*}
+export PATH="$NCU_BIN_DIR:$PY_BIN_DIR:${PATH:-/usr/local/bin:/usr/bin:/bin}"
+export LD_LIBRARY_PATH="$PY_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
 export WANDB_MODE=disabled
