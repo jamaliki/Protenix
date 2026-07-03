@@ -94,6 +94,36 @@ def timed_step(
     return out
 
 
+def cuda_profiler_capture(
+    name: str,
+    fn: Callable[[], tuple[torch.Tensor, torch.Tensor, dict[str, float]]],
+    *,
+    warmup: int,
+    iters: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run a narrow CUDA-profiler capture for Nsight Compute.
+
+    CUDA events rank the PairformerBlock's Python-visible stages, but the next
+    same-token/variable-atom bottleneck is a kernel-boundary question.  Launch
+    NCU with ``--profile-from-start off`` and it will ignore setup work until
+    ``cudaProfilerStart`` is called here.  Capturing only the warmed block keeps
+    the report focused enough to decide whether the next kernel should target
+    attention wrapper traffic, triangle multiplication, transitions, or copies.
+    """
+    for _ in range(warmup):
+        s_out, z_out, _ = fn()
+    torch.cuda.synchronize()
+
+    torch.cuda.nvtx.range_push(name)
+    torch.cuda.cudart().cudaProfilerStart()
+    for _ in range(iters):
+        s_out, z_out, _ = fn()
+    torch.cuda.synchronize()
+    torch.cuda.cudart().cudaProfilerStop()
+    torch.cuda.nvtx.range_pop()
+    return s_out, z_out
+
+
 def run_once(
     block: PairformerBlock,
     s0: torch.Tensor,
@@ -191,6 +221,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pair-mask-dtype", choices=["same", "bool"], default="same")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument(
+        "--ncu-capture",
+        action="store_true",
+        help=(
+            "Run only a warmed PairformerBlock CUDA-profiler capture for Nsight "
+            "Compute. Launch NCU with --profile-from-start off to collect just "
+            "this range."
+        ),
+    )
+    parser.add_argument(
+        "--ncu-iters",
+        type=int,
+        default=1,
+        help="PairformerBlock calls inside the CUDA-profiler capture range.",
+    )
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--enable-tf32", type=str_bool, default=True)
     parser.add_argument("--randomize-zero-weights", type=str_bool, default=True)
@@ -209,6 +254,33 @@ def main() -> None:
     totals: dict[str, float] = defaultdict(float)
     amp = cuda_autocast(args.compute_dtype)
     with torch.inference_mode(), amp:
+        if args.ncu_capture:
+            s_out, z_out = cuda_profiler_capture(
+                f"pairformer_block_B{args.batch}_N{args.tokens}",
+                lambda: run_once(block, s, z, pair_mask, args),
+                warmup=args.warmup,
+                iters=args.ncu_iters,
+            )
+            print(
+                json.dumps(
+                    {
+                        "args": vars(args),
+                        "capture_shapes": {
+                            "s": list(s_out.shape),
+                            "z": list(z_out.shape),
+                        },
+                        "device": torch.cuda.get_device_name(),
+                        "torch": {
+                            "version": torch.__version__,
+                            "cuda": torch.version.cuda,
+                        },
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return
+
         for _ in range(args.warmup):
             run_once(block, s, z, pair_mask, args)
         torch.cuda.reset_peak_memory_stats()

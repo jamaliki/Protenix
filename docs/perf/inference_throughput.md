@@ -187,6 +187,33 @@ repeated-`7r6r` wrapper/runner gate.  If an older build reports roughly
 before interpreting the gap as a missing flag; current optimized code measured
 `42.57s` model-forward on the comparable base-checkpoint gate.
 
+Follow-up profiling should now inspect the one-block pairformer kernel mix at
+this exact endpoint before writing another fused kernel.  The block-level CUDA
+event screen already shows whether triangle attention, triangle multiplication,
+or transition dominates, and `scripts/perf/pairformer_block_breakdown.py` now
+has a narrow Nsight Compute capture mode so the next run can classify the
+actual launches without profiling initialization:
+
+```bash
+ncu --profile-from-start off \
+  --set full \
+  --target-processes all \
+  python scripts/perf/pairformer_block_breakdown.py \
+    --batch 32 \
+    --tokens 251 \
+    --input-dtype bfloat16 \
+    --compute-dtype bfloat16 \
+    --triangle-attention cuequivariance \
+    --triangle-multiplicative cuequivariance \
+    --warmup 3 \
+    --ncu-capture \
+    --ncu-iters 1
+```
+
+This is intentionally a measurement hook, not a production path.  The promotion
+bar remains a paired full `N_step=200` same-token variable-atom gate after the
+candidate moves a material pairformer subtotal.
+
 The real campaign shape is often a directory containing one JSON file per
 design.  That used to defeat batching because the runner called
 `infer_predict()` once per file.  The directory path now resolves the whole
