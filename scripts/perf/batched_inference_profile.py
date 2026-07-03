@@ -23,6 +23,7 @@ import torch
 
 from configs.configs_inference import inference_configs
 from runner.batch_inference import get_default_runner
+from runner.campaign_inputs import resolve_inference_jsons, write_campaign_json
 from runner.inference import infer_predict
 
 
@@ -74,6 +75,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--chunk-size", type=optional_int, default=None)
     parser.add_argument("--sample-diffusion-chunk-size", type=optional_int, default=5)
+    parser.add_argument(
+        "--sort-by-token-length",
+        type=str_bool,
+        default=True,
+        help=(
+            "Match runner/batch_inference.py campaign batching by writing a "
+            "temporary length-sorted campaign JSON before profiling."
+        ),
+    )
     parser.add_argument("--profile-memory", type=str_bool, default=True)
     parser.add_argument("--top-rows", type=int, default=60)
     return parser.parse_args()
@@ -88,11 +98,17 @@ def main() -> None:
     dump_dir = Path(args.dump_dir).resolve()
     profile_dir = dump_dir / "profiles"
     profile_dir.mkdir(parents=True, exist_ok=True)
+    input_jsons = resolve_inference_jsons(args.input_json)
+    profile_input_json, _cleanup_json = write_campaign_json(
+        input_jsons,
+        str(dump_dir),
+        sort_by_token_length=args.sort_by_token_length,
+    )
 
     # get_default_runner reads the module-level inference config when it builds
     # the ConfigDict, so set the perf-run paths before constructing the runner.
     inference_configs["dump_dir"] = str(dump_dir / "predictions")
-    inference_configs["input_json_path"] = args.input_json
+    inference_configs["input_json_path"] = profile_input_json
     inference_configs["num_workers"] = args.num_workers
 
     runner = get_default_runner(
@@ -115,7 +131,7 @@ def main() -> None:
         inference_token_bucket_size=args.token_bucket_size,
     )
     configs = runner.configs
-    configs.input_json_path = args.input_json
+    configs.input_json_path = profile_input_json
     configs.num_workers = args.num_workers
     configs.infer_setting.chunk_size = args.chunk_size
     configs.infer_setting.sample_diffusion_chunk_size = (
@@ -150,6 +166,7 @@ def main() -> None:
             {
                 "args": vars(args),
                 "elapsed_sec": elapsed_sec,
+                "profile_input_json": profile_input_json,
                 "trace": str(trace_path),
                 "top_cuda": str(top_path),
                 "torch": {
