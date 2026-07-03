@@ -239,6 +239,15 @@ dumping:
 | Same mixed-token `N_sample=1` workload, many campaign shards on one H100 | 0.166 records/s original low-sample boundary | 1.77 records/s with five `--batch_size 16` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20` | 10.7x per-GPU operational throughput |
 | Same mixed-token workload, many campaign shards on one H100 | 0.753 generated samples/s original low-sample boundary | 5.53 generated samples/s with five `--batch_size 16` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20` | 7.3x per-GPU operational throughput |
 
+For same-token, variable-atom campaigns, compare the `predict` or
+model-forward section rather than the outer Slurm/script wall time.  Current
+code measured closer to `6-7x` for the comparable `B32, N_token=251,
+N_sample=1` predict path, while end-to-end wrapper speedups can look much
+smaller if the run includes model initialization, cold caches, file dumping, an
+older container, or a checkpoint variant that has not been re-benchmarked.
+Seeing `token-trunk+diffusion-token-atom-batch` in the log means batching is
+working; it does not mean the run is using the exact-shape `7r6r` path.
+
 For the mixed-token, low-sample workload, keep `--batch_size 16` as the current
 fixed-batch default: B8 loses diffusion/atom batching efficiency, while B32
 loses more to padded trunk and diffusion-transformer shapes.
