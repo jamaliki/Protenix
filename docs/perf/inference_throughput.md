@@ -820,6 +820,57 @@ multi-step batched diffusion and can be disabled with
 `PROTENIX_CACHE_DIFFUSION_PAIR_BIAS=0`; `N_step=1` scout runs skip it because
 there is no reuse window.
 
+Post-cache launch profile: job `97110`
+(`runs/post_cache_profile_n20_20260703_093234_3275f96`) captured a
+representative `N_step=20`, `N_sample=5`, mixed-token, B16 trace after the pair
+bias cache.  The model inference completed, then the job failed only in the
+scoped aggregation command because `trace_multi_scope_aggregate.py` was invoked
+without any `--scope` arguments.  The raw `1.8 GB` Chrome trace and global
+aggregate were intact, so the scoped aggregate was rerun manually with exact
+`user_annotation` ranges and written to
+`profile_default_cache/profiles/rank0_scope_aggregate_user_exact.json`.
+
+The batch timing now shows the intended bottleneck shift.  For the short
+40-124-token bucket, pairformer was `7.93s`, diffusion `2.71s`, and confidence
+`4.46s` inside a `25.66s` predict section.  For the long 136-220-token bucket,
+pairformer was `11.43s`, diffusion `2.69s`, and confidence `6.41s` inside a
+`29.08s` predict section.  The diffusion transformer subtotal is only
+`0.73-0.82s` for `N_step=20`; the pairformer and confidence pairformer are now
+the main remaining model costs.
+
+Top global CUDA kernel classes in the post-cache trace were:
+
+| kernel class | self CUDA ms | calls | interpretation |
+| --- | ---: | ---: | --- |
+| PyTorch/Triton BF16 LayerNorm kernels | 3517.5 | 13282 | normalization/layout-adjacent traffic dominates many pairformer paths |
+| cuDNN full-token SDPA/FMHA | 1862.6 | 2400 | full attention remains material, but it is not one monolithic bad launch |
+| BF16 direct-copy kernel | 1074.0 | 8078 | layout movement is still first-order |
+| CUEQ fused gated dual GEMM | 1070.7 | 5760 | triangle-multiplication/transition fused MLP work is still material |
+| BF16 elementwise multiply/add | 820.8 / 806.0 | 10964 / 12344 | residual/gate/activation traffic is launch-heavy |
+| QKV-to-heads layout kernel | 665.6 | 2400 | attention producer layout remains visible |
+| CUEQ/NVJET triangle GEMMs | 596.6, 578.5, 420.6 | 5760 / 4540 / 2960 | CUEQ is fast but still a large aggregate because it is called many times |
+
+The corrected exact scope aggregate ranked pairformer subpaths by wall interval:
+
+| scope | scope wall ms | calls | top kernel signal |
+| --- | ---: | ---: | --- |
+| triangle multiplication outgoing | 10892.6 | 1840 | cuDNN FMHA, LayerNorm, QKV layout, CUEQ fused GEMM/copy traffic |
+| triangle attention starting-node | 6819.8 | 1840 | LayerNorm, elementwise multiply, cuDNN FMHA, NVJET GEMMs |
+| token attention | 3868.2 | 1600 | cuDNN FMHA, LayerNorm, CUEQ fused GEMM, QKV layout |
+| triangle multiplication incoming | 2969.4 | 1840 | LayerNorm, NVJET GEMMs, direct copies |
+| triangle attention ending-node | 2530.2 | 1840 | LayerNorm, cuDNN FMHA, CUTLASS GEMMs, direct copies |
+| atom encoder | 2358.0 | 40 | now smaller than the large pairformer scopes |
+| diffusion token transformer | 1433.3 | 40 | no longer the leading target after pair-bias reuse |
+| pair transition | 823.8 | 1840 | comparatively small after prior transition work |
+
+Decision: keep the next experiments focused on pairformer kernels/layouts.  The
+direct dense-bias D=24 token-attention screen is queued as job `97137`
+(`runs/dense_bias_attention_d24_probe_20260703_094447_9e62026`) and the remote
+worktree was updated to commit `b039f9a` before it runs.  That probe tests the
+specific missing boundary from the earlier failed padded TriAttention attempt:
+read the existing `B x H x N x 24` q/k/v tensors plus non-contiguous dense pair
+bias directly, without D=32 padding or copy overhead.
+
 Pre-cache promoted trace: job `96456`
 (`runs/current_batched_profile_n20_20260703_031951_3d1adcd`) profiled the
 actual `runner/batch_inference.py` campaign path after the atom-attention
@@ -2649,6 +2700,8 @@ Profiling and reproducibility helpers:
 - `scripts/perf/local_attention_hotspot.py`: local-attention kernel screen.
 - `scripts/perf/local_attention_bias_hotspot.py`: bias-projection screen.
 - `scripts/perf/trunk_attention_hotspot.py`: trunk attention block screen.
+- `scripts/perf/dense_bias_attention_d24_probe.py`: direct Triton
+  dense-pair-bias token-attention screen for the pairformer `D=24` head shape.
 - `scripts/perf/triangle_attention_breakdown.py`: per-launch/subrange screen
   for CUEQ triangle attention and its layout/epilogue boundaries.
 - `scripts/perf/diffusion_pair_bias_cache_probe.py`: tests whether caching the
@@ -2669,6 +2722,8 @@ Profiling and reproducibility helpers:
 - `scripts/perf/layer_norm_hotspot.py`: isolated H100 screen for the Triton
   LayerNorm fallback versus the PyTorch fallback.
 - `scripts/perf/trace_aggregate.py`: compact profiler trace summarizer.
+- `scripts/perf/trace_multi_scope_aggregate.py`: multi-scope Chrome-trace
+  summarizer used for pairformer range attribution.
 
 ## If continuing from here
 
