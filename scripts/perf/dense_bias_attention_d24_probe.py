@@ -282,6 +282,12 @@ def make_module(args: argparse.Namespace) -> AttentionPairBias:
         c_z=args.c_z,
     ).cuda()
     module.eval()
+    if args.randomize_zero_weights:
+        with torch.no_grad():
+            generator = torch.Generator(device="cuda").manual_seed(args.seed + 991)
+            for parameter in module.parameters():
+                if parameter.numel() and not torch.count_nonzero(parameter).item():
+                    parameter.normal_(mean=0.0, std=0.02, generator=generator)
     return module
 
 
@@ -487,6 +493,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--randomize-zero-weights",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help=(
+            "Random pairformer AttentionPairBias zero-initializes gate/output "
+            "weights. Randomize those tensors so full-boundary parity is tested."
+        ),
+    )
     parser.add_argument("--profile", type=int, choices=[0, 1], default=0)
     parser.add_argument("--profile-row-limit", type=int, default=20)
     return parser.parse_args()

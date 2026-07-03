@@ -68,6 +68,21 @@ def _try_triton_local_attention(
     )
 
 
+def _try_triton_dense_bias_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_bias: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    try:
+        from protenix.model.modules.dense_attention_triton import (
+            triton_dense_bias_attention,
+        )
+    except Exception:
+        return None
+    return triton_dense_bias_attention(q=q, k=k, v=v, attn_bias=attn_bias)
+
+
 def _local_attention_gate_fusion_requested() -> bool:
     return os.getenv("PROTENIX_TRITON_LOCAL_ATTN_FUSE_GATE", "0").lower() not in {
         "0",
@@ -500,6 +515,15 @@ def _attention(
             attn_bias = attn_bias.to(dtype=torch.float32)
 
     if use_efficient_implementation:
+        triton_attention = (
+            None
+            if force_fp32_attention
+            else _try_triton_dense_bias_attention(
+                q=q, k=k, v=v, attn_bias=attn_bias
+            )
+        )
+        if triton_attention is not None:
+            return triton_attention
         with torch.amp.autocast("cuda", enabled=not force_fp32_attention):
             return _scaled_dot_product_attention(q, k, v, attn_bias)
 
