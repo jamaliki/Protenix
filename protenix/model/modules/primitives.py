@@ -485,6 +485,13 @@ def _attention(
     assert k.shape == v.shape
 
     input_dtype = q.dtype
+    if use_efficient_implementation:
+        triton_attention = _try_triton_dense_bias_attention(
+            q=q, k=k, v=v, attn_bias=attn_bias
+        )
+        if triton_attention is not None:
+            return triton_attention
+
     # Local atom attention has small 32x128 windows. On H100/cuDNN this path is
     # faster and more reliable in FP32, while full token attention benefits from
     # BF16 when PROTENIX_ATTENTION_FORCE_FP32=0.
@@ -515,15 +522,6 @@ def _attention(
             attn_bias = attn_bias.to(dtype=torch.float32)
 
     if use_efficient_implementation:
-        triton_attention = (
-            None
-            if force_fp32_attention
-            else _try_triton_dense_bias_attention(
-                q=q, k=k, v=v, attn_bias=attn_bias
-            )
-        )
-        if triton_attention is not None:
-            return triton_attention
         with torch.amp.autocast("cuda", enabled=not force_fp32_attention):
             return _scaled_dot_product_attention(q, k, v, attn_bias)
 
