@@ -1386,6 +1386,32 @@ time was `44.54s` for default auto versus `44.74s` with transition flags.  A
 future transition kernel would need to fuse the output/residual boundary or
 otherwise reduce more than the input-projection epilogue to matter end to end.
 
+The boundary was re-tested after the same-token, variable-atom issue made
+`B=32, N_token=251, N_sample=1` the most important endpoint.  Job `99031`
+(`runs/pair_transition_full_issue_gate_20260703_225347_2fb3b18`, commit
+`2fb3b18`) used the 32-record `N_atom=1834-1940`, `N_step=200`, confidence
+gate.  Baseline kept generic Triton elementwise disabled but explicitly kept
+the triangle-attention epilogue on; candidate enabled transition input fusion
+with `PROTENIX_TRITON_FUSED_ELEMENTWISE_MIN_ELEMENTS=100000000` so only the
+huge transition activation product passed the generic Triton guard.
+
+| case | predict sec | model-forward | pairformer | diffusion | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| baseline A | 81.60 | 50.904 | 31.839 | 16.278 | 2.787 | cold compile/cache outlier |
+| transition A | 42.59 | 40.707 | 28.336 | 11.581 | 0.791 | candidate |
+| baseline B | 42.81 | 40.965 | 28.793 | 11.399 | 0.772 | warmed control |
+| transition B | 42.56 | 40.702 | 27.948 | 11.948 | 0.805 | +0.6% predict, below bar |
+
+The isolated B32/N251 pair-transition hotspot still shows the mechanism:
+`forward_env_off` was `8.32 ms` and `forward_env_on` was `6.76 ms`, mostly by
+replacing separate `SiLU` and multiply launches (`1.36 + 2.02 ms`) with the
+split fused consumer (`2.02 ms`).  In the full model the pairformer subtotal
+moved by about `0.85 s`, but diffusion variance gave back most of the gain.
+Decision: keep this as a kernel-boundary clue, not a default.  A transition
+rewrite needs a larger contiguous win, probably by preserving cuBLAS-quality
+input/output GEMM mainloops while deleting more than the current activation
+product launch.
+
 Another narrow epilogue branch, `codex/transition-addmm-residual`, tried to
 fold the pairformer transition residual add into the final transition GEMM with
 `torch.addmm(beta=1)`.  This was the right kind of small boundary experiment:
