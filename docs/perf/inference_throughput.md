@@ -2617,6 +2617,42 @@ traffic around kernels that still consume padded pair tensors.  Keep this as
 evidence for a future larger ragged pairformer boundary, not as a promoted
 single-module optimization.
 
+The next screen widened the question from one row-wise transition MLP to a
+whole `PairformerBlock`.  Commit `134cbaa` added
+`scripts/perf/pairformer_ragged_islands_hotspot.py`, which compares today's
+single padded B16 block with lower-bound "islands": two smaller sorted buckets,
+exact-length groups, and singletons.  This is deliberately benchmark-only; it
+does not preserve the cross-block pair layout and it pays extra launches.  A
+large win here would justify a real single-kernel segmented/CuTe design.  A
+flat or negative result says the existing CUEQ/CUDA kernels are already too
+good at the padded shapes for Python-level islanding to matter.
+
+The one-H100 canary was job `97271`
+(`runs/ragged_pairformer_islands_20260703_110850_134cbaa`).  The job failed
+only after both JSON results were written, because the ad hoc Slurm summary
+used an unquoted heredoc around Python f-strings.  A salvaged summary was
+written to `summary_salvaged.md`:
+
+| token group | variant | valid-pair efficiency | groups | block ms | speedup vs padded |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `40-124` | padded all | 0.486 | 1 | 4.777 | 1.000 |
+| `40-124` | two split buckets | 0.707 | 2 | 7.256 | 0.658 |
+| `40-124` | exact-length groups | 1.000 | 8 | 25.792 | 0.185 |
+| `40-124` | singletons | 1.000 | 16 | 50.353 | 0.095 |
+| `136-220` | padded all | 0.670 | 1 | 15.227 | 1.000 |
+| `136-220` | two split buckets | 0.832 | 2 | 13.198 | 1.154 |
+| `136-220` | exact-length groups | 1.000 | 8 | 30.548 | 0.498 |
+| `136-220` | singletons | 1.000 | 16 | 59.933 | 0.254 |
+
+Decision: reject Python-level ragged islands and do not expect small
+pairformer sub-bucketing to close the gap.  The short bucket is already so fast
+that extra launches dominate even when valid-pair efficiency improves from
+`0.486` to `0.707`; the long bucket has a modest `1.15x` block-level island
+signal, but the combined short+long block total is essentially flat/slower.
+A true ragged pairformer kernel would need to keep the one-launch/vendor-kernel
+quality of CUEQ while avoiding padded work.  That remains a large kernel design
+project, not a cleanup or batching knob.
+
 ## Negative results worth remembering
 
 These failed because the real workload, not the isolated kernel, is the gate:
@@ -2634,6 +2670,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Lowering mixed-token `N_sample=5` batch size from 16 to 8 | current full gate slowed from `3.56` to `3.0-3.1` generated samples/s because diffusion/atom work split into four smaller launch groups | tighter token ranges are useful only if the saved padding beats the lost batching efficiency |
 | Explicit mixed-token bucket sizes `96`, `64`, `48`, and `32` at B16 | all slowed the representative N200 gate; best explicit bucket fell from `3.649` to `3.270` generated samples/s and narrower buckets reached `2.307` generated samples/s | queue bucketing saves some padded pairformer work only by fragmenting diffusion/atom batches; the real solution needs ragged kernels or segmented schedules, not more launch groups |
 | Internal pairformer-only trunk buckets while keeping diffusion B16 | best case `trunk64` improved pairformer `15.736 -> 15.461s`, but diffusion worsened `24.098 -> 24.689s` and throughput fell `3.608 -> 3.575` generated samples/s; narrower trunk buckets were much worse | Python-level sub-batching changes launch/cache balance and is not the segmented-pairformer solution; remove the knob and target true ragged kernels/schedules |
+| Full-block ragged pairformer islands | two split buckets improved the long `136-220` block `1.15x`, but slowed the short `40-124` block to `0.66x`; exact-length groups and singletons were much slower | launch count and lost batching eat the padding savings unless the ragged schedule is a real one-launch/vendor-quality kernel |
 | Materializing pairformer token-attention bias as contiguous `[B, H, Q, K]` | traced pairformer SDPA shape `[16, 16, 124, 24]` moved from math-dispatch attempt to a cuDNN frontend "no valid execution plans" error; fallback timing then segfaulted in the isolated screen | the non-contiguous bias layout is not the only blocker; head_dim 24 plus dense additive bias lacks a safe cuDNN plan in this runtime, so do not pay a bias copy hoping for a backend flip |
 | CUEQ `attention_pair_bias` for diffusion token attention | native pair-bias projection needed an explicit zero LayerNorm bias, then CUEQ's internal SDPA failed with `No valid execution plans built`; forced PyTorch fallback was slower than the current full conv2d+SDPA baseline | CUEQ's wrapper is not a drop-in win here; use it only if we can call a narrower fused pair-bias producer while keeping Protenix's SDPA fallback policy |
 | Reusing Triton `TriAttentionFunction` for pairformer token attention | isolated `N=220` hotspot improved, but the full mixed-sequence gate averaged only `45.16s -> 44.89s` predict (`+0.6%`) and one repeat regressed | padding `D=24` to `D=32` and copying layouts is too much integration overhead; if revisited, write a direct dense-bias `D=24` kernel instead |
@@ -2737,6 +2774,9 @@ Profiling and reproducibility helpers:
 - `scripts/perf/pair_transition_ragged_hotspot.py`: compact valid-pair
   pairformer-transition screen; separates ideal compact compute from
   gather/scatter costs before attempting a larger ragged pairformer rewrite.
+- `scripts/perf/pairformer_ragged_islands_hotspot.py`: lower-bound whole-block
+  screen for ragged pairformer islands; compares one padded B16 block with
+  smaller split buckets, exact-length groups, and singletons.
 - `scripts/perf/tokyo_transition_epilogue_hotspot.sbatch`: Tokyo one-H100
   wrapper for the transition epilogue screen, including CUDA/CUTLASS env setup.
 - `scripts/perf/confidence_head_hotspot.py`: confidence pairformer screen.
