@@ -2670,6 +2670,82 @@ Decision: do not plumb bool masks into triangle multiplication.  The result is
 within hotspot noise and far too small to justify changing pair-mask dtype
 contracts across the model.
 
+### Same-GPU concurrency / MPS gate
+
+Status: promote as an **operational campaign mode**, not as a model-kernel
+change.
+
+Hypothesis: the optimized mixed-sequence path still launches many medium and
+small kernels.  A single `--batch_size 16` campaign does not fully occupy an
+H100, so several independent warm Protenix workers on the same GPU may improve
+per-GPU throughput.  CUDA MPS should help the separate CUDA contexts overlap
+more effectively than ordinary process concurrency.
+
+Benchmark harness: commit `184a494` adds
+`scripts/perf/concurrent_batch_inference_gate.py`.  The harness loads persistent
+workers, runs a short warmup, writes warmup and every timed repeat to distinct
+dump directories, synchronizes workers at the timed boundary, and fails the
+summary if parsed model timing logs do not cover the expected records.  This
+matters: the first draft reused warmup output directories and could report
+bogus few-second runs; the hardened gate caught that failure mode.
+
+Representative workload:
+
+- one H100 80 GB on Sandpit Tokyo;
+- 32 mixed 40-220-token records per worker;
+- `N_sample=5`, `N_step=200`, `--batch_size 16`, BF16, CUEQ triangle kernels;
+- confidence head and normal CIF/JSON dumping enabled;
+- branch `codex/ragged-multisample-diffusion`, commit `184a494`.
+
+Non-MPS two-worker gate:
+
+- job `97296`;
+- run dir
+  `runs/concurrency_gate_20260703_113119_184a494`;
+- sequential two-campaign wall baseline: `320` generated samples in `86.08s`,
+  or `3.717` generated samples/s;
+- two ordinary processes on one GPU: `320` generated samples in `79.38s`, or
+  `4.031` generated samples/s.
+
+Width and MPS gate:
+
+- job `97306`;
+- run dir
+  `runs/concurrency_width_gate_20260703_114157_184a494`;
+- CUDA MPS pipe/log directories must live on a node-local filesystem such as
+  `/tmp`.  Putting `CUDA_MPS_PIPE_DIRECTORY` on Lustre created control logs but
+  no live socket and should not be used.
+
+| mode | workers | generated samples | wall s | wall samples/s | decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| ordinary processes | 2 | 320 | 79.38 | 4.031 | small win |
+| ordinary processes | 3 | 480 | 115.86 | 4.143 | flattening |
+| ordinary processes | 4 | 640 | 152.56 | 4.195 | flattening |
+| CUDA MPS, `/tmp` socket | 2 | 320 | 66.36 | 4.822 | useful |
+| CUDA MPS, `/tmp` socket | 3 | 480 | 94.32 | 5.089 | near knee |
+| CUDA MPS, `/tmp` socket | 4 | 640 | 124.58 | 5.137 | best measured |
+
+Interpretation:
+
+- Ordinary process concurrency proves there is some underfill, but context
+  isolation and contention cap the win quickly.
+- CUDA MPS materially improves overlap across independent workers.  The best
+  measured point, four workers, is only slightly above three workers, so the
+  practical recommendation is **three to four MPS workers per H100** for large
+  campaign shards.
+- Compared with the prior promoted single-process low-sample rate (`3.85`
+  generated samples/s), `5.137` generated samples/s is a `1.33x` operational
+  gain.  Compared with the original low-sample branch boundary (`0.753`
+  generated samples/s), it is about `6.8x` per-GPU throughput.
+- This is not a substitute for kernel work: each worker individually slows down
+  as width increases, and the aggregate curve is already flattening.  The
+  remaining route to the requested `10x` target still needs a larger true
+  kernel/layout win, not just more same-GPU processes.
+
+Decision: document and recommend CUDA MPS concurrency for throughput-oriented
+design campaigns with enough independent shards.  Keep the production model
+code unchanged; the benchmark harness remains the reproducibility tool.
+
 ## Negative results worth remembering
 
 These failed because the real workload, not the isolated kernel, is the gate:
@@ -2772,6 +2848,9 @@ Production code touched by the throughput stack:
 Profiling and reproducibility helpers:
 
 - `scripts/perf/protenix_inference_benchmark.py`: full-model throughput gate.
+- `scripts/perf/concurrent_batch_inference_gate.py`: same-GPU multi-process
+  campaign gate; measures ordinary process concurrency and CUDA MPS throughput
+  with persistent warm workers and isolated output directories per timed repeat.
 - `scripts/perf/full_inference_precision_audit.py`: full-run matmul precision
   audit; records forced-FP32 modules and non-module einsums/matmuls.
 - `scripts/perf/atom_transformer_hotspot.py`: atom block hotspot screen.

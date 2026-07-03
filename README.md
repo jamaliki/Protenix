@@ -227,10 +227,62 @@ dumping:
 | 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.9 s summed predict, 0.943 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.70x predict, 5.69x throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 41.6 s, 3.85 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, BF16 diffusion core, BF16 atom attention, Triton local atom attention, default Triton LayerNorm fallback, and cached diffusion pair bias | 5.11x over the old branch boundary |
+| Same mixed-token workload, many campaign shards on one H100 | 0.753 generated samples/s original low-sample boundary | 5.14 generated samples/s with four `--batch_size 16` workers under CUDA MPS using `/tmp` MPS sockets | 6.8x per-GPU operational throughput |
 
 For the mixed-token, low-sample workload, keep `--batch_size 16` as the current
 fixed-batch default: B8 loses diffusion/atom batching efficiency, while B32
 loses more to padded trunk and diffusion-transformer shapes.
+
+#### Optional: fill one H100 with multiple campaign workers
+
+For large design campaigns, throughput can improve further by running several
+independent `protenix pred` workers on the same allocated H100 under CUDA MPS.
+This does not change model math; it overlaps independent campaigns to fill gaps
+left by many small launches.  Use this only when you have enough independent
+JSON shards and care about aggregate samples/sec more than one shard's latency.
+
+Important details:
+
+- Keep each worker on the same optimized settings above, especially
+  `--batch_size 16` for mixed 40-220-token proteins.
+- Start CUDA MPS with pipe and log directories on a node-local filesystem such
+  as `/tmp`.  Do not put `CUDA_MPS_PIPE_DIRECTORY` on Lustre; the MPS control
+  socket may fail there.
+- In the current H100 gate, four MPS workers reached `5.14` generated
+  samples/s on the mixed `N_sample=5`, `N_step=200` workload.  That is `1.33x`
+  over the prior single-process promoted rate (`3.85` generated samples/s) and
+  about `6.8x` over the original low-sample branch boundary (`0.753`
+  generated samples/s).
+- No-MPS multi-process concurrency helped only modestly (`4.19` generated
+  samples/s at four workers), so use MPS if you choose this operational mode.
+
+Minimal Slurm-job sketch after acquiring one H100:
+
+```bash
+export PROTENIX_ATTENTION_FORCE_FP32=0
+export PROTENIX_GPU_RANDOM_AUGMENT=1
+export PROTENIX_BROADCAST_DIFFUSION_S=1
+
+export CUDA_MPS_PIPE_DIRECTORY="/tmp/protenix_mps_${SLURM_JOB_ID}/pipe"
+export CUDA_MPS_LOG_DIRECTORY="/tmp/protenix_mps_${SLURM_JOB_ID}/log"
+mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+nvidia-cuda-mps-control -d
+
+# Launch up to four shards per H100; run another wave after wait returns.
+for shard in shard_0.json shard_1.json shard_2.json shard_3.json; do
+  protenix pred -i "$shard" -o "out/${shard%.json}" \
+    -s 101 -c 10 -p 200 -e 5 -d bf16 \
+    --trimul_kernel cuequivariance \
+    --triatt_kernel cuequivariance \
+    --enable_cache true \
+    --enable_fusion true \
+    --enable_tf32 true \
+    --batch_size 16 &
+done
+wait
+
+echo quit | nvidia-cuda-mps-control
+```
 
 Quick sanity check: a good campaign run should log messages like
 `Predicting 32 same-shape (auto) input(s)` or
