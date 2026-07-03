@@ -2456,6 +2456,29 @@ Run directories:
 - `pairformer_orientation_screen_20260702_123911`, Slurm job `95054`
 - `pairformer_logical_ending_screen_20260702_124119`, Slurm job `95058`
 
+Pairformer transition ragged-layout screen: commit `6dee304` adds
+`scripts/perf/pair_transition_ragged_hotspot.py` to test the first safe
+segmented-pairformer boundary.  Pair transition is row-wise over `(i, j)` pair
+features, so a compact valid-pair layout is mathematically straightforward:
+run the transition MLP on only `sum(length_i^2)` real pairs instead of the
+padded `batch * max_length^2` pairs.  The screen deliberately reports three
+variants:
+
+- ideal compact compute, assuming later pairformer kernels can consume compact
+  rows directly;
+- compact compute plus gathering valid rows from today's padded tensor;
+- full gather/compute/scatter, which is the cost of inserting only this one
+  compact island into the current padded pairformer.
+
+This distinction matters for kernel design.  A win only in the first row says
+"rewrite a larger ragged pairformer boundary"; a win after scatter says "this
+one local MLP is worth integrating now."  The current H100 run is queued as
+Slurm job `96985` under
+`runs/pair_transition_ragged_hotspot_fast_20260703_085818_6dee304` for the two
+real sorted B16 token groups (`40-124` and `136-220`).  Do not promote code from
+this screen until it has both a representative model gate and clear numerical
+guardrails.
+
 ## Negative results worth remembering
 
 These failed because the real workload, not the isolated kernel, is the gate:
@@ -2565,6 +2588,9 @@ Profiling and reproducibility helpers:
   epilogue screen and candidate-injection harness for native CuTe/CUTLASS work.
 - `scripts/perf/transition_output_epilogue_reference_candidate.py`: baseline
   candidate ABI smoke for the transition epilogue harness.
+- `scripts/perf/pair_transition_ragged_hotspot.py`: compact valid-pair
+  pairformer-transition screen; separates ideal compact compute from
+  gather/scatter costs before attempting a larger ragged pairformer rewrite.
 - `scripts/perf/tokyo_transition_epilogue_hotspot.sbatch`: Tokyo one-H100
   wrapper for the transition epilogue screen, including CUDA/CUTLASS env setup.
 - `scripts/perf/confidence_head_hotspot.py`: confidence pairformer screen.
