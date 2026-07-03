@@ -210,6 +210,21 @@ ncu --profile-from-start off \
     --ncu-iters 1
 ```
 
+On Sandpit Tokyo, prefer the checked-in Slurm wrapper so the run records the
+commit, uses the same one-H100 resource shape as the other gates, and writes a
+portable `.ncu-rep` plus text/CSV exports:
+
+```bash
+cd /mnt/lustre/users/kiarash-eitgbi/code/protenix_src_sampleaxis_40e51f8
+scripts/perf/submit_tokyo_pairformer_block_ncu.sh
+```
+
+The default wrapper profiles the issue-shaped `B=32, N_token=251` endpoint with
+`--set full`.  Override `BATCH`, `TOKENS`, `NCU_SET`, or `NCU_ITERS` only when
+answering a different launch-level question.  Keep `gpu-canary`, one H100,
+14 CPUs, and `--mem=128G` unless a measured capture requires a different
+resource shape.
+
 This is intentionally a measurement hook, not a production path.  The promotion
 bar remains a paired full `N_step=200` same-token variable-atom gate after the
 candidate moves a material pairformer subtotal.
