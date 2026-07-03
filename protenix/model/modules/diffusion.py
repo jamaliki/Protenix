@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import os
-from contextlib import nullcontext
+import warnings
+from contextlib import contextmanager, nullcontext
 from typing import Optional, Union
 
 import torch
@@ -80,6 +81,44 @@ def atom_attention_bf16_enabled() -> bool:
     value = os.getenv("PROTENIX_BF16_ATOM_ATTENTION")
     if value is None or value.strip().lower() in _AUTO_ENV_VALUES:
         return _cuda_bf16_supported()
+    return value.strip().lower() not in _FALSE_ENV_VALUES
+
+
+def compile_diffusion_transformer_enabled() -> bool:
+    """Return whether to compile the diffusion token transformer.
+
+    The flattened low-sample inference path calls the same 24-block token
+    transformer hundreds of times during `N_step=200` sampling.  Isolated H100
+    screens show that `torch.compile` can fuse enough launch-heavy plumbing to
+    move that boundary by about 1.3x, but each new padded token length pays a
+    large compile cost.  Keep this opt-in until a warmed representative gate
+    proves that a real campaign reuses enough shapes to amortize compilation.
+    """
+
+    value = os.getenv("PROTENIX_COMPILE_DIFFUSION_TRANSFORMER", "0")
+    return value.strip().lower() not in _FALSE_ENV_VALUES
+
+
+def compile_diffusion_transformer_mode() -> str:
+    mode = os.getenv("PROTENIX_COMPILE_DIFFUSION_TRANSFORMER_MODE", "default")
+    return mode if mode else "default"
+
+
+def compile_diffusion_transformer_fullgraph() -> bool:
+    value = os.getenv("PROTENIX_COMPILE_DIFFUSION_TRANSFORMER_FULLGRAPH", "0")
+    return value.strip().lower() not in _FALSE_ENV_VALUES
+
+
+def compile_diffusion_transformer_disable_cudnn_sdpa() -> bool:
+    """Return whether compiled transformer calls should avoid cuDNN SDPA.
+
+    The first integrated compile gate failed when Inductor selected a cuDNN SDPA
+    execution plan that the runtime could not build.  Disabling only cuDNN SDPA
+    preserves Flash/Efficient/Math SDPA fallbacks and kept the isolated compile
+    speedup at both mixed-batch token sizes.
+    """
+
+    value = os.getenv("PROTENIX_COMPILE_DIFFUSION_DISABLE_CUDNN_SDPA", "1")
     return value.strip().lower() not in _FALSE_ENV_VALUES
 
 
@@ -420,6 +459,8 @@ class DiffusionModule(nn.Module):
         )
         self.normalize = LayerNorm(c_z, create_offset=False, create_scale=False)
         self._perf_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
+        self._diffusion_transformer_compile_attempted = False
+        self._diffusion_transformer_compiled = False
 
     def reset_perf_stats(self) -> None:
         self._perf_events = {}
@@ -455,6 +496,64 @@ class DiffusionModule(nn.Module):
         if not diffusion_core_bf16_enabled() or not torch.cuda.is_available():
             return nullcontext()
         return torch.autocast(device_type="cuda", dtype=dtype)
+
+    def maybe_compile_diffusion_transformer(self) -> None:
+        """Lazily wrap the diffusion transformer with `torch.compile`.
+
+        Wrapping in ``__init__`` would change checkpoint-loading and state-dict
+        behavior.  The first inference call happens after weights have been
+        loaded and the module is on its final device, which is the right point
+        to install an opt-in compiled wrapper.  Actual graph specialization
+        still happens on first use of each padded token shape.
+        """
+
+        if self._diffusion_transformer_compile_attempted:
+            return
+        if (
+            not compile_diffusion_transformer_enabled()
+            or self.training
+            or torch.is_grad_enabled()
+            or not hasattr(torch, "compile")
+        ):
+            return
+        self._diffusion_transformer_compile_attempted = True
+        try:
+            self.diffusion_transformer = torch.compile(
+                self.diffusion_transformer,
+                mode=compile_diffusion_transformer_mode(),
+                fullgraph=compile_diffusion_transformer_fullgraph(),
+                dynamic=False,
+            )
+            self._diffusion_transformer_compiled = True
+        except Exception as exc:  # pragma: no cover - runtime dependent.
+            warnings.warn(
+                "Could not wrap diffusion transformer with torch.compile; "
+                f"continuing eagerly. Original error: {exc!r}",
+                RuntimeWarning,
+            )
+
+    @contextmanager
+    def _compiled_transformer_sdpa_context(self):
+        if (
+            not self._diffusion_transformer_compiled
+            or not compile_diffusion_transformer_disable_cudnn_sdpa()
+            or not torch.cuda.is_available()
+            or not hasattr(torch.backends.cuda, "enable_cudnn_sdp")
+            or not hasattr(torch.backends.cuda, "cudnn_sdp_enabled")
+        ):
+            yield
+            return
+
+        # Scope the backend change to this transformer call.  Other model
+        # attention paths can keep their default backend selection, while the
+        # compiled diffusion graph avoids the cuDNN SDPA plan that failed in the
+        # first integrated compile gate.
+        previous = torch.backends.cuda.cudnn_sdp_enabled()
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        try:
+            yield
+        finally:
+            torch.backends.cuda.enable_cudnn_sdp(previous)
 
     def _atom_attention_autocast(self):
         if not atom_attention_bf16_enabled() or not torch.cuda.is_available():
@@ -623,7 +722,11 @@ class DiffusionModule(nn.Module):
         with self._profile_block("transformer"), torch.profiler.record_function(
             "protenix/diffusion_transformer"
         ):
-            with self._diffusion_core_autocast(transformer_dtype):
+            self.maybe_compile_diffusion_transformer()
+            with (
+                self._compiled_transformer_sdpa_context(),
+                self._diffusion_core_autocast(transformer_dtype),
+            ):
                 a_token = self.diffusion_transformer(
                     a=a_token,
                     s=s_single.to(dtype=transformer_dtype),
