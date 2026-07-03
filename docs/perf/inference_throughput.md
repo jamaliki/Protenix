@@ -764,6 +764,27 @@ currently owns that node.  Do not promote the threshold knob unless that
 same-job N200 gate improves generated samples/sec and the intended
 diffusion/pairformer subtotals move in the expected direction.
 
+A larger attention-boundary follow-up is commit `c67cde2`, which adds the
+opt-in `PROTENIX_FUSED_SELF_QKV_PROJECTION` path to
+`protenix.model.modules.primitives.Attention`.  This is the same algebraic
+idea that already won in triangular CUEQ attention: when self-attention uses
+the same tensor for q, k, and v, concatenate the three projection weights and
+run one wider GEMM instead of three independent GEMMs.  The path is
+inference-only, default-off, and guarded to q/k/v self-attention with the
+ordinary precision policy.  It preserves the vendor GEMM/SDPA kernels and only
+changes the producer boundary before SDPA.
+
+Remote unit tests in `env-boltz2` passed:
+`PYTHONPATH=$REPO CUDA_VISIBLE_DEVICES= $ENV/bin/python -m unittest
+tests.test_attention_pair_bias`.  The queued one-H100 hotspot is job `96624`
+(`runs/self_qkv_hotspot_20260703_035814_c67cde2`), dependent on `96600`.  It
+screens the flag on four shapes from the current profile: diffusion-token
+`samples=80, N_token=124/220, c=768`, and pair/confidence-style
+`batch=16, N_token=124/220, c=384`.  Promote nothing from the unit test alone:
+advance the QKV flag only if the hotspot moves the
+`attention_qkv_sdpa_gate_out` subrange, then run a full `N_sample=5`,
+`N_step=200` campaign gate.
+
 Launch-level follow-up: job `96110`
 (`runs/flat_bf16_batch_profile_20260702_221601_c8a532d`) proved the profiler
 wrapper needed to catch `SystemExit` before exporting artifacts.  Corrected job
