@@ -349,6 +349,50 @@ if triton_fused_elementwise_available():
         out = (1.0 / (1.0 + tl.exp(-gate))) * value
         tl.store(out_ptr + offsets, out, mask=valid)
 
+    @triton.jit
+    def _sigmoid_mul_heads_first_swapped_gate_kernel(
+        gate_ptr,
+        heads_first_ptr,
+        out_ptr,
+        n_elements: tl.constexpr,
+        i_count: tl.constexpr,
+        j_count: tl.constexpr,
+        head_dim: tl.constexpr,
+        heads_channels: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = (pid * block_size + tl.arange(0, block_size)).to(tl.int64)
+        valid = offsets < n_elements
+
+        hc = offsets % heads_channels
+        i = (offsets // heads_channels) % i_count
+        tmp = offsets // (heads_channels * i_count)
+        j = tmp % j_count
+        batch = tmp // j_count
+        h = hc // head_dim
+        c = hc % head_dim
+
+        # ``out`` is contiguous in [..., J, I, H * C] order for the ending-node
+        # output projection.  ``gate`` was projected from the original
+        # contiguous [..., I, J, H * C] pair tensor, while CUEQ returned
+        # heads-first [..., J, H, I, C].  Read both with swapped pair axes so the
+        # prototype can test a broad ending-attention producer without
+        # materializing gate.transpose(I, J).
+        gate_offsets = ((batch * i_count + i) * j_count + j) * heads_channels + hc
+        source_offsets = (
+            ((batch * j_count + j) * (heads_channels // head_dim) + h)
+            * i_count
+            + i
+        ) * head_dim + c
+
+        gate = tl.load(gate_ptr + gate_offsets, mask=valid, other=0.0).to(tl.float32)
+        value = tl.load(heads_first_ptr + source_offsets, mask=valid, other=0.0).to(
+            tl.float32
+        )
+        out = (1.0 / (1.0 + tl.exp(-gate))) * value
+        tl.store(out_ptr + offsets, out, mask=valid)
+
 
 def _grid(n_elements: int) -> tuple[int]:
     return (triton.cdiv(n_elements, _BLOCK_SIZE),)
@@ -534,6 +578,70 @@ def triton_sigmoid_mul_heads_first(
         out,
         gate.numel(),
         q_count=q_count,
+        head_dim=head_dim,
+        heads_channels=heads_channels,
+        block_size=_BLOCK_SIZE,
+        num_warps=4,
+    )
+    return out
+
+
+def triton_sigmoid_mul_heads_first_swapped_gate(
+    gate: torch.Tensor,
+    heads_first: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Gate CUEQ ending attention without materializing ``gate.transpose``.
+
+    This is a benchmark/prototype helper for ending-node triangle attention.
+    ``gate`` is projected from the original contiguous ``[..., I, J, H * C]``
+    pair tensor, while ``heads_first`` is CUEQ output for the logical
+    transposed problem in ``[..., J, H, I, C]`` layout.  The output is
+    contiguous ``[..., J, I, H * C]`` for the existing output GEMM.
+    """
+    if not triton_triangle_attention_epilogue_enabled():
+        return None
+    if not triton_fused_elementwise_available():
+        return None
+    if torch.is_grad_enabled():
+        return None
+    if gate.dtype not in _SUPPORTED_DTYPES:
+        return None
+    if not gate.is_cuda or not heads_first.is_cuda:
+        return None
+    if gate.dtype != heads_first.dtype:
+        return None
+    if not gate.is_contiguous() or not heads_first.is_contiguous():
+        return None
+    if gate.dim() < 3 or heads_first.dim() != gate.dim() + 1:
+        return None
+    if heads_first.shape[:-4] != gate.shape[:-3]:
+        return None
+    i_count = gate.shape[-3]
+    j_count = gate.shape[-2]
+    heads_channels = gate.shape[-1]
+    head_count = heads_first.shape[-3]
+    if heads_first.shape[-4] != j_count or heads_first.shape[-2] != i_count:
+        return None
+    if heads_channels % head_count != 0:
+        return None
+    head_dim = heads_channels // head_count
+    if heads_first.shape[-1] != head_dim:
+        return None
+    if gate.numel() == 0:
+        return None
+
+    out = torch.empty(
+        (*gate.shape[:-3], j_count, i_count, heads_channels),
+        dtype=gate.dtype,
+        device=gate.device,
+    )
+    _sigmoid_mul_heads_first_swapped_gate_kernel[_grid(out.numel())](
+        gate,
+        heads_first,
+        out,
+        out.numel(),
+        i_count=i_count,
+        j_count=j_count,
         head_dim=head_dim,
         heads_channels=heads_channels,
         block_size=_BLOCK_SIZE,

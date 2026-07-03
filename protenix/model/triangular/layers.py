@@ -368,6 +368,7 @@ class Attention(nn.Module):
         kv_x: torch.Tensor,
         apply_scale: bool = True,
         cueq_heads_first: bool = False,
+        cueq_swap_pair_axes: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # [*, Q/K/V, H * C_hidden]
         if (
@@ -397,7 +398,11 @@ class Attention(nn.Module):
                 # [..., I, H, J, D] layout.  Producing that layout here avoids
                 # the hidden transpose/contiguous copies inside the CUEQ call
                 # while preserving the same fused projection and fallback path.
-                qkv_heads_first = triton_qkv_to_cueq_heads_first(qkv, self.no_heads)
+                qkv_heads_first = triton_qkv_to_cueq_heads_first(
+                    qkv,
+                    self.no_heads,
+                    swap_pair_axes=cueq_swap_pair_axes,
+                )
                 if qkv_heads_first is not None:
                     return qkv_heads_first
             q, k, v = qkv.chunk(3, dim=-1)
@@ -415,6 +420,11 @@ class Attention(nn.Module):
         q = q.transpose(-2, -3)
         k = k.transpose(-2, -3)
         v = v.transpose(-2, -3)
+
+        if cueq_swap_pair_axes:
+            q = q.transpose(-4, -2).contiguous()
+            k = k.transpose(-4, -2).contiguous()
+            v = v.transpose(-4, -2).contiguous()
 
         if apply_scale:
             q /= math.sqrt(self.c_hidden)

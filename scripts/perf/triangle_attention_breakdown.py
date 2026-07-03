@@ -26,6 +26,7 @@ from protenix.model.modules.fused_elementwise_triton import (
     triton_fused_elementwise_enabled,
     triton_triangle_attention_epilogue_enabled,
     triton_sigmoid_mul_heads_first,
+    triton_sigmoid_mul_heads_first_swapped_gate,
 )
 from protenix.model.triangular.layers import (
     cuequivariance_triangular_attn,
@@ -247,6 +248,131 @@ def manual_cueq_forward(
     return o, timings
 
 
+def manual_cueq_ending_contiguous_forward(
+    module: TriangleAttention,
+    x_in: torch.Tensor,
+    mask_in: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Ending-node attention prototype that keeps projections contiguous.
+
+    The production ending path evaluates the starting-node attention on
+    ``x.transpose(I, J)``.  That is mathematically clean but makes LayerNorm and
+    all projection GEMMs consume a transposed pair layout.  This prototype uses
+    the identity ``LN(x.transpose(I, J)) == LN(x).transpose(I, J)`` and computes
+    the expensive channel-wise projections on the original contiguous ``x``.
+    Small Triton layout helpers then write the swapped CUEQ layouts directly.
+
+    It is deliberately a benchmark path: if this does not move the H100 module
+    subtotal, a production rewrite would only add complexity.
+    """
+    if module.starting:
+        raise ValueError("contiguous ending prototype requires ending attention")
+
+    events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+    x = timed("layer_norm_contiguous", lambda: module.layer_norm(x_in), events)
+
+    if cueq_bool_mask_enabled():
+        mask_for_attention = timed(
+            "mask_bool_swapped",
+            lambda: (mask_in.transpose(-1, -2) == 1)[..., :, None, None, :],
+            events,
+        )
+    else:
+        mask_bias = timed(
+            "mask_bias_swapped",
+            lambda: (module.inf * (mask_in.transpose(-1, -2) - 1))[
+                ..., :, None, None, :
+            ],
+            events,
+        )
+
+    triangle_bias_linear = timed(
+        "triangle_bias_linear_contiguous",
+        lambda: module.linear(x),
+        events,
+    )
+    triangle_bias = timed(
+        "triangle_bias_swapped_layout",
+        lambda: permute_final_dims(triangle_bias_linear, (2, 1, 0)).unsqueeze(-4),
+        events,
+    )
+
+    q, k, v = timed(
+        "qkv_projection_swapped_layout",
+        lambda: module.mha._prep_qkv(
+            x,
+            x,
+            apply_scale=False,
+            cueq_heads_first=True,
+            cueq_swap_pair_axes=True,
+        ),
+        events,
+    )
+
+    triangle_bias_fp32 = timed(
+        "triangle_bias_fp32",
+        lambda: triangle_bias.float(),
+        events,
+    )
+    if not cueq_bool_mask_enabled():
+        mask_for_attention = timed(
+            "mask_bool_from_swapped_bias",
+            lambda: (mask_bias == 0).bool(),
+            events,
+        )
+
+    scale = 1.0 / math.sqrt(module.c_hidden)
+    heads_first = timed(
+        "cueq_attention",
+        lambda: cuequivariance_triangular_attn(
+            q, k, v, triangle_bias_fp32, mask_for_attention, scale
+        ),
+        events,
+    )
+    if isinstance(heads_first, tuple):
+        heads_first = heads_first[0]
+
+    gate = timed("gate_projection_contiguous", lambda: module.mha.linear_g(x), events)
+    o = timed(
+        "gate_sigmoid_mul_swapped_triton",
+        lambda: triton_sigmoid_mul_heads_first_swapped_gate(gate, heads_first),
+        events,
+    )
+    if o is None:
+        gate_t = timed(
+            "gate_transpose_contiguous",
+            lambda: gate.transpose(-2, -3).contiguous(),
+            events,
+        )
+        o = timed(
+            "gate_sigmoid_mul_flatten_triton",
+            lambda: triton_sigmoid_mul_heads_first(gate_t, heads_first),
+            events,
+        )
+        if o is None:
+            o = timed(
+                "attention_transpose",
+                lambda: heads_first.transpose(-2, -3),
+                events,
+            )
+            gate_view = timed(
+                "gate_sigmoid_layout",
+                lambda: module.mha.sigmoid(gate_t).view(
+                    gate_t.shape[:-1] + (module.no_heads, -1)
+                ),
+                events,
+            )
+            o = timed("gate_multiply", lambda: o * gate_view, events)
+            o = timed("flatten_heads", lambda: flatten_final_dims(o, 2), events)
+
+    o = timed("output_projection", lambda: module.mha.linear_o(o), events)
+    o = timed("output_transpose", lambda: o.transpose(-2, -3), events)
+
+    torch.cuda.synchronize()
+    timings = {name: start.elapsed_time(end) for name, start, end in events}
+    return o, timings
+
+
 def module_forward(
     module: TriangleAttention,
     x: torch.Tensor,
@@ -393,6 +519,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ending-contiguous-producer",
+        type=str_bool,
+        default=False,
+        help=(
+            "Diagnostic only: for ending-node attention, keep LayerNorm and the "
+            "qkv/gate/bias projections on the original contiguous pair tensor, "
+            "then write swapped CUEQ layouts with prototype Triton helpers."
+        ),
+    )
+    parser.add_argument(
         "--ncu-capture",
         choices=["none", "module", "manual"],
         default="none",
@@ -415,6 +551,8 @@ def main() -> None:
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("triangle_attention_breakdown requires CUDA")
+    if args.ending_contiguous_producer and not args.ending:
+        raise ValueError("--ending-contiguous-producer requires --ending true")
 
     torch.backends.cuda.matmul.allow_tf32 = args.enable_tf32
     torch.manual_seed(args.seed)
@@ -429,12 +567,19 @@ def main() -> None:
             if args.ncu_capture == "module":
                 capture_fn = lambda: module_forward(module, x, mask)
             else:
-                capture_fn = lambda: manual_cueq_forward(
-                    module,
-                    x,
-                    mask,
-                    ending_norm_before_transpose=args.ending_norm_before_transpose,
-                )[0]
+                if args.ending_contiguous_producer:
+                    capture_fn = lambda: manual_cueq_ending_contiguous_forward(
+                        module,
+                        x,
+                        mask,
+                    )[0]
+                else:
+                    capture_fn = lambda: manual_cueq_forward(
+                        module,
+                        x,
+                        mask,
+                        ending_norm_before_transpose=args.ending_norm_before_transpose,
+                    )[0]
             out = cuda_profiler_capture(
                 (
                     f"triangle_attention_{args.ncu_capture}_"
@@ -465,20 +610,26 @@ def main() -> None:
             return
 
         for _ in range(args.warmup):
-            manual_cueq_forward(
+            if args.ending_contiguous_producer:
+                manual_cueq_ending_contiguous_forward(module, x, mask)
+            else:
+                manual_cueq_forward(
+                    module,
+                    x,
+                    mask,
+                    ending_norm_before_transpose=args.ending_norm_before_transpose,
+                )
+
+        reference = module_forward(module, x, mask)
+        if args.ending_contiguous_producer:
+            split, _ = manual_cueq_ending_contiguous_forward(module, x, mask)
+        else:
+            split, _ = manual_cueq_forward(
                 module,
                 x,
                 mask,
                 ending_norm_before_transpose=args.ending_norm_before_transpose,
             )
-
-        reference = module_forward(module, x, mask)
-        split, _ = manual_cueq_forward(
-            module,
-            x,
-            mask,
-            ending_norm_before_transpose=args.ending_norm_before_transpose,
-        )
         parity = max_abs_error(reference, split)
         layout = layout_probe(module, x, mask)
 
@@ -488,12 +639,15 @@ def main() -> None:
 
         torch.cuda.reset_peak_memory_stats()
         for _ in range(args.iters):
-            _, timings = manual_cueq_forward(
-                module,
-                x,
-                mask,
-                ending_norm_before_transpose=args.ending_norm_before_transpose,
-            )
+            if args.ending_contiguous_producer:
+                _, timings = manual_cueq_ending_contiguous_forward(module, x, mask)
+            else:
+                _, timings = manual_cueq_forward(
+                    module,
+                    x,
+                    mask,
+                    ending_norm_before_transpose=args.ending_norm_before_transpose,
+                )
             for name, elapsed_ms in timings.items():
                 totals[name] += elapsed_ms
 
