@@ -186,6 +186,7 @@ def _cueq_attention_pair_bias(
     v: torch.Tensor,
     z: torch.Tensor,
     token_mask: torch.Tensor,
+    layernorm_z_bias: torch.Tensor | None,
     *,
     return_z_proj: bool,
 ) -> torch.Tensor:
@@ -203,7 +204,7 @@ def _cueq_attention_pair_bias(
         w_proj_g=module.attention.linear_g.weight,
         w_proj_o=module.attention.linear_o.weight,
         w_ln_z=module.layernorm_z.weight,
-        b_ln_z=module.layernorm_z.bias,
+        b_ln_z=layernorm_z_bias,
         inf=1e4,
         eps=module.layernorm_z.eps,
         attn_scale=1.0,
@@ -268,6 +269,14 @@ def main() -> None:
             return module.layernorm_a(a=inputs["a"], s=inputs["s"])
 
     a_norm = normalize_a()
+    layernorm_z_bias = module.layernorm_z.bias
+    if layernorm_z_bias is None:
+        # CUEQ 0.10's native pair-bias Triton kernel checks whether LayerNorm
+        # has any affine parameter, then unconditionally reads both weight and
+        # bias pointers.  Protenix's mathematically equivalent no-offset
+        # LayerNorm has weight but no bias, so pass an explicit zero vector for
+        # this probe instead of tripping that kernel compilation bug.
+        layernorm_z_bias = torch.zeros_like(module.layernorm_z.weight)
     with amp:
         # Protenix scales q before SDPA and calls SDPA with scale=1.0.  The
         # CUEQ primitive gets the same pre-scaled q and attn_scale=1.0 so this
@@ -328,6 +337,7 @@ def main() -> None:
                 current_v,
                 inputs["z"],
                 inputs["token_mask_record"],
+                layernorm_z_bias,
                 return_z_proj=False,
             )
 
@@ -341,6 +351,7 @@ def main() -> None:
                 v,
                 inputs["z"],
                 inputs["token_mask_record"],
+                layernorm_z_bias,
                 return_z_proj=False,
             )
 
