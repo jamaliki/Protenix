@@ -20,6 +20,7 @@ import unittest
 import torch
 
 os.environ["LAYERNORM_TYPE"] = "torch"
+from protenix.model.modules.primitives import Attention
 from protenix.model.modules.transformer import AttentionPairBias
 
 
@@ -123,6 +124,34 @@ class TestAttentionPairBias(unittest.TestCase):
         out = model(**inputs)
         target_shape = (*bs_dims, N_token, c_a)
         self.assertEqual(out.shape, out.reshape(target_shape).shape)
+
+    def test_fused_self_qkv_projection_matches_separate_projections(self) -> None:
+        torch.manual_seed(3)
+        old = os.environ.get("PROTENIX_FUSED_SELF_QKV_PROJECTION")
+        try:
+            attn = Attention(
+                c_q=24,
+                c_k=24,
+                c_v=24,
+                c_hidden=6,
+                num_heads=4,
+                q_linear_bias=True,
+            ).to(self.device)
+            attn.eval()
+            x = torch.randn(2, 5, 24, device=self.device)
+            with torch.no_grad():
+                os.environ["PROTENIX_FUSED_SELF_QKV_PROJECTION"] = "0"
+                ref = attn._prep_qkv(x, x, apply_scale=True)
+                os.environ["PROTENIX_FUSED_SELF_QKV_PROJECTION"] = "1"
+                self.assertTrue(attn._can_fuse_self_qkv_projection(x, x))
+                fused = attn._prep_qkv(x, x, apply_scale=True)
+            for ref_tensor, fused_tensor in zip(ref, fused):
+                self.assertTrue(torch.allclose(ref_tensor, fused_tensor))
+        finally:
+            if old is None:
+                os.environ.pop("PROTENIX_FUSED_SELF_QKV_PROJECTION", None)
+            else:
+                os.environ["PROTENIX_FUSED_SELF_QKV_PROJECTION"] = old
 
     def tearDown(self):
         elapsed_time = time.time() - self._start_time
