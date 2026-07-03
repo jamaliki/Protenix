@@ -73,8 +73,9 @@ def make_inputs(
     z = torch.randn(
         args.batch, args.tokens, args.tokens, args.c_z, device=device, dtype=dtype
     )
+    mask_dtype = torch.bool if args.pair_mask_dtype == "bool" else dtype
     pair_mask = torch.ones(
-        args.batch, args.tokens, args.tokens, device=device, dtype=dtype
+        args.batch, args.tokens, args.tokens, device=device, dtype=mask_dtype
     )
     return s, z, pair_mask
 
@@ -187,6 +188,7 @@ def parse_args() -> argparse.Namespace:
     dtype_choices = ["float32", "bfloat16", "float16"]
     parser.add_argument("--input-dtype", choices=dtype_choices, default="bfloat16")
     parser.add_argument("--compute-dtype", choices=dtype_choices, default="bfloat16")
+    parser.add_argument("--pair-mask-dtype", choices=["same", "bool"], default="same")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--seed", type=int, default=123)
