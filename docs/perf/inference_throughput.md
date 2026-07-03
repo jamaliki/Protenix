@@ -1094,6 +1094,27 @@ The model-only same-shape sweep shows where larger batches stop helping:
 | B64, `N_sample=5` | 0.436 seq/s | 2.18 sample/s | 146.80 | 46.74 | diffusion |
 | B96, `N_sample=5` | 0.438 seq/s | 2.19 sample/s | 219.23 | 69.06 | diffusion |
 
+For the actual mixed-token 32-record `N_sample=5`, `N_step=200` campaign,
+larger batches are worse even after the promoted batching and BF16 changes.
+Job `96673`
+(`runs/batch_size_16_32_gate_n200_20260703_044457_cd17527`) compared the
+current stack at `--batch_size 16` and `--batch_size 32`:
+
+| case | predict sec | generated samples/s | pairformer | diffusion | diffusion transformer | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| B16 | 43.950 | 3.641 | 15.801 | 23.644 | 14.002 | 2.440 | keep |
+| B32 | 54.500 | 2.936 | 22.426 | 27.565 | 18.319 | 2.443 | reject |
+| B16 repeat | 43.980 | 3.638 | 15.734 | 23.706 | 14.056 | 2.469 | keep |
+| B32 repeat | 54.590 | 2.931 | 22.541 | 27.480 | 18.191 | 2.494 | reject |
+
+The mechanism is clear: B32 saves one Python/model call, but it also mixes the
+entire 40-220-token range into one padded physical shape.  Pairformer grows
+from about `15.8s` to `22.5s`, and the diffusion transformer grows from about
+`14.0s` to `18.2s`, so per-GPU generated-sample throughput drops by about
+`19%`.  For mixed-length low-sample campaigns, prefer `--batch_size 16` unless
+a future bucketing rule can preserve tight token ranges at larger effective
+batches.
+
 For this 245-token input, `B=32-64` is the practical knee.  Larger batches keep
 raising memory but add little throughput.  The low-sample workload is therefore
 not the same bottleneck as the `N_sample=2560` same-output workload: `N_sample=1`
@@ -2045,6 +2066,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | BF16 final confidence logits | reduced FP32 logit matmuls but no NCU/timing win | the remaining FP32 matmuls are too small and cast traffic dominates |
 | Whole confidence head under AMP | 2.9-5.6% slower at `N_sample=128`, `N_step=20` | lower dtype is not automatically faster when FP32 uses TF32 tensor cores and casts/library paths change |
 | Generic full-token Triton attention | slower than cuDNN/SDPA | vendor kernels win unless the shape mismatch is severe |
+| Raising mixed-token `N_sample=5` batch size from 16 to 32 | current full gate slowed from `3.64` to `2.93` generated samples/s because pairformer and diffusion transformer ran on a much larger padded physical shape | bigger batches only help when bucketing keeps token ranges tight; memory headroom alone is not a throughput argument |
 | Materializing pairformer token-attention bias as contiguous `[B, H, Q, K]` | traced pairformer SDPA shape `[16, 16, 124, 24]` moved from math-dispatch attempt to a cuDNN frontend "no valid execution plans" error; fallback timing then segfaulted in the isolated screen | the non-contiguous bias layout is not the only blocker; head_dim 24 plus dense additive bias lacks a safe cuDNN plan in this runtime, so do not pay a bias copy hoping for a backend flip |
 | Reusing Triton `TriAttentionFunction` for pairformer token attention | isolated `N=220` hotspot improved, but the full mixed-sequence gate averaged only `45.16s -> 44.89s` predict (`+0.6%`) and one repeat regressed | padding `D=24` to `D=32` and copying layouts is too much integration overhead; if revisited, write a direct dense-bias `D=24` kernel instead |
 | `torch.compile` around the diffusion-token transformer | isolated 24-block screen improved `1.29-1.34x`, but the real model gate failed in the compiled graph with a cuDNN frontend "no valid execution plans" error before producing candidate timings | block-level fusion remains attractive, but Inductor's emitted SDPA path is not yet a safe production mechanism for this model boundary |
