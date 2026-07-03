@@ -751,18 +751,29 @@ were only tens of milliseconds.  The next atom win is therefore not another
 local-attention kernel rewrite; it would need to remove many small launches or
 copies around the atom blocks.
 
-This profile motivates one narrow follow-up instead of re-enabling the rejected
+This profile motivated one narrow follow-up instead of re-enabling the rejected
 broad fusion flag.  Commit `b5c8c3e` adds
 `PROTENIX_TRITON_FUSED_ELEMENTWISE_MIN_ELEMENTS`, which keeps the default-off
-generic Triton elementwise fusions away from tiny tensors.  The planned gate is
-job `96600`
+generic Triton elementwise fusions away from tiny tensors.  The representative
+gate was job `96600`
 (`runs/elementwise_threshold_gate_n200_20260703_034213_b5c8c3e`), comparing the
 current default with thresholds of `1,000,000` and `8,000,000` output elements
-on the same `N_sample=5`, `N_step=200`, batch-16 campaign.  The job is queued
-on `gpu-canary` with `afterany:96494`, because an interactive allocation
-currently owns that node.  Do not promote the threshold knob unless that
-same-job N200 gate improves generated samples/sec and the intended
-diffusion/pairformer subtotals move in the expected direction.
+on the same `N_sample=5`, `N_step=200`, batch-16 campaign.
+
+| case | predict sec | generated samples/s | pairformer | diffusion | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| default | 44.020 | 3.635 | 15.747 | 23.774 | 2.461 | baseline |
+| threshold 1M | 43.600 | 3.670 | 15.325 | 23.722 | 2.517 | reject: noise-level |
+| threshold 8M | 44.030 | 3.634 | 15.482 | 23.955 | 2.527 | reject: flat |
+| default repeat | 44.620 | 3.586 | 15.755 | 24.369 | 2.459 | baseline repeat |
+| threshold 1M repeat | 44.090 | 3.629 | 15.380 | 24.063 | 2.577 | reject: noise-level |
+| threshold 8M repeat | 44.220 | 3.618 | 15.412 | 24.133 | 2.603 | reject: flat |
+
+The apparent best case is about `1.1%` faster by generated samples/sec, but the
+movement is small compared with same-job variance and the intended subtotals
+do not move decisively.  Keep the minimum-size guard only as a safety valve for
+manual experiments with the already default-off global elementwise flag; do not
+use it in the promoted recipe.
 
 A larger attention-boundary follow-up is commit `c67cde2`, which adds the
 opt-in `PROTENIX_FUSED_SELF_QKV_PROJECTION` path to
@@ -776,8 +787,12 @@ changes the producer boundary before SDPA.
 
 Remote unit tests in `env-boltz2` passed:
 `PYTHONPATH=$REPO CUDA_VISIBLE_DEVICES= $ENV/bin/python -m unittest
-tests.test_attention_pair_bias`.  The queued one-H100 hotspot is job `96624`
-(`runs/self_qkv_hotspot_20260703_035814_c67cde2`), dependent on `96600`.  It
+tests.test_attention_pair_bias`.  The one-H100 hotspot screen is job `96656`
+(`runs/self_qkv_hotspot_20260703_035814_c67cde2`).  It replaces the original
+pending canary job `96624`, which was cancelled before starting because the
+canary node was reserved by an interactive allocation; a regular-partition
+replacement, job `96650`, was also cancelled before starting because Slurm
+estimated a much later start than the canary backfill slot.  The active screen
 screens the flag on four shapes from the current profile: diffusion-token
 `samples=80, N_token=124/220, c=768`, and pair/confidence-style
 `batch=16, N_token=124/220, c=384`.  Promote nothing from the unit test alone:
