@@ -784,6 +784,27 @@ pairformer opportunity is not Python-side weight packing; it is a larger
 kernel-boundary change that removes work around CUEQ triangle attention or
 triangle multiplication itself without adding new layout traffic.
 
+The obvious transpose-removal variant was also screened and rejected.  Job
+`96743` (`runs/end_triangle_transpose_probe_20260703_053931_1e4c462`) compared
+the current ending-triangle-attention boundary,
+`transpose(...).contiguous() -> starting-style CUEQ attention -> transpose back`,
+against an algebraically equivalent `TriangleAttention(starting=False)` call on
+the original pair tensor.  The hope was to avoid two full `[B, N, N, C]`
+copies.  In practice, the strided orientation made the LayerNorm/QKV/CUEQ
+producer boundary much worse:
+
+| shape | explicit-transpose boundary | logical ending-node boundary | decision |
+| --- | ---: | ---: | --- |
+| `B=16, N=124` | 1.113 ms | 1.615 ms | reject: `45%` slower |
+| `B=16, N=220` | 3.884 ms | 5.329 ms | reject: `37%` slower |
+
+This explains why the current explicit contiguous transposes remain in the
+inference block despite looking wasteful in isolation: they pay a predictable
+HBM copy so the larger normalization, projection, and CUEQ kernels see the
+layout they were optimized for.  A useful future change would have to fuse the
+transpose into those producers or teach the kernels the alternate strides,
+not merely pass a strided view through the existing path.
+
 This profile motivated one narrow follow-up instead of re-enabling the rejected
 broad fusion flag.  Commit `b5c8c3e` adds
 `PROTENIX_TRITON_FUSED_ELEMENTWISE_MIN_ELEMENTS`, which keeps the default-off
