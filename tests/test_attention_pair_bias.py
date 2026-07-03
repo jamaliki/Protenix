@@ -20,7 +20,6 @@ import unittest
 import torch
 
 os.environ["LAYERNORM_TYPE"] = "torch"
-from protenix.model.modules.primitives import AdaptiveLayerNorm, Attention
 from protenix.model.modules.transformer import AttentionPairBias
 
 
@@ -124,71 +123,6 @@ class TestAttentionPairBias(unittest.TestCase):
         out = model(**inputs)
         target_shape = (*bs_dims, N_token, c_a)
         self.assertEqual(out.shape, out.reshape(target_shape).shape)
-
-    def test_fused_self_qkv_projection_matches_separate_projections(self) -> None:
-        torch.manual_seed(3)
-        old = os.environ.get("PROTENIX_FUSED_SELF_QKV_PROJECTION")
-        try:
-            for q_linear_bias in (True, False):
-                with self.subTest(q_linear_bias=q_linear_bias):
-                    attn = Attention(
-                        c_q=24,
-                        c_k=24,
-                        c_v=24,
-                        c_hidden=6,
-                        num_heads=4,
-                        q_linear_bias=q_linear_bias,
-                    ).to(self.device)
-                    attn.eval()
-                    x = torch.randn(2, 5, 24, device=self.device)
-                    with torch.no_grad():
-                        os.environ["PROTENIX_FUSED_SELF_QKV_PROJECTION"] = "0"
-                        ref = attn._prep_qkv(x, x, apply_scale=True)
-                        os.environ["PROTENIX_FUSED_SELF_QKV_PROJECTION"] = "1"
-                        self.assertTrue(attn._can_fuse_self_qkv_projection(x, x))
-                        fused = attn._prep_qkv(x, x, apply_scale=True)
-                    for ref_tensor, fused_tensor in zip(ref, fused):
-                        # The fused path changes three GEMM launches into one
-                        # wider GEMM.  That is algebraically identical, but the
-                        # library may choose a different reduction schedule
-                        # or TF32 plan, so assert numerical closeness rather
-                        # than accidental bitwise identity.
-                        torch.testing.assert_close(
-                            fused_tensor,
-                            ref_tensor,
-                            rtol=2e-3,
-                            atol=2e-3,
-                        )
-        finally:
-            if old is None:
-                os.environ.pop("PROTENIX_FUSED_SELF_QKV_PROJECTION", None)
-            else:
-                os.environ["PROTENIX_FUSED_SELF_QKV_PROJECTION"] = old
-
-    def test_fused_adaptive_layernorm_projection_matches_separate_projections(
-        self,
-    ) -> None:
-        torch.manual_seed(4)
-        old = os.environ.get("PROTENIX_FUSED_ADAPTIVE_LAYERNORM_PROJECTION")
-        try:
-            module = AdaptiveLayerNorm(c_a=24, c_s=12).to(self.device)
-            module.eval()
-            a = torch.randn(3, 5, 24, device=self.device)
-            # A singleton leading dimension exercises the diffusion-style case
-            # where conditioning is shared across multiple sample lanes.
-            s = torch.randn(1, 5, 12, device=self.device)
-            with torch.no_grad():
-                os.environ["PROTENIX_FUSED_ADAPTIVE_LAYERNORM_PROJECTION"] = "0"
-                ref = module(a=a, s=s)
-                os.environ["PROTENIX_FUSED_ADAPTIVE_LAYERNORM_PROJECTION"] = "1"
-                self.assertTrue(module._can_fuse_s_projection())
-                fused = module(a=a, s=s)
-            torch.testing.assert_close(fused, ref, rtol=2e-3, atol=2e-3)
-        finally:
-            if old is None:
-                os.environ.pop("PROTENIX_FUSED_ADAPTIVE_LAYERNORM_PROJECTION", None)
-            else:
-                os.environ["PROTENIX_FUSED_ADAPTIVE_LAYERNORM_PROJECTION"] = old
 
     def tearDown(self):
         elapsed_time = time.time() - self._start_time

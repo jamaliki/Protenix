@@ -775,30 +775,44 @@ do not move decisively.  Keep the minimum-size guard only as a safety valve for
 manual experiments with the already default-off global elementwise flag; do not
 use it in the promoted recipe.
 
-A larger attention-boundary follow-up is commit `c67cde2`, which adds the
-opt-in `PROTENIX_FUSED_SELF_QKV_PROJECTION` path to
-`protenix.model.modules.primitives.Attention`.  This is the same algebraic
-idea that already won in triangular CUEQ attention: when self-attention uses
-the same tensor for q, k, and v, concatenate the three projection weights and
-run one wider GEMM instead of three independent GEMMs.  The path is
-inference-only, default-off, and guarded to q/k/v self-attention with the
-ordinary precision policy.  It preserves the vendor GEMM/SDPA kernels and only
-changes the producer boundary before SDPA.
+A larger attention-boundary follow-up tested the algebraic idea that won in
+triangular CUEQ attention: when ordinary self-attention uses the same tensor
+for q, k, and v, concatenate the three projection weights and run one wider
+GEMM instead of three independent GEMMs.  The hotspot screen, job `96656`
+(`runs/self_qkv_hotspot_20260703_035814_c67cde2`), showed the intended local
+movement:
 
-Remote unit tests in `env-boltz2` passed:
-`PYTHONPATH=$REPO CUDA_VISIBLE_DEVICES= $ENV/bin/python -m unittest
-tests.test_attention_pair_bias`.  The one-H100 hotspot screen is job `96656`
-(`runs/self_qkv_hotspot_20260703_035814_c67cde2`).  It replaces the original
-pending canary job `96624`, which was cancelled before starting because the
-canary node was reserved by an interactive allocation; a regular-partition
-replacement, job `96650`, was also cancelled before starting because Slurm
-estimated a much later start than the canary backfill slot.  The active screen
-screens the flag on four shapes from the current profile: diffusion-token
-`samples=80, N_token=124/220, c=768`, and pair/confidence-style
-`batch=16, N_token=124/220, c=384`.  Promote nothing from the unit test alone:
-advance the QKV flag only if the hotspot moves the
-`attention_qkv_sdpa_gate_out` subrange, then run a full `N_sample=5`,
-`N_step=200` campaign gate.
+| case | block ms off | block ms on | qkv+sdpa+gate+out off | qkv+sdpa+gate+out on |
+| --- | ---: | ---: | ---: | ---: |
+| diffusion `N_token=124` | 0.910 | 0.881 | 0.336 | 0.294 |
+| diffusion `N_token=220` | 1.429 | 1.427 | 0.654 | 0.595 |
+| pair `N_token=124` | 1.004 | 0.965 | 0.367 | 0.321 |
+| pair `N_token=220` | 1.184 | 1.182 | 0.454 | 0.441 |
+
+Because the local subrange moved, it advanced to the full mixed-sequence
+`N_sample=5`, `N_step=200`, batch-16 gate, job `96662`
+(`runs/self_qkv_gate_n200_20260703_043101_22ec28b`).  The real gate rejected
+promotion:
+
+| case | predict sec | generated samples/s | pairformer | diffusion | diffusion transformer | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| default | 44.970 | 3.558 | 15.765 | 24.563 | 14.612 | 2.578 | baseline |
+| fused self-QKV | 44.480 | 3.597 | 15.833 | 24.135 | 14.336 | 2.458 | repeat required |
+| default repeat | 44.410 | 3.603 | 15.815 | 24.075 | 14.403 | 2.467 | baseline repeat |
+| fused self-QKV repeat | 45.230 | 3.537 | 15.772 | 24.824 | 14.802 | 2.556 | reject: regressed |
+
+The average is effectively flat/slower (`44.69s` default vs `44.86s`
+candidate).  This is a useful negative result: reducing q/k/v launch count
+does not help enough once the wider GEMM and downstream layout/cache effects
+are embedded in the real diffusion/confidence/pairformer workload.  The
+default-off code path was removed instead of leaving another unpromoted knob.
+
+An adjacent producer-fusion screen tried concatenating the two
+`AdaptiveLayerNorm` conditioning projections.  Hotspot job `96659`
+(`runs/adaln_projection_hotspot_20260703_042917_22ec28b`) rejected it before a
+full gate: the AdaLN subrange sometimes shrank by only `0.006-0.009 ms`, while
+full diffusion blocks were flat or slower (`1.416 -> 1.494 ms` at
+`N_token=220`).  This path was also removed.
 
 Launch-level follow-up: job `96110`
 (`runs/flat_bf16_batch_profile_20260702_221601_c8a532d`) proved the profiler
@@ -2035,6 +2049,8 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Reusing Triton `TriAttentionFunction` for pairformer token attention | isolated `N=220` hotspot improved, but the full mixed-sequence gate averaged only `45.16s -> 44.89s` predict (`+0.6%`) and one repeat regressed | padding `D=24` to `D=32` and copying layouts is too much integration overhead; if revisited, write a direct dense-bias `D=24` kernel instead |
 | `torch.compile` around the diffusion-token transformer | isolated 24-block screen improved `1.29-1.34x`, but the real model gate failed in the compiled graph with a cuDNN frontend "no valid execution plans" error before producing candidate timings | block-level fusion remains attractive, but Inductor's emitted SDPA path is not yet a safe production mechanism for this model boundary |
 | Fused self-attention `q/k/v/g` projection | exact parity but trunk block slowed from about 14.1 ms to 14.9 ms | fewer launches are not enough if the wider GEMM/cache/layout is worse |
+| Fused ordinary self-attention q/k/v projection | hotspot moved the intended `qkv+sdpa+gate+out` subrange, but the full mixed `N_sample=5`, `N_step=200` gate averaged flat/slower (`44.69s -> 44.86s`) and one repeat regressed | producer fusion must still move the full workload; local launch savings can disappear in wider GEMM/layout/cache effects |
+| Fused `AdaptiveLayerNorm` conditioning projections | AdaLN subrange shrank slightly in some hotspot shapes, but full diffusion blocks were flat/slower, e.g. `1.416 -> 1.494 ms` at `N_token=220` | do not carry default-off concatenated-GEMM knobs unless the enclosing block moves |
 | Fused transition `a1/a2` projection without split-aware consumer | transition slowed from about 5.3 ms to 7.0 ms | fusing the producer can break the consumer by creating non-contiguous halves |
 | Custom Triton transition input GEMM+SiLU | synthetic +12%, but real transition input path slowed from 3.09 ms to 3.54 ms | custom GEMM screens must use real module weights/autocast; cuBLAS efficiency is the bottleneck to match |
 | Unguarded pairformer transition input fusion at B96 | failed before producing model output | the concatenated pair-transition activation is too large; keep the shape guard |
