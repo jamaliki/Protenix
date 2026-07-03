@@ -51,9 +51,16 @@ def _matches_scope(name: str, pattern: str, exact: bool) -> bool:
     return name == pattern if exact else pattern in name
 
 
-def find_scope_intervals(trace: Path, pattern: str, exact: bool) -> list[Interval]:
+def find_scope_intervals(
+    trace: Path,
+    pattern: str,
+    exact: bool,
+    category: str | None,
+) -> list[Interval]:
     intervals: list[Interval] = []
     for event in event_objects(trace):
+        if category is not None and str(event.get("cat", "")) != category:
+            continue
         name = str(event.get("name", ""))
         if not _matches_scope(name, pattern, exact):
             continue
@@ -91,6 +98,16 @@ class IntervalIndex:
         scope_start, scope_end = self.intervals[idx - 1]
         return scope_start < end and scope_end > start
 
+    def contains(self, start: float, end: float) -> bool:
+        # For attribution we normally want child events, not broad parents such
+        # as "Trace::PyTorch Profiler" that merely overlap every scope.  Check
+        # the interval that starts at or immediately before the event.
+        idx = bisect.bisect_right(self.starts, start)
+        if idx == 0:
+            return False
+        scope_start, scope_end = self.intervals[idx - 1]
+        return scope_start <= start and end <= scope_end
+
 
 def _add(table: defaultdict[str, list[float]], name: str, duration_us: float) -> None:
     row = table[name]
@@ -103,6 +120,7 @@ def aggregate_scope(
     trace: Path,
     intervals: list[Interval],
     top: int,
+    overlap: bool,
 ) -> dict[str, Any]:
     index = IntervalIndex(intervals)
     category_counts: Counter[str] = Counter()
@@ -117,7 +135,8 @@ def aggregate_scope(
         interval = _event_interval(event)
         if interval is None:
             continue
-        if not index.overlaps(*interval):
+        inside = index.overlaps(*interval) if overlap else index.contains(*interval)
+        if not inside:
             continue
 
         matched_events += 1
@@ -160,18 +179,37 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("trace", type=Path)
     parser.add_argument("--scope", required=True, help="Scope name or substring.")
+    parser.add_argument(
+        "--scope-cat",
+        help=(
+            "Optional Chrome-trace category for the scope event, e.g. "
+            "user_annotation or gpu_user_annotation."
+        ),
+    )
     parser.add_argument("--exact", action="store_true", help="Require exact name match.")
+    parser.add_argument(
+        "--overlap",
+        action="store_true",
+        help="Count any overlapping event instead of only events contained in the scope.",
+    )
     parser.add_argument("--top", type=int, default=40)
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
 
-    intervals = find_scope_intervals(args.trace, args.scope, args.exact)
+    intervals = find_scope_intervals(
+        args.trace,
+        args.scope,
+        args.exact,
+        args.scope_cat,
+    )
     result = {
         "trace": str(args.trace),
         "scope": args.scope,
+        "scope_cat": args.scope_cat,
         "exact": args.exact,
+        "overlap": args.overlap,
         "scope_count": len(intervals),
-        **aggregate_scope(args.trace, intervals, args.top),
+        **aggregate_scope(args.trace, intervals, args.top, args.overlap),
     }
     text = json.dumps(result, indent=2, sort_keys=True)
     if args.out is not None:
