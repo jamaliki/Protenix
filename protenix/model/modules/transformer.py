@@ -67,37 +67,6 @@ def _expand_mask_to_prefix(
     ).expand(*target_prefix_shape, mask.shape[-1])
 
 
-def _contiguous_token_attention_bias_enabled() -> bool:
-    return os.getenv("PROTENIX_CONTIGUOUS_TOKEN_ATTENTION_BIAS", "0").lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
-
-
-def _maybe_make_token_attention_bias_contiguous(bias: torch.Tensor) -> torch.Tensor:
-    """Optionally copy full-token bias into the layout preferred by SDPA.
-
-    Pairformer token attention builds bias as ``[..., token, token, head]`` and
-    then permutes to the logical SDPA shape ``[..., head, query, key]``.  That
-    view has head as the fastest-moving dimension.  The post-atom H100 trace
-    showed PyTorch dispatching this exact BF16 shape to decomposed math SDPA,
-    while the diffusion transformer's physically contiguous ``[B, H, Q, K]``
-    bias reached cuDNN SDPA.  This helper is an experiment switch: pay one
-    explicit copy only for inference full-token attention and see whether the
-    backend transition wins back more than the copy costs.
-    """
-
-    if not _contiguous_token_attention_bias_enabled():
-        return bias
-    if torch.is_grad_enabled() or bias.is_contiguous() or not bias.is_cuda:
-        return bias
-    if bias.dim() < 4 or bias.shape[-1] != bias.shape[-2]:
-        return bias
-    return bias.contiguous()
-
-
 def _repeat_bias_for_sample_lanes(
     bias: torch.Tensor,
     z_sample_count: Optional[int],
@@ -398,8 +367,6 @@ class AttentionPairBias(nn.Module):
             # the sample dimension.
             key_bias = (token_mask.to(dtype=bias.dtype) - 1) * 1e4
             bias = bias + key_bias[..., None, None, :]
-
-        bias = _maybe_make_token_attention_bias_contiguous(bias)
 
         # Line 11: Multi-head attention with attention bias & gating (and optionally local attention)
         q = self.attention(q_x=q, kv_x=kv, attn_bias=bias, inplace_safe=inplace_safe)

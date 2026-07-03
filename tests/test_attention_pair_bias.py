@@ -16,15 +16,11 @@ import math
 import os
 import time
 import unittest
-from unittest import mock
 
 import torch
 
 os.environ["LAYERNORM_TYPE"] = "torch"
-from protenix.model.modules.transformer import (
-    AttentionPairBias,
-    _maybe_make_token_attention_bias_contiguous,
-)
+from protenix.model.modules.transformer import AttentionPairBias
 
 
 class TestAttentionPairBias(unittest.TestCase):
@@ -127,26 +123,6 @@ class TestAttentionPairBias(unittest.TestCase):
         out = model(**inputs)
         target_shape = (*bs_dims, N_token, c_a)
         self.assertEqual(out.shape, out.reshape(target_shape).shape)
-
-    def test_contiguous_token_attention_bias_policy(self) -> None:
-        source = torch.randn(2, 8, 8, 4, device=self.device)
-        bias = source.permute(0, 3, 1, 2)
-        self.assertFalse(bias.is_contiguous())
-
-        with mock.patch.dict(os.environ, {}, clear=True), torch.inference_mode():
-            self.assertIs(_maybe_make_token_attention_bias_contiguous(bias), bias)
-
-        with mock.patch.dict(
-            os.environ, {"PROTENIX_CONTIGUOUS_TOKEN_ATTENTION_BIAS": "1"}
-        ), torch.inference_mode():
-            out = _maybe_make_token_attention_bias_contiguous(bias)
-        if bias.is_cuda:
-            self.assertTrue(out.is_contiguous())
-            torch.testing.assert_close(out, bias)
-        else:
-            # The candidate exists only to influence CUDA SDPA backend choice;
-            # CPU tensors must not pay a pointless copy in unit-test installs.
-            self.assertIs(out, bias)
 
     def tearDown(self):
         elapsed_time = time.time() - self._start_time
