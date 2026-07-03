@@ -23,6 +23,8 @@ select different matmul/attention reduction schedules.
 
 from __future__ import annotations
 
+import _repo_bootstrap  # noqa: F401
+
 import argparse
 import json
 from contextlib import contextmanager, nullcontext

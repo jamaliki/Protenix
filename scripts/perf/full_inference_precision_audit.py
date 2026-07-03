@@ -10,6 +10,8 @@ autocast off internally.
 
 from __future__ import annotations
 
+import _repo_bootstrap  # noqa: F401
+
 import argparse
 import json
 import os

@@ -9,6 +9,8 @@ instead of the already-fast diffusion path.
 
 from __future__ import annotations
 
+import _repo_bootstrap  # noqa: F401
+
 import argparse
 import json
 from collections import defaultdict

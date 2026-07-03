@@ -10,6 +10,8 @@ means.  This probe exercises that new mask boundary on the core
 
 from __future__ import annotations
 
+import _repo_bootstrap  # noqa: F401
+
 import argparse
 import statistics
 from collections.abc import Callable

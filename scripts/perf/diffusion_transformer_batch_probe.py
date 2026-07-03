@@ -16,6 +16,8 @@ invasive sampler integration is worth doing.
 
 from __future__ import annotations
 
+import _repo_bootstrap  # noqa: F401
+
 import argparse
 import statistics
 from collections.abc import Callable

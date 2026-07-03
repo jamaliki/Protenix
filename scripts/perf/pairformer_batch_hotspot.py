@@ -9,6 +9,8 @@ padding check shows whether naive ragged padding is mathematically safe.
 
 from __future__ import annotations
 
+import _repo_bootstrap  # noqa: F401
+
 import argparse
 import json
 from contextlib import contextmanager, nullcontext
