@@ -700,19 +700,23 @@ low-sample campaign shapes `[B * N_sample, N_token, C] = [80, N, 768]`:
 | `N_token=220`, mode `reduce-overhead` | 0.593 ms | 0.496 ms | 1.19x | max abs 0.015625 |
 
 This is a real sub-block win, but the ceiling is modest because the transition
-is only part of the 24-block diffusion transformer.  The follow-up model change
-adds an opt-in hook:
+is only part of the 24-block diffusion transformer.  The follow-up model hook
+was rejected by the representative gate, job `96434`
+(`runs/transition_compile_gate_n200_20260703_030113_f6f982c`).  It deliberately
+compiled only the feed-forward transition and left SDPA eager, but the full
+mixed-sequence `N_sample=5`, `N_step=200`, batch-16 gate slowed down:
 
-```bash
-export PROTENIX_COMPILE_DIFFUSION_TRANSITION=1
-export PROTENIX_COMPILE_DIFFUSION_TRANSITION_MODE=default
-```
+| case | samples/s | predict sec | diffusion transformer sec | decision |
+| --- | ---: | ---: | ---: | --- |
+| default | 3.590 | 44.570 | 14.266 | keep |
+| compiled transition | 3.417 | 46.820 | 16.765 | reject |
+| default repeat | 3.594 | 44.520 | 14.428 | keep |
+| compiled transition repeat | 3.366 | 47.530 | 17.179 | reject |
 
-The hook compiles only full-token diffusion transition blocks in CUDA no-grad
-eval mode with identity DropPath.  It deliberately excludes atom-local
-transformer blocks and all SDPA calls.  Status: validation pending; promote it
-only if the representative mixed-sequence `N_sample=5`, `N_step=200` gate moves
-the diffusion-transformer subtotal in the intended direction.
+The representative result moved the intended subtotal in the wrong direction,
+so the model hook was removed.  Keep the isolated probe as evidence that the
+transition boundary has launch/elementwise overhead, but do not use
+`torch.compile` as the production mechanism for it.
 
 Launch-level follow-up: job `96110`
 (`runs/flat_bf16_batch_profile_20260702_221601_c8a532d`) proved the profiler
