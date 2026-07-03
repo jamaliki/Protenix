@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -76,6 +77,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-size", type=optional_int, default=None)
     parser.add_argument("--sample-diffusion-chunk-size", type=optional_int, default=5)
     parser.add_argument(
+        "--profile-pairformer-scopes",
+        type=str_bool,
+        default=True,
+        help=(
+            "Enable optional pairformer record_function ranges so the exported "
+            "trace can attribute kernels to triangle attention, transitions, "
+            "and token attention. Disable only when measuring profiler overhead."
+        ),
+    )
+    parser.add_argument(
         "--sort-by-token-length",
         type=str_bool,
         default=True,
@@ -98,6 +109,8 @@ def main() -> None:
     dump_dir = Path(args.dump_dir).resolve()
     profile_dir = dump_dir / "profiles"
     profile_dir.mkdir(parents=True, exist_ok=True)
+    if args.profile_pairformer_scopes:
+        os.environ["PROTENIX_PROFILE_PAIRFORMER_SCOPES"] = "1"
     input_jsons = resolve_inference_jsons(args.input_json)
     profile_input_json, _cleanup_json = write_campaign_json(
         input_jsons,

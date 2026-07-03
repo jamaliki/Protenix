@@ -13,6 +13,8 @@
 # limitations under the License.
 
 # pylint: disable=C0114
+import contextlib
+import os
 from functools import partial
 from typing import Any, Optional
 
@@ -37,6 +39,37 @@ from protenix.model.utils import (
     pad_at_dim,
     sample_msa_feature_dict_random_without_replacement,
 )
+
+
+_PROFILE_PAIRFORMER_SCOPES: Optional[bool] = None
+
+
+def _profile_pairformer_scopes_enabled() -> bool:
+    global _PROFILE_PAIRFORMER_SCOPES
+    if _PROFILE_PAIRFORMER_SCOPES is None:
+        _PROFILE_PAIRFORMER_SCOPES = os.getenv(
+            "PROTENIX_PROFILE_PAIRFORMER_SCOPES", "0"
+        ).lower() not in {
+            "0",
+            "false",
+            "off",
+            "no",
+        }
+    return _PROFILE_PAIRFORMER_SCOPES
+
+
+def _pairformer_scope(name: str):
+    """Return a profiler range only for explicit pairformer trace runs.
+
+    PyTorch's global profiler table tells us that the pairformer is still a
+    material end-to-end subtotal, but not which child launches are responsible.
+    These optional ranges make Chrome traces attributable at the kernel/fusion
+    boundary without charging production inference for profiler annotations.
+    """
+
+    if not _profile_pairformer_scopes_enabled():
+        return contextlib.nullcontext()
+    return torch.profiler.record_function(f"protenix/{name}")
 
 
 class PairformerBlock(nn.Module):
@@ -136,97 +169,117 @@ class PairformerBlock(nn.Module):
                 [..., N_token, N_token, c_z]
         """
         if inplace_safe:
-            z = self.tri_mul_out(
-                z,
-                mask=pair_mask,
-                inplace_safe=inplace_safe,
-                _add_with_inplace=True,
-                triangle_multiplicative=triangle_multiplicative,
-            )
-            z = self.tri_mul_in(
-                z,
-                mask=pair_mask,
-                inplace_safe=inplace_safe,
-                _add_with_inplace=True,
-                triangle_multiplicative=triangle_multiplicative,
-            )
-            z += self.tri_att_start(
-                z,
-                mask=pair_mask,
-                triangle_attention=triangle_attention,
-                inplace_safe=inplace_safe,
-                chunk_size=chunk_size,
-            )
-            z = z.transpose(-2, -3).contiguous()
-            z += self.tri_att_end(
-                z,
-                mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
-                triangle_attention=triangle_attention,
-                inplace_safe=inplace_safe,
-                chunk_size=chunk_size,
-            )
-            z = z.transpose(-2, -3).contiguous()
-            z += self.pair_transition(z)
-        else:
-            tmu_update = self.tri_mul_out(
-                z,
-                mask=pair_mask,
-                inplace_safe=inplace_safe,
-                _add_with_inplace=False,
-                triangle_multiplicative=triangle_multiplicative,
-            )
-            z = dropout_add_rowwise(z, tmu_update, self.p_drop, self.training)
-            del tmu_update
-            tmu_update = self.tri_mul_in(
-                z,
-                mask=pair_mask,
-                inplace_safe=inplace_safe,
-                _add_with_inplace=False,
-                triangle_multiplicative=triangle_multiplicative,
-            )
-            z = dropout_add_rowwise(z, tmu_update, self.p_drop, self.training)
-            del tmu_update
-            z = dropout_add_rowwise(
-                z,
-                self.tri_att_start(
+            with _pairformer_scope("pairformer_block/triangle_mul_out"):
+                z = self.tri_mul_out(
+                    z,
+                    mask=pair_mask,
+                    inplace_safe=inplace_safe,
+                    _add_with_inplace=True,
+                    triangle_multiplicative=triangle_multiplicative,
+                )
+            with _pairformer_scope("pairformer_block/triangle_mul_in"):
+                z = self.tri_mul_in(
+                    z,
+                    mask=pair_mask,
+                    inplace_safe=inplace_safe,
+                    _add_with_inplace=True,
+                    triangle_multiplicative=triangle_multiplicative,
+                )
+            with _pairformer_scope("pairformer_block/triangle_attention_start"):
+                z += self.tri_att_start(
                     z,
                     mask=pair_mask,
                     triangle_attention=triangle_attention,
                     inplace_safe=inplace_safe,
                     chunk_size=chunk_size,
-                ),
-                self.p_drop,
-                self.training,
-            )
-            z = z.transpose(-2, -3).contiguous()
-            z = dropout_add_rowwise(
-                z,
-                self.tri_att_end(
+                )
+            with _pairformer_scope("pairformer_block/transpose_to_end"):
+                z = z.transpose(-2, -3).contiguous()
+            with _pairformer_scope("pairformer_block/triangle_attention_end"):
+                z += self.tri_att_end(
                     z,
                     mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
                     triangle_attention=triangle_attention,
                     inplace_safe=inplace_safe,
                     chunk_size=chunk_size,
-                ),
-                self.p_drop,
-                self.training,
-            )
-            z = z.transpose(-2, -3).contiguous()
+                )
+            with _pairformer_scope("pairformer_block/transpose_to_start"):
+                z = z.transpose(-2, -3).contiguous()
+            with _pairformer_scope("pairformer_block/pair_transition"):
+                z += self.pair_transition(z)
+        else:
+            with _pairformer_scope("pairformer_block/triangle_mul_out"):
+                tmu_update = self.tri_mul_out(
+                    z,
+                    mask=pair_mask,
+                    inplace_safe=inplace_safe,
+                    _add_with_inplace=False,
+                    triangle_multiplicative=triangle_multiplicative,
+                )
+            z = dropout_add_rowwise(z, tmu_update, self.p_drop, self.training)
+            del tmu_update
+            with _pairformer_scope("pairformer_block/triangle_mul_in"):
+                tmu_update = self.tri_mul_in(
+                    z,
+                    mask=pair_mask,
+                    inplace_safe=inplace_safe,
+                    _add_with_inplace=False,
+                    triangle_multiplicative=triangle_multiplicative,
+                )
+            z = dropout_add_rowwise(z, tmu_update, self.p_drop, self.training)
+            del tmu_update
+            with _pairformer_scope("pairformer_block/triangle_attention_start"):
+                z = dropout_add_rowwise(
+                    z,
+                    self.tri_att_start(
+                        z,
+                        mask=pair_mask,
+                        triangle_attention=triangle_attention,
+                        inplace_safe=inplace_safe,
+                        chunk_size=chunk_size,
+                    ),
+                    self.p_drop,
+                    self.training,
+                )
+            with _pairformer_scope("pairformer_block/transpose_to_end"):
+                z = z.transpose(-2, -3).contiguous()
+            with _pairformer_scope("pairformer_block/triangle_attention_end"):
+                z = dropout_add_rowwise(
+                    z,
+                    self.tri_att_end(
+                        z,
+                        mask=(
+                            pair_mask.transpose(-1, -2)
+                            if pair_mask is not None
+                            else None
+                        ),
+                        triangle_attention=triangle_attention,
+                        inplace_safe=inplace_safe,
+                        chunk_size=chunk_size,
+                    ),
+                    self.p_drop,
+                    self.training,
+                )
+            with _pairformer_scope("pairformer_block/transpose_to_start"):
+                z = z.transpose(-2, -3).contiguous()
 
-            z = z + self.pair_transition(z)
+            with _pairformer_scope("pairformer_block/pair_transition"):
+                z = z + self.pair_transition(z)
         if self.c_s > 0:
             token_mask = (
                 None
                 if pair_mask is None
                 else torch.diagonal(pair_mask, dim1=-2, dim2=-1)
             )
-            s = s + self.attention_pair_bias(
-                a=s,
-                s=None,
-                z=z,
-                token_mask=token_mask,
-            )
-            s = s + self.single_transition(s)
+            with _pairformer_scope("pairformer_block/token_attention"):
+                s = s + self.attention_pair_bias(
+                    a=s,
+                    s=None,
+                    z=z,
+                    token_mask=token_mask,
+                )
+            with _pairformer_scope("pairformer_block/single_transition"):
+                s = s + self.single_transition(s)
         return s, z
 
 
@@ -338,11 +391,12 @@ class PairformerStack(nn.Module):
         blocks_per_ckpt = self.blocks_per_ckpt
         if not torch.is_grad_enabled():
             blocks_per_ckpt = None
-        s, z = checkpoint_blocks(
-            blocks,
-            args=(s, z),
-            blocks_per_ckpt=blocks_per_ckpt,
-        )
+        with _pairformer_scope("pairformer_stack"):
+            s, z = checkpoint_blocks(
+                blocks,
+                args=(s, z),
+                blocks_per_ckpt=blocks_per_ckpt,
+            )
         return s, z
 
 
