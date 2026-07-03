@@ -1937,6 +1937,40 @@ The full gate produced finite coordinates for all 96 sequences and preserved
 the confidence head.  Direct q/k/v parity at B96 after the 64-bit offset fix was
 bitwise exact against the original layout path.
 
+The adjacent idea of caching the small packed BF16 `q/k/v` projection weight
+inside triangle attention was screened and rejected.  The mechanism was
+plausible because `_prep_qkv()` rebuilds `torch.cat([Wq, Wk, Wv])` under BF16
+autocast, and trace tables had visible `aten::cat`/`aten::to` traffic.  Commit
+`3ed487f` cached that packed weight in eval/no-grad mode behind
+`PROTENIX_CACHE_TRIANGLE_QKV_WEIGHT`, preserving the same cuBLAS GEMM and CUEQ
+attention kernels.
+
+The isolated canary hotspot, job `97564`
+(`runs/triangle_qkv_weight_cache_20260703_131705_3ed487f`), did move exactly
+the intended narrow subrange:
+
+| shape | module off | module on | qkv projection off | qkv projection on |
+| --- | ---: | ---: | ---: | ---: |
+| `B8, N100` | 0.504 ms | 0.479 ms | 0.106 ms | 0.080 ms |
+| `B16, N124` | 0.851 ms | 0.843 ms | 0.107 ms | 0.096 ms |
+| `B16, N220` | 3.119 ms | 3.110 ms | 0.301 ms | 0.290 ms |
+
+The representative N200 campaign gate, job `97575`
+(`runs/triangle_qkv_weight_cache_gate_n200_20260703_132023_3ed487f`), rejected
+promotion.  The first `cache_off_a` case was a cold outlier, so the decision
+uses the later paired cases:
+
+| case | predict sec | generated samples/s | pairformer | diffusion | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| cache off repeat | 40.77 | 3.924 | 15.717 | 20.600 | 2.516 | control |
+| cache on | 40.19 | 3.981 | 15.672 | 20.077 | 2.499 | apparent total win, mechanism not clean |
+| cache on repeat | 40.39 | 3.961 | 15.740 | 20.167 | 2.526 | apparent total win, mechanism not clean |
+
+Decision: remove the cache.  The intended pairformer subtotal was flat
+(`15.717s` off versus `15.672/15.740s` on), while the apparent total movement
+came mostly from diffusion variance.  This is below the evidence bar for
+carrying another inference flag or cache path.
+
 #### Pairformer transition input fusion for many-sequence batches
 
 The many-independent-sequence workload (`batch=B`, `N_sample=1`) exposes a
@@ -2820,6 +2854,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | `torch.compile` around the diffusion-token transformer | isolated 24-block screens improved `1.29-1.34x`; the first model gate failed in a cuDNN SDPA plan, and the safer no-cuDNN-SDPA gate was flat/slower (`44.59 -> 44.92s`, repeat `43.87 -> 43.95s`) | block-level fusion remains attractive, but a generic Inductor wrapper does not move the real campaign path |
 | Fused self-attention `q/k/v/g` projection | exact parity but trunk block slowed from about 14.1 ms to 14.9 ms | fewer launches are not enough if the wider GEMM/cache/layout is worse |
 | Fused ordinary self-attention q/k/v projection | hotspot moved the intended `qkv+sdpa+gate+out` subrange, but the full mixed `N_sample=5`, `N_step=200` gate averaged flat/slower (`44.69s -> 44.86s`) and one repeat regressed | producer fusion must still move the full workload; local launch savings can disappear in wider GEMM/layout/cache effects |
+| Cached packed BF16 triangle-attention qkv weight | isolated qkv subrange improved (`B16, N220` qkv projection `0.301 -> 0.290 ms`), but the N200 gate did not move pairformer (`15.717s` off versus `15.672/15.740s` on) | Python-side weight materialization is visible but too small; do not carry a cache path without a clean pairformer subtotal win |
 | Ending-node triangle attention `LN(x).transpose(...)` | ending-attention module screens improved about `21-22%`, but the full mixed `N_sample=5`, `N_step=200` gate was flat/noisy (`44.49 -> 44.23s`, repeat `44.06 -> 44.40s`) and pairformer did not consistently move | channel-wise LayerNorm commutes with the pair-axis transpose, but moving only this boundary is not enough; revisit only as part of a larger contiguous ending-node q/k/v+bias producer |
 | Packed CUEQ triangle-attention q/k/v+gate+bias producer | exact or near-exact isolated screen, but slower on every actual shape: start attention `0.79-0.83x`, ending attention `0.49-0.51x` | one oversized projection plus a custom unpack/scatter loses to separate cuBLAS projections plus narrow Triton layout kernels; do not widen this producer boundary without a vendor-quality fused LayerNorm+GEMM schedule |
 | Fused `AdaptiveLayerNorm` conditioning projections | AdaLN subrange shrank slightly in some hotspot shapes, but full diffusion blocks were flat/slower, e.g. `1.416 -> 1.494 ms` at `N_token=220` | do not carry default-off concatenated-GEMM knobs unless the enclosing block moves |

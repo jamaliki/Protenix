@@ -39,15 +39,6 @@ if fastln_is_installed:
     from protenix.model.layer_norm.layer_norm import FusedLayerNorm
 
 
-def _triangle_qkv_weight_cache_enabled() -> bool:
-    return os.getenv("PROTENIX_CACHE_TRIANGLE_QKV_WEIGHT", "1").lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
-
-
 def _prod(nums: Union[List[int], Tuple[int, ...], torch.Size]) -> int:
     out = 1
     for n in nums:
@@ -370,26 +361,6 @@ class Attention(nn.Module):
             )
 
         self.sigmoid = nn.Sigmoid()
-        self._qkv_weight_cache_key = None
-        self._qkv_weight_cache = None
-
-    def _packed_bf16_qkv_weight(self) -> torch.Tensor:
-        """Return cached BF16 ``[Wq; Wk; Wv]`` for inference self-attention.
-
-        Triangle attention calls this path thousands of times in campaign
-        inference.  The large activation GEMM should stay in cuBLAS, but
-        rebuilding the small packed BF16 weight with three casts plus a cat on
-        every call is pure overhead.  Cache only in eval/no-grad mode so
-        training still sees ordinary Parameter reads and autograd semantics.
-        """
-        weights = (self.linear_q.weight, self.linear_k.weight, self.linear_v.weight)
-        cache_key = tuple((w.data_ptr(), w._version, w.device) for w in weights)
-        if cache_key != self._qkv_weight_cache_key:
-            self._qkv_weight_cache = torch.cat(
-                [weight.to(dtype=torch.bfloat16) for weight in weights]
-            ).contiguous()
-            self._qkv_weight_cache_key = cache_key
-        return self._qkv_weight_cache
 
     def _prep_qkv(
         self,
@@ -416,18 +387,8 @@ class Attention(nn.Module):
             weights = [self.linear_q.weight, self.linear_k.weight, self.linear_v.weight]
             if d is torch.bfloat16:
                 with torch.amp.autocast("cuda", enabled=False):
-                    if (
-                        _triangle_qkv_weight_cache_enabled()
-                        and not self.training
-                        and not torch.is_grad_enabled()
-                    ):
-                        qkv_weight = self._packed_bf16_qkv_weight()
-                    else:
-                        qkv_weight = torch.cat(
-                            [weight.to(dtype=d) for weight in weights]
-                        )
                     qkv = nn.functional.linear(
-                        q_x, qkv_weight
+                        q_x, torch.cat([weight.to(dtype=d) for weight in weights])
                     )
             else:
                 qkv = nn.functional.linear(q_x, torch.cat(weights))
