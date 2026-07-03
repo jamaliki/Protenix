@@ -2804,6 +2804,21 @@ Width and MPS gate:
 | CUDA MPS, `/tmp` socket | 6 | 16 | 960 | 179.44 | 5.350 | regressed |
 | CUDA MPS, `/tmp` socket | 7 | 14 | 1120 | 201.98 | 5.545 | +0.2% vs 5-worker, likely noise |
 
+Follow-up for the other practical campaign endpoint, `N_sample=1`, used the
+same 32 mixed 40-220-token records, `N_step=200`, confidence enabled, and
+normal dumping.  Job `97671`, run dir
+`runs/mps_nsample1_width_20260703_134300_b659862`, ran at commit `b659862`
+after removing the rejected triangle qkv weight cache:
+
+| mode | workers | active thread % | batch size | generated records | wall s | wall records/s | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| single process | 1 | n/a | 16 | 32 | 33.06 | 0.968 | current code baseline |
+| single process | 1 | n/a | 32 | 32 | 34.33 | 0.932 | padding hurts |
+| CUDA MPS, `/tmp` socket | 4 | 25 | 16 | 128 | 74.73 | 1.713 | useful |
+| CUDA MPS, `/tmp` socket | 5 | 20 | 16 | 160 | 90.46 | 1.769 | practical knee |
+| CUDA MPS, `/tmp` socket | 5 | 20 | 32 | 160 | 126.00 | 1.270 | B32 is wrong for mixed lengths |
+| CUDA MPS, `/tmp` socket | 6 | 16 | 16 | 192 | 112.04 | 1.714 | regressed |
+
 Interpretation:
 
 - Ordinary process concurrency proves there is some underfill, but context
@@ -2813,15 +2828,22 @@ Interpretation:
   five workers at `20%` reached `5.532` generated samples/s.  Seven workers at
   `14%` produced the highest single measured number (`5.545`) but only by
   `0.2%`, while adding more memory pressure and per-shard latency.  Treat
-  **five MPS workers per H100 at 20% each** as the practical knee.
+  **five MPS workers per H100 at 20% each** as the practical knee for both
+  `N_sample=1` and `N_sample=5`.
 - Compared with the prior promoted single-process low-sample rate (`3.85`
   generated samples/s), `5.532` generated samples/s is a `1.44x` operational
   gain.  Compared with the original low-sample branch boundary (`0.753`
   generated samples/s), it is about `7.3x` per-GPU throughput.
+- For `N_sample=1`, current single-process throughput is `0.968` records/s
+  versus the original `0.166` records/s default (`5.83x`).  Five MPS workers at
+  20% raise that to `1.769` records/s, or about `10.7x` over the original
+  default for the many-independent-sequence endpoint.
 - This is not a substitute for kernel work: each worker individually slows down
   as width increases, and the aggregate curve is already flattening.  The
-  remaining route to the requested `10x` target still needs a larger true
-  kernel/layout win, not just more same-GPU processes.
+  `N_sample=1` endpoint now clears the requested `10x` per-GPU target
+  operationally, but the `N_sample=5` endpoint remains at about `7.3x`.  Closing
+  that gap still needs a larger true kernel/layout win, not just more same-GPU
+  processes.
 
 Decision: document and recommend CUDA MPS concurrency for throughput-oriented
 design campaigns with enough independent shards.  Keep the production model
