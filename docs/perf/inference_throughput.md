@@ -765,6 +765,27 @@ larger graph over conditioning, atom encode/decode, and the diffusion update
 could be revisited, but the narrow transformer graph is not enough to justify
 model-level graph machinery.
 
+Diffusion pair-bias cache screen: commit `d43e0a0` adds
+`scripts/perf/diffusion_pair_bias_cache_probe.py` for a more targeted
+diffusion-transformer boundary.  The flattened low-sample path already keeps
+the pair tensor `z` at record grain, but every diffusion transformer block still
+projects `z` to `[B, heads, N, N]`, repeats it over flattened sample lanes, and
+adds the token key mask on every denoising step.  `z` and the token mask are
+step-invariant for the promoted unguided sampler, so this work could be cached
+once per block before the `N_step=200` loop.
+
+The screen compares current eager transformer execution with a manual block
+loop that consumes precomputed final `[B * samples, heads, N, N]` biases.  It
+also reports `cached_bias_rebuild_each_call` as a control: if rebuilding the
+cache every call is flat but reusing it wins, the mechanism is specifically
+cross-step reuse rather than a faster rewritten block.  The memory tradeoff is
+explicit: at `B=16`, `N_sample=5`, `N=220`, storing 24 expanded BF16 biases is
+roughly three GiB.  The queued H100 screen is Slurm job `97022` under
+`runs/diffusion_pair_bias_cache_probe_20260703_090631_d43e0a0`, using the real
+`N=124` and `N=220` padded bucket shapes.  Promote only if a follow-up full
+`N_step=200` gate proves the saved projection/repeat work beats the higher live
+memory and one-time cache build.
+
 Current promoted trace: job `96456`
 (`runs/current_batched_profile_n20_20260703_031951_3d1adcd`) profiled the
 actual `runner/batch_inference.py` campaign path after the atom-attention
@@ -2584,6 +2605,9 @@ Profiling and reproducibility helpers:
 - `scripts/perf/trunk_attention_hotspot.py`: trunk attention block screen.
 - `scripts/perf/triangle_attention_breakdown.py`: per-launch/subrange screen
   for CUEQ triangle attention and its layout/epilogue boundaries.
+- `scripts/perf/diffusion_pair_bias_cache_probe.py`: tests whether caching the
+  step-invariant projected diffusion pair bias for each transformer block can
+  remove repeated work across the denoising loop.
 - `scripts/perf/transition_output_epilogue_hotspot.py`: transition output-GEMM
   epilogue screen and candidate-injection harness for native CuTe/CUTLASS work.
 - `scripts/perf/transition_output_epilogue_reference_candidate.py`: baseline
