@@ -2814,14 +2814,47 @@ workload win:
 | diffusion | 20.686 s | 21.050 s | `0.983x` |
 | confidence | 2.500 s | 2.576 s | `0.970x` |
 
-Decision: promote the direct dual-GEMM kernel only behind a large-row default
-guard.  `PROTENIX_TRITON_TRANSITION_DUAL_GEMM` is default-on, but
-`PROTENIX_TRITON_TRANSITION_DUAL_GEMM_MIN_ROWS` defaults to `1000000`.  That
-triggers for the B32/N251 same-token variable-atom trunk (`~2.0M` transition
-rows), where the full gate improved the intended pairformer subtotal and the
-whole predict path, while leaving the recommended B16 mixed-token `N_sample=5`
-path (`B16 * 220^2 = 774400` rows in the long bucket) on the cuBLAS baseline.
-Lower the row guard only for a new campaign after running the same paired gate.
+Initial decision: promote the direct dual-GEMM kernel only behind a large-row
+default guard.  `PROTENIX_TRITON_TRANSITION_DUAL_GEMM` is default-on, but the
+base-width default row guard stayed at `1000000`.  That triggers for the B32/N251
+same-token variable-atom trunk (`~2.0M` transition rows), where the full gate
+improved the intended pairformer subtotal and the whole predict path, while
+leaving the recommended base-checkpoint B16 mixed-token `N_sample=5` path
+(`B16 * 220^2 = 774400` rows in the long bucket) on the cuBLAS baseline.
+
+Protenix-v2 follow-up: the Sam-style v2 profile changed the guard decision
+because v2 has `c_z=256`, hidden width 1024, and a measured H100 tile for that
+wider transition shape.  Commit `317a05a` lowered the default row guard to
+`200000` only when `k_input >= 256` and `n_hidden >= 1024`; commit `ebdf6cc`
+then removed the old caller-side prefilter so the shape-aware kernel guard is
+authoritative.  The corrected block verification was job `109495`, run
+`runs/v2_transition_default_verify_20260704_164614_ebdf6cc`:
+
+| v2 block bucket | off total | default total | off pair transition | default pair transition | decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `B16/N124` | 10.673 ms | 10.133 ms (`1.053x`) | 1.816 ms | 1.312 ms (`1.384x`) | default fires |
+| `B16/N220` | 27.128 ms | 25.577 ms (`1.061x`) | 5.619 ms | 4.060 ms (`1.384x`) | default fires |
+
+The representative full v2 gate was job `109503`, run
+`runs/v2_transition_full_gate_20260704_165251_ebdf6cc`.  It generated the same
+32 synthetic poly-A records with lengths `40, 52, ..., 220` repeated twice,
+used `--batch_size 16`, confidence enabled, `N_step=200`, BF16, CUEQ triangle
+kernels, and alternated `PROTENIX_TRITON_TRANSITION_DUAL_GEMM=0` against the
+default.  The first `n5_off_a` case was a cold JIT/cache warmup artifact
+(`82.08s` summed predict) and is excluded from the promotion comparison.
+
+| endpoint | off predict | default predict | off pairformer | default pairformer | interpretation |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `N_sample=5`, clean warm b-repeat | 52.48 s | 50.95 s (`1.030x`) | 21.359 s | 19.886 s (`1.074x`) | small full-workload win in intended subtotal |
+| `N_sample=5`, usable average (one warm off, two defaults) | 52.48 s | 51.51 s (`1.019x`) | 21.359 s | 20.206 s (`1.057x`) | positive but below headline scale |
+| `N_sample=1`, two warm pairs | 38.70 s | 36.79 s (`1.052x`) | 21.352 s | 19.895 s (`1.073x`) | clearer low-sample win |
+
+Decision: promote the shape-aware v2 lower guard.  It is not a 10x-class
+change, but it is a clean kernel improvement: the block gate moves the pair
+transition by `~1.38x`, the full gate moves the pairformer subtotal by
+`~1.06-1.07x`, diffusion stays essentially unchanged, and the base-width path
+retains the conservative million-row guard unless the user explicitly overrides
+`PROTENIX_TRITON_TRANSITION_DUAL_GEMM_MIN_ROWS`.
 
 ### 3. Specialize atom local attention
 

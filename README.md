@@ -214,22 +214,22 @@ speedups.  The Tokyo v2 gates used SHA256
 branch now reports the expected path explicitly instead of surfacing a raw
 `urllib` traceback.
 
-Large same-token pairformer batches also use a Triton dual-GEMM transition
-input kernel by default (`PROTENIX_TRITON_TRANSITION_DUAL_GEMM=1`).  Pairformer
-transition normally computes two projections from the same normalized pair rows
-and immediately consumes them as `SiLU(a) * b`; the Triton path keeps both
-accumulators inside one tiled launch and writes only the consumed hidden tensor.
-On H100, Protenix-v2's wider transition shape (`c_z=256`, hidden width 1024)
-uses a larger measured tile than the base model while the base shape keeps the
-older tile.  This is intentionally shape-guarded: the wider tile improved the
-v2-shaped B32/N251 PairformerBlock by about `1.4%`, but was neutral for the
-base-model block.
-The default row-count guard is intentionally high
-(`PROTENIX_TRITON_TRANSITION_DUAL_GEMM_MIN_ROWS=1000000`): it speeds the
-important B32 same-token, variable-atom endpoint, but stays out of the
-recommended B16 mixed-token `N_sample=5` path where the full gate was flat to
-slightly slower.  Set `PROTENIX_TRITON_TRANSITION_DUAL_GEMM=0` for conservative
-bisects, or lower the min-row guard only when benchmarking a new campaign shape.
+Large same-token pairformer batches, and Protenix-v2 mixed-token pairformer
+buckets, also use a Triton dual-GEMM transition input kernel by default
+(`PROTENIX_TRITON_TRANSITION_DUAL_GEMM=1`).  Pairformer transition normally
+computes two projections from the same normalized pair rows and immediately
+consumes them as `SiLU(a) * b`; the Triton path keeps both accumulators inside
+one tiled launch and writes only the consumed hidden tensor.  On H100,
+Protenix-v2's wider transition shape (`c_z=256`, hidden width 1024) uses a
+larger measured tile than the base model while the base shape keeps the older
+tile.  The row guard is shape-aware: base-width paths keep the conservative
+million-row threshold, while v2-width paths use a lower threshold so the
+Sam-style B16 mixed-token buckets participate.  On the v2 mixed 40-220-token
+gate, this moved the pairformer subtotal by about `1.06-1.07x`; the full
+predict section improved by about `1.02x` for `N_sample=5` and `1.05x` for
+`N_sample=1`.  Set `PROTENIX_TRITON_TRANSITION_DUAL_GEMM=0` for conservative
+bisects, or override `PROTENIX_TRITON_TRANSITION_DUAL_GEMM_MIN_ROWS` only when
+benchmarking a new campaign shape.
 
 For normal multi-step inference, the diffusion transformer also caches the
 step-invariant token pair-attention bias once per block.  This spends a few GiB
@@ -316,7 +316,7 @@ dumping:
 | One combined JSON with 32 same-shape records | 361.8 s runner time | 69.3 s runner time | 5.2x after initialization |
 | 32 same-token, variable-atom 251-token records, base checkpoint | 301.9 s summed predict at `--batch_size 1` | 41.2 s predict, 39.3 s model-forward at `--batch_size 32`; pairformer is 26.7 s with the large-row dual-GEMM transition guard | 7.3x predict vs current unbatched path |
 | 32 same-token, variable-atom 251-token records, Protenix-v2 checkpoint | prior current-HEAD user rerun: 77.2 s model-forward, dominated by 62.1 s pairformer | 52.1 s predict, 50.4 s model-forward at `--batch_size 32`; pairformer is 38.0 s with the H100 CUEQ cache overlay | 1.53x model-forward vs that v2 rerun; v2 remains about 1.27x slower than the base-checkpoint row |
-| 32 variable-length proteins, 40-220 tokens, Protenix-v2 checkpoint, `N_sample=5`, `N_step=200` | true original v2 default still needs a matched measurement | 47.0 s, 3.41 generated samples/s at `--batch_size 16`; pairformer is 21.6 s and diffusion is 20.5 s | current Sam-style v2 reference point; about 18% slower than the comparable optimized base-checkpoint mixed row |
+| 32 variable-length proteins, 40-220 tokens, Protenix-v2 checkpoint, `N_sample=5`, `N_step=200` | true original v2 default still needs a matched measurement | 47.0 s, 3.41 generated samples/s at `--batch_size 16` in the original v2 low-sample gate; the later paired transition-guard gate moved pairformer about `21.4s -> 19.9-20.2s` within-job | current Sam-style v2 reference point; the transition guard is a small pairformer win, not a headline 10x result |
 | 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.1 s wall, 29.9 s summed predict, 0.968 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.83x single-process throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 38.3 s, 4.18 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, BF16 diffusion core, BF16 atom attention, Triton local atom attention, default Triton LayerNorm fallback, cached diffusion pair bias, and guarded triangle LN+q/k/v production | 5.55x over the old branch boundary |
