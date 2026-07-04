@@ -3724,7 +3724,16 @@ occupancy:
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | CUDA MPS, `/tmp` socket | 12 | 8 | 4 | 1920 | 304.99 | 6.295 | below B8/9 |
 | CUDA MPS, `/tmp` socket | 14 | 7 | 4 | 2240 | 364.19 | 6.151 | over-contended |
-| CUDA MPS, `/tmp` socket | 16 | 6 | 4 | 2560 | 387.79 | 6.601 | new best, but still short of 10x |
+| CUDA MPS, `/tmp` socket | 16 | 6 | 4 | 2560 | 387.79 | 6.601 | former best before LN+q/k/v default |
+
+After the triangle LN+q/k/v producer became default-on, job `103333`
+(`runs/mps_b4_lnqkv_nsample5_20260704_094131_685211b`) repeated the best B4/16
+operational point in one paired allocation:
+
+| mode | workers | active thread % | batch size | generated samples | wall s | wall samples/s | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| CUDA MPS, `/tmp` socket, LN+q/k/v off | 16 | 6 | 4 | 2560 | 387.19 | 6.612 | same-node control; matches prior B4/16 |
+| CUDA MPS, `/tmp` socket, LN+q/k/v on | 16 | 6 | 4 | 2560 | 380.97 | 6.720 | current best, `1.016x` over control |
 
 The higher-width follow-up, job `102933`
 (`runs/mps_b4_highwidth_nsample5_20260704_083945_3a5215c`), tested
@@ -3740,11 +3749,11 @@ padded work per shard while MPS recovers GPU occupancy.  This is a
 throughput-only mode: each worker's own campaign latency is much worse
 (`~388s` for B4/16 and `~225s` for B8/9 versus `~142s` for B16/5), but
 aggregate per-GPU generated samples/s improves.  The current best `N_sample=5`
-operational speedup is `6.601 / 0.753 = 8.8x` over the original low-sample
-boundary, still short of the `10x` target.  Closing that final `~14%`
-throughput gap needs either a real model/kernel win or one more carefully
-bounded width probe; it is not a reason to raise batch size in the ordinary
-single-process path.
+operational speedup is `6.720 / 0.753 = 8.9x` over the original low-sample
+boundary, still short of the `10x` target.  Closing that final `~12%`
+throughput gap needs another real model/kernel win; it is not a reason to raise
+batch size in the ordinary single-process path or keep adding MPS workers past
+the measured knee.
 
 Timed-only component logs make the mechanism clear.  In the same-node B16/5
 control, model-forward time was `4.23s` per input, split mainly into
@@ -3766,14 +3775,11 @@ Interpretation:
   `N_sample=1`, treat **five MPS workers per H100 at 20% each** as the
   practical knee.  For maximum `N_sample=5` aggregate throughput, the best
   measured operational mode is **sixteen B4 workers at 6% each**.
-- Compared with the cache-era promoted single-process low-sample rate (`3.85`
-  generated samples/s), the B4/sixteen-worker `6.601` generated samples/s
-  result is a `1.71x` operational gain.  The later triangle LN+q/k/v default
-  moved the single-process gate to `4.18` generated samples/s, but this MPS
-  width sweep has not yet been repeated with that default.  Compared with the
-  original low-sample branch boundary (`0.753` generated samples/s), the
-  measured B4/sixteen-worker MPS result remains about `8.8x` per-GPU
-  throughput.
+- Compared with the current single-process low-sample rate (`4.18` generated
+  samples/s), the B4/sixteen-worker `6.720` generated samples/s result is a
+  `1.61x` operational gain.  Compared with the original low-sample branch
+  boundary (`0.753` generated samples/s), the measured B4/sixteen-worker MPS
+  result is about `8.9x` per-GPU throughput.
 - For `N_sample=1`, current single-process throughput is `0.968` records/s
   versus the original `0.166` records/s default (`5.83x`).  Five MPS workers at
   20% raise that to `1.769` records/s, or about `10.7x` over the original
@@ -3781,7 +3787,7 @@ Interpretation:
 - This is not a substitute for kernel work: each worker individually slows down
   as width increases, and the aggregate curve is already flattening.  The
   `N_sample=1` endpoint now clears the requested `10x` per-GPU target
-  operationally, but the `N_sample=5` endpoint remains at about `8.8x`.  Closing
+  operationally, but the `N_sample=5` endpoint remains at about `8.9x`.  Closing
   that gap still needs a larger true kernel/layout win, not just more same-GPU
   processes.
 

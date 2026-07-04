@@ -314,7 +314,7 @@ dumping:
 | 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.1 s wall, 29.9 s summed predict, 0.968 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.83x single-process throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 38.3 s, 4.18 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, BF16 diffusion core, BF16 atom attention, Triton local atom attention, default Triton LayerNorm fallback, cached diffusion pair bias, and guarded triangle LN+q/k/v production | 5.55x over the old branch boundary |
 | Same mixed-token `N_sample=1` workload, many campaign shards on one H100 | 0.166 records/s original low-sample boundary | 1.77 records/s with five `--batch_size 16` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20` | 10.7x per-GPU operational throughput |
-| Same mixed-token `N_sample=5` workload, many campaign shards on one H100 | 0.753 generated samples/s original low-sample boundary | 6.60 generated samples/s with sixteen `--batch_size 4` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=6` | 8.8x per-GPU operational throughput |
+| Same mixed-token `N_sample=5` workload, many campaign shards on one H100 | 0.753 generated samples/s original low-sample boundary | 6.72 generated samples/s with sixteen `--batch_size 4` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=6` | 8.9x per-GPU operational throughput |
 
 For same-token, variable-atom campaigns, compare the `predict` or
 model-forward section rather than the outer Slurm/script wall time.  Current
@@ -367,14 +367,12 @@ Important details:
   `N_sample=1`: they reached `1.77` records/s, about `10.7x` over the original
   low-sample branch boundary (`0.166` records/s).  For mixed `N_sample=5`,
   smaller per-worker batches helped once MPS recovered occupancy: sixteen
-  `--batch_size 4` workers at 6% reached `6.60` generated samples/s, `1.71x`
-  over the cache-era single-process promoted rate (`3.85` generated samples/s)
-  and about `8.8x` over the original low-sample boundary (`0.753` generated
-  samples/s).  The newer triangle LN+q/k/v default moves the single-process
-  gate to `4.18` generated samples/s, but the MPS width sweep has not yet been
-  repeated with that default.  B4 with 12 or 14 workers and B8 with 10 workers
-  were slower; a B4/18 follow-up was already below the B4/16 rate before it
-  finished, so do not keep adding workers blindly.
+  `--batch_size 4` workers at 6% reached `6.72` generated samples/s after the
+  triangle LN+q/k/v default, about `1.61x` over the current single-process
+  rate (`4.18` generated samples/s) and `8.9x` over the original low-sample
+  boundary (`0.753` generated samples/s).  B4 with 12 or 14 workers and B8
+  with 10 workers were slower; a B4/18 follow-up was already below the B4/16
+  rate before it finished, so do not keep adding workers blindly.
 - Keep `PROTENIX_PREFETCH_DATALOADER=1` for long MPS campaigns if host memory
   allows it, but treat it as a modest host-overlap polish rather than the main
   speedup.  In paired five-worker MPS gates it added `1-2%` throughput while
