@@ -4625,8 +4625,8 @@ short-term implementation ladder is:
    commit `85a4630` fixed the gate to precompute triangle-update weights and
    compact metadata outside the timed region.  The first uncached block attempt
    rebuilt those tensors every timed update and reproduced the earlier slow
-   compact-wrapper artifact; ignore it for promotion.  The fair gate was job
-   `110669`, run
+   compact-wrapper artifact; ignore it for promotion.  The fair cached gate was
+   job `110669`, run
    `runs/pairformer_direct_owned_block_cached_85a4630_20260704_225653`:
 
    | v2 bucket | baseline block | direct producer-owned block | valid-region parity | decision |
@@ -4634,15 +4634,30 @@ short-term implementation ladder is:
    | short `B16/N124` | `10.261 ms` | `8.305 ms` (`1.24x`) | `z max_abs 0.0625`, `s max_abs 0.03125`, no NaNs | useful short signal |
    | long `B16/N220` | `25.957 ms` | `27.024 ms` (`0.96x`) | `z max_abs 0.0625`, `s max_abs 0.0625`, no NaNs | reject as default |
 
-   Decision: do not promote the direct producer-owned block path.  The isolated
-   update boundary is now real, and it survives the short heavily padded block,
-   but the long block that dominates Sam-style v2 throughput loses after the
-   cost of invalid-row materialization, attention, transition, and remaining
-   grouped-boundary launches are charged.  The next serious implementation has
-   to fuse deeper than "two direct triangle updates plus zero invalid rows":
-   either produce a dense-safe output without a separate invalid-row pass, or
-   fuse contraction, output gate/projection, and residual into the block-native
-   layout so the long bucket keeps the isolated update win.
+   The remaining integration tax was the full dense `masked_fill` used to zero
+   padded rows after each compact update.  Commit `4877e94` replaced that
+   operation, for the `direct` mode, with a precomputed invalid-row offset list
+   and a Triton zeroing kernel that touches only padded pair rows.  Job `110672`,
+   run `runs/pairformer_direct_owned_block_zero_4877e94_20260704_230040`,
+   produced:
+
+   | v2 bucket | baseline block | direct block with invalid-offset zeroing | valid-region parity | decision |
+   | --- | ---: | ---: | --- | --- |
+   | short `B16/N124` | `10.278 ms` | `7.857 ms` (`1.31x`) | `z max_abs 0.0625`, `s max_abs 0.03125`, no NaNs | useful short win |
+   | long `B16/N220` | `25.962 ms` | `25.492 ms` (`1.018x`) | `z max_abs 0.0625`, `s max_abs 0.046875`, no NaNs | repeat before promotion |
+
+   Long-bucket repeat job `110673`, run
+   `runs/pairformer_direct_owned_block_zero_repeat_4877e94_20260704_230157`,
+   used 30 timed iterations and confirmed the small win: `25.992 ms` baseline
+   versus `25.500 ms` direct (`1.019x`).  Decision: this is now a real
+   block-level speedup, but it is not enough by itself for a production default.
+   The short bucket is strongly positive; the long bucket that dominates
+   Sam-style v2 throughput is only about two percent faster at one block.  The
+   next serious implementation must fuse deeper than "two direct triangle
+   updates plus invalid-row zeroing": either produce dense-safe output directly
+   from the update kernel, or fuse contraction, output gate/projection, and
+   residual into the block-native layout so the long-bucket win is large enough
+   to survive 48 blocks and end-to-end inference.
 
    Pairformer CUDA graph follow-up: commit `75761ba` added
    `scripts/perf/pairformer_cudagraph_probe.py` to check whether launch/Python
@@ -5094,7 +5109,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Exact-group `bmm` contractor inside the compact triangle-update bridge | after fixing the benchmark's row-wise scatter, the short bucket improved (`1.21-1.59x`) with BF16-valid parity, but the long bucket still regressed to `0.68-0.79x`; profiling shows the remaining loss is mostly `torch.stack` copy/cat materialization plus compact producer/output boundary cost | exact-length work reduction is real only if the producer emits exact-group layout directly and the output/residual store is redesigned; do not promote a short-only compact bridge for Sam-style v2 |
 | No-stack strided `matmul` view for exact groups | removed explicit `torch.stack`/`cat` and slightly improved short buckets, but long buckets were worse than exact-group `bmm` (`0.72-0.74x`); profiler shows `aten::copy_` grew to about `2.33 ms` because PyTorch still materializes around the strided batch/output layout | the compact ABI cannot be rescued by PyTorch view tricks; the producer must write grouped layout directly |
 | PyTorch assembly inside the first direct producer-owned triangle-update screen | the direct producer was correct for shuffled mixed lengths, but the first long v2 bucket still lost (`0.91-0.92x`) because `permute(...).reshape(...)` materialized exact-group `bmm` outputs and spent about `1.0 ms` per update in `reshape`/`clone`/`copy_` | wrapper layout debt can erase the whole segmented-work win; replacing this with a Triton tiled copy made the same direct boundary positive (`1.15-1.16x`) on the long bucket |
-| Direct producer-owned triangle updates inside a full v2 `PairformerBlock` | after caching setup outside timing, the short block improved `10.261 -> 8.305 ms` (`1.24x`), but the long block regressed `25.957 -> 27.024 ms` (`0.96x`) | the update-boundary win is real but not deep enough; the long Sam-style v2 block needs fused dense-safe output or a block-native segmented layout, not a separate invalid-row zeroing wrapper |
+| Full dense `masked_fill` invalid-row zeroing in the direct producer-owned block probe | after caching setup outside timing, the short block improved (`1.24x`) but the long block still regressed (`0.96x`) because every compact update paid a dense padded-row materialization pass | precompute invalid row offsets and zero only padded rows; this turned the same direct block positive (`1.31x` short, repeated `1.019x` long), though still not enough for promotion |
 | Compact valid-row triangle-multiplication bridge | valid-only compact row work was slower than padded CUEQ (`0.70x` short, `0.27x` long), and scattering back to padded layout was worse | do not bridge compact row-wise work through dense `a/b` tensors; a real segmented native update must stay segmented through contraction and output |
 | Compact segmented triangle-multiplication update inside a full v2 `PairformerBlock` | isolated short-bucket update improved, but the full block slowed badly: short `10.237 -> 27.144 ms` best (`0.38x`), long `25.791 -> 123.764 ms` best (`0.21x`) | the dense-ABI compact bridge pays too much pack/scatter, invalid-row zeroing, and custom-contraction cost; the next attempt needs a native vendor-quality CuTe/SM90 segmented update |
 | Unguarded fused triangle-multiplication input LayerNorm + dual-GEMM producer | short v2 blocks improved about `1.08x`, but long `B16/N220` blocks slowed to `0.94x`; the path is now default-off and guarded to <=300k physical pair rows | local producer fusion can be shape-specific; do not enable it globally for Sam-style v2 campaigns unless the long bucket is protected by fallback |
@@ -5276,8 +5291,10 @@ Profiling and reproducibility helpers:
   before downstream consumers, and answers whether an isolated update-boundary
   win survives attention/transition/token dilution.  The old compact wrapper is
   rejected (`0.37-0.38x` short bucket, `0.21x` long bucket).  The newer direct
-  producer-owned mode is a real short-block win (`1.24x`) but still loses the
-  long v2 block (`0.96x`), so it is also not a default.
+  producer-owned mode uses cached metadata/weights plus invalid-offset zeroing;
+  it is a real block win (`1.31x` short bucket, repeated `1.019x` long bucket)
+  but still too small on the long v2 block to be a default without deeper
+  fusion and end-to-end gates.
 - `scripts/perf/pairformer_cudagraph_probe.py`: CUDA graph replay screen for
   v2-width Pairformer blocks/stacks.  It separates pure replay from realistic
   changed-input copies so graph launch-overhead wins are not confused with
