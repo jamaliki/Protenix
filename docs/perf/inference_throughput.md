@@ -4463,13 +4463,41 @@ short-term implementation ladder is:
 
    The CUEQ-producer variant was also exact but slower than the Triton producer
    on this compact boundary: short `1.09-1.14x`, long `0.58-0.59x`.  Valid-row
-   drift stayed within BF16 tolerances (`max_abs <= 0.03125`).  Decision:
-   reject the compact exact-group bridge as a Sam-style v2 default.  It proves
-   the short heavily padded bucket has exploitable work reduction, but the long
-   bucket that dominates wide-v2 throughput loses once the old compact
-   producer, Python grouping, output normalization, and scatter boundary are in
-   the timed path.  The next implementation should not be another wrapper on
-   this ABI; it should own the fused segmented update layout natively.
+   drift stayed within BF16 tolerances (`max_abs <= 0.03125`).
+
+   Launch attribution then exposed one self-inflicted cost in the benchmark
+   bridge.  Job `110258`, run
+   `runs/triangle_update_exact_group_bmm_profile_ab24cc4_20260704_221119`,
+   profiled the exact-group contractor before the fix.  On the long bucket, the
+   useful contraction had fallen to `0.47-0.50 ms` across eight `aten::bmm`
+   calls, but `_scatter_residual_kernel` alone cost `1.37 ms` because it launched
+   one tiny Triton program per valid pair row per channel tile.  Commit
+   `80c35f0` tiled that scatter over 16 compact rows per program.  The repeat
+   timing job `110505`, run
+   `runs/triangle_update_exact_group_bmm_tiledscatter_80c35f0_20260704_221522`,
+   moved the benchmark boundary but did not change the decision:
+
+   | bucket / direction | padded CUEQ update | best exact-group `bmm` update after tiled scatter | speedup | decision |
+   | --- | ---: | ---: | ---: | --- |
+   | short incoming | `2.517 ms` | `1.582 ms` | `1.59x` | useful signal |
+   | short outgoing | `2.433 ms` | `1.618 ms` | `1.50x` | useful signal |
+   | long incoming | `4.127 ms` | `5.308 ms` | `0.78x` | reject |
+   | long outgoing | `4.234 ms` | `5.372 ms` | `0.79x` | reject |
+
+   The CUEQ-producer variant remained slower: short `1.21-1.27x`, long
+   `0.68-0.70x`.  Post-fix profile job `110506`, run
+   `runs/triangle_update_tiledscatter_profile_80c35f0_20260704_221720`, confirmed
+   the scatter kernel dropped to `0.31 ms`, but the compact bridge is now
+   dominated by `torch.stack` materialization (`aten::copy_` about `1.00 ms` plus
+   `aten::cat` about `0.92 ms`), the compact input producer (`1.45-1.46 ms`),
+   row stats (`0.40 ms`), and the remaining output boundary.  Decision: reject
+   the compact exact-group bridge as a Sam-style v2 default.  It proves the
+   short heavily padded bucket has exploitable work reduction, but the long
+   bucket that dominates wide-v2 throughput still loses unless the producer
+   emits exact-group layout directly and the output/residual store is part of
+   the same native boundary.  The next implementation should not be another
+   wrapper on this ABI; it should own the fused segmented update layout
+   natively.
 
    Pairformer CUDA graph follow-up: commit `75761ba` added
    `scripts/perf/pairformer_cudagraph_probe.py` to check whether launch/Python
@@ -4917,7 +4945,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Raising CUEQ triangle-multiplication PyTorch fallback threshold for v2 | forcing the `N=124` bucket through the PyTorch fallback doubled triangle-mul time (`5.04 -> 10.04 ms`) and slowed the block (`10.67 -> 15.69 ms`); `N=220` was unchanged | the short physical bucket still needs CUEQ's fused LayerNorm/GatedGEMM path; fallback thresholds are not the ragged-v2 fix |
 | CUTLASS 3 record-L-batched triangle contraction | one SM90 rank-4 GEMM per record, with `c_z=256` in GEMM's `L` dimension, still regressed short buckets (`0.48-0.53x`), barely helped long outgoing (`1.06x`), and slowed long incoming (`0.96x`) | removing the `4096` grouped-problem overhead is not enough; another standalone stock-GEMM wrapper is not the v2 fix |
 | Producer-owned exact-group CUTLASS 3 triangle contraction | assuming a future producer writes exact-length groups directly, cuBLAS-backed `torch.bmm` was strong (`1.35-2.25x` contraction-only), but the stock CUTLASS rank-4 kernel still regressed short buckets and only reached `1.09-1.17x` on long buckets | the layout idea is useful, but the stock CUTLASS adapter is not the native fused v2 update |
-| Exact-group `bmm` contractor inside the compact triangle-update bridge | short bucket improved (`1.09-1.39x`) with BF16-valid parity, but the long bucket regressed to `0.58-0.66x` | exact-length work reduction is real only if the producer/output/scatter boundary is also redesigned; do not promote a short-only compact bridge for Sam-style v2 |
+| Exact-group `bmm` contractor inside the compact triangle-update bridge | after fixing the benchmark's row-wise scatter, the short bucket improved (`1.21-1.59x`) with BF16-valid parity, but the long bucket still regressed to `0.68-0.79x`; profiling shows the remaining loss is mostly `torch.stack` copy/cat materialization plus compact producer/output boundary cost | exact-length work reduction is real only if the producer emits exact-group layout directly and the output/residual store is redesigned; do not promote a short-only compact bridge for Sam-style v2 |
 | Compact valid-row triangle-multiplication bridge | valid-only compact row work was slower than padded CUEQ (`0.70x` short, `0.27x` long), and scattering back to padded layout was worse | do not bridge compact row-wise work through dense `a/b` tensors; a real segmented native update must stay segmented through contraction and output |
 | Compact segmented triangle-multiplication update inside a full v2 `PairformerBlock` | isolated short-bucket update improved, but the full block slowed badly: short `10.237 -> 27.144 ms` best (`0.38x`), long `25.791 -> 123.764 ms` best (`0.21x`) | the dense-ABI compact bridge pays too much pack/scatter, invalid-row zeroing, and custom-contraction cost; the next attempt needs a native vendor-quality CuTe/SM90 segmented update |
 | Unguarded fused triangle-multiplication input LayerNorm + dual-GEMM producer | short v2 blocks improved about `1.08x`, but long `B16/N220` blocks slowed to `0.94x`; the path is now default-off and guarded to <=300k physical pair rows | local producer fusion can be shape-specific; do not enable it globally for Sam-style v2 campaigns unless the long bucket is protected by fallback |
@@ -5069,9 +5097,9 @@ Profiling and reproducibility helpers:
   pair rows, runs input producer variants, contracts in compact per-record
   storage, applies the output gate, and scatters valid rows back to dense output
   with the residual.  Current result: real short-bucket signal, including the
-  exact-group `bmm` contractor, but long-bucket rejection unless the compact
-  contraction/update mainloop becomes vendor-class and avoids Python grouping
-  plus scatter debt.
+  exact-group `bmm` contractor and the row-tiled scatter fix, but long-bucket
+  rejection unless the producer writes exact-group layout directly and the
+  output/residual store is fused into the native boundary.
 - `scripts/perf/triangle_update_compact_segmented_profile.py`: profiler companion
   for the compact segmented update screen.  Use it when a timing result needs
   launch-level attribution, especially to separate producer, contraction,

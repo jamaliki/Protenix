@@ -421,9 +421,11 @@ rank-4 feature-batched GEMM launch per record, also failed to clear that bar:
 it regressed the short bucket and only reached `1.06x` on long outgoing while
 remaining slower on long incoming.  Even the more optimistic exact-length-group
 screen, where a future producer is assumed to emit record-major groups directly,
-only turned into a full-update win on the heavily padded short bucket
-(`1.09-1.39x`) and regressed the long bucket (`0.58-0.66x`).  That makes it a
-learning signal for a native segmented update, not a deployable v2 path.
+only turned into a full-update win on the heavily padded short bucket.  After
+fixing a row-wise scatter launch in that benchmark, the exact-group bridge
+reached `1.21-1.59x` on the short bucket but still regressed the long bucket to
+`0.68-0.79x`.  That makes it a learning signal for a native segmented update,
+not a deployable v2 path.
 Whole-Pairformer CUDA graph replay was also screened as a lower-risk
 launch-overhead fix.  It was exact and helped the short v2 bucket by about
 `3%`, but the full 48-block long bucket was flat (`~1.00x`) once changed
