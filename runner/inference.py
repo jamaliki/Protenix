@@ -14,6 +14,8 @@
 import json
 import logging
 import os
+import queue
+import threading
 import time
 import traceback
 import urllib.request
@@ -538,6 +540,65 @@ def _raise_on_batch_fallback_enabled() -> bool:
         "on",
         "yes",
     }
+
+
+def _prefetch_dataloader_items(batch_size: int) -> int:
+    """Return the host-side dataloader prefetch depth.
+
+    In many-record campaigns the GPU waits while the main thread featurizes the
+    next records.  A small background prefetch queue can overlap that pure
+    host-side work with the current GPU batch.  Keep it opt-in until gated on
+    representative campaigns because it changes when input errors surface and
+    holds one extra batch of CPU tensors/AtomArrays in memory.
+    """
+    if batch_size <= 1:
+        return 0
+    if os.getenv("PROTENIX_PREFETCH_DATALOADER", "").strip().lower() not in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }:
+        return 0
+    try:
+        requested = int(os.getenv("PROTENIX_DATALOADER_PREFETCH_ITEMS", str(batch_size)))
+    except ValueError:
+        requested = batch_size
+    return max(1, requested)
+
+
+def _iter_with_prefetch(iterable: Any, max_prefetch: int) -> Any:
+    """Yield an iterable through a bounded background-thread queue."""
+    if max_prefetch <= 0:
+        yield from iterable
+        return
+
+    end_marker = object()
+    item_queue: queue.Queue[Any] = queue.Queue(maxsize=max_prefetch)
+
+    def _producer() -> None:
+        try:
+            for item in iterable:
+                item_queue.put(item)
+        except BaseException as exc:
+            item_queue.put(exc)
+        finally:
+            item_queue.put(end_marker)
+
+    producer = threading.Thread(
+        target=_producer,
+        name="protenix-inference-prefetch",
+        daemon=True,
+    )
+    producer.start()
+    while True:
+        item = item_queue.get()
+        if item is end_marker:
+            break
+        if isinstance(item, BaseException):
+            raise item
+        yield item
+    producer.join()
 
 
 _ATOM_ONLY_FEATURE_KEYS = {
@@ -1541,6 +1602,13 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
         batch_size = _inference_batch_size(configs)
         batch_mode = _inference_batch_mode(configs)
         token_bucket_size = _inference_token_bucket_size(configs)
+        prefetch_items = _prefetch_dataloader_items(batch_size)
+        if prefetch_items > 0:
+            logger.info(
+                "[Rank %s] Inference dataloader prefetch enabled with depth %d.",
+                DIST_WRAPPER.rank,
+                prefetch_items,
+            )
         pending: dict[Any, list[tuple[dict[str, Any], Any]]] = {}
 
         def flush_signature(signature: Any) -> None:
@@ -1554,7 +1622,7 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                 batch_mode=batch_mode,
             )
 
-        for batch in dataloader:
+        for batch in _iter_with_prefetch(dataloader, prefetch_items):
             for data, atom_array, data_error_message in batch:
                 sample_name = data.get("sample_name", "unknown")
                 try:
