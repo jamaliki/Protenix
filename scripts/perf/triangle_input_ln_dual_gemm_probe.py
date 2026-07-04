@@ -112,12 +112,14 @@ def _ln_dual_gemm_transpose_kernel(
     proj_weight,
     mask_ptr,
     out,
+    norm_out,
     rows,
     channels: tl.constexpr,
     out_channels: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
+    store_norm: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -143,6 +145,12 @@ def _ln_dual_gemm_transpose_kernel(
         # CUEQ's producer feeds BF16 tensor-core GEMMs.  Keep the same contract:
         # accumulate normalization in FP32 for stability, then cast before dot.
         values = values.to(tl.bfloat16)
+        if store_norm:
+            tl.store(
+                norm_out + offs_m[:, None] * channels + k[None, :],
+                values,
+                mask=(pid_n == 0) & (offs_m[:, None] < rows) & k_mask[None, :],
+            )
         gate_w = tl.load(
             gate_weight + offs_n[:, None] * channels + k[None, :],
             mask=(offs_n[:, None] < out_channels) & k_mask[None, :],
@@ -213,13 +221,16 @@ def triton_producer(
     z: torch.Tensor,
     mask: torch.Tensor,
     config: Config,
-) -> torch.Tensor:
+    *,
+    return_norm: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     bm, bn, bk, nw, ns = config
     rows = z.numel() // z.shape[-1]
     mean = torch.empty(rows, device=z.device, dtype=torch.float32)
     rstd = torch.empty(rows, device=z.device, dtype=torch.float32)
     out_channels = 2 * z.shape[-1]
     out = torch.empty((out_channels, rows), device=z.device, dtype=z.dtype)
+    norm_out = torch.empty_like(z) if return_norm else z
     p_weight = torch.cat([module.linear_a_p.weight, module.linear_b_p.weight], 0).to(
         device=z.device, dtype=z.dtype
     ).contiguous()
@@ -238,16 +249,21 @@ def triton_producer(
         p_weight,
         mask,
         out,
+        norm_out,
         rows,
         C_Z,
         out_channels,
         bm,
         bn,
         bk,
+        return_norm,
         num_warps=nw,
         num_stages=ns,
     )
-    return out.reshape(out_channels, *z.shape[:3])
+    ab = out.reshape(out_channels, *z.shape[:3])
+    if return_norm:
+        return ab, norm_out
+    return ab
 
 
 def time_cuda(fn: TensorFn, warmup: int, iters: int) -> tuple[torch.Tensor, float]:
