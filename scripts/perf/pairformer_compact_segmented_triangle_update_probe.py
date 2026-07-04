@@ -124,9 +124,20 @@ def compact_triangle_update(
     dense_offsets: torch.Tensor,
     descriptors: torch.Tensor | None,
     invalid_offsets: torch.Tensor | None,
+    direct_row_stats: str,
+    direct_row_stat_block_rows: int,
 ) -> torch.Tensor:
     if producer == "direct":
-        out = direct_owned_update(module, z, dense_offsets, lengths, direction, weights)
+        out = direct_owned_update(
+            module,
+            z,
+            dense_offsets,
+            lengths,
+            direction,
+            weights,
+            row_stats=direct_row_stats,
+            row_stat_block_rows=direct_row_stat_block_rows,
+        )
         return zero_invalid_offsets_(out, invalid_offsets)
 
     if descriptors is None:
@@ -153,6 +164,8 @@ def run_compact_triangles(
     config: ContractConfig,
     producer: str,
     plan: TriangleUpdatePlan,
+    direct_row_stats: str,
+    direct_row_stat_block_rows: int,
 ) -> TensorPair:
     s = clone_optional(s)
     z = z.clone()
@@ -168,6 +181,8 @@ def run_compact_triangles(
         plan.dense_offsets,
         plan.descriptors,
         plan.invalid_offsets,
+        direct_row_stats,
+        direct_row_stat_block_rows,
     )
     z = compact_triangle_update(
         block.tri_mul_in,
@@ -181,6 +196,8 @@ def run_compact_triangles(
         plan.dense_offsets,
         plan.descriptors,
         plan.invalid_offsets,
+        direct_row_stats,
+        direct_row_stat_block_rows,
     )
     z += block.tri_att_start(
         z,
@@ -233,6 +250,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--randomize-zero-weights", type=str_bool, default=True)
+    parser.add_argument("--direct-row-stats", choices=["scalar", "tiled"], default="tiled")
+    parser.add_argument("--direct-row-stat-block-rows", type=int, default=4)
     parser.add_argument("--output-json")
     return parser.parse_args()
 
@@ -265,6 +284,8 @@ def main() -> None:
                     args.config,
                     producer,
                     plan,
+                    args.direct_row_stats,
+                    args.direct_row_stat_block_rows,
                 ),
                 args.warmup,
                 args.iters,
@@ -274,6 +295,10 @@ def main() -> None:
                     "variant": f"compact_triangle_update_{producer}",
                     "producer": producer,
                     "config": args.config.label(),
+                    "direct_row_stats": args.direct_row_stats if producer == "direct" else None,
+                    "direct_row_stat_block_rows": (
+                        args.direct_row_stat_block_rows if producer == "direct" else None
+                    ),
                     "timing": timing,
                     "speedup_vs_baseline": baseline_timing["ms"] / timing["ms"],
                     "parity_vs_baseline_valid": compare_outputs(

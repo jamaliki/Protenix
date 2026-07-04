@@ -123,6 +123,45 @@ def _owned_group_ln_dual_gemm_kernel(
     tl.store(rhs_ptr, result, mask=valid & (offs_n[None, :] >= channels))
 
 
+@triton.jit
+def _compact_row_stats_tiled_kernel(
+    z,
+    dense_offsets,
+    mean,
+    rstd,
+    rows: tl.constexpr,
+    channels: tl.constexpr,
+    eps: tl.constexpr,
+    block_rows: tl.constexpr,
+    block_c: tl.constexpr,
+) -> None:
+    """Compute LayerNorm row statistics for several compact rows per program.
+
+    The older compact screen launches one Triton program per valid pair row.
+    On v2/wide-z that means two triangle updates pay thousands of tiny
+    reductions per Pairformer block.  This variant keeps the math identical
+    but lets one program reduce a small tile of rows, trading a little more
+    register use for fewer launches/programs and better memory coalescing.
+    """
+
+    rows_off = (tl.program_id(0) * block_rows + tl.arange(0, block_rows)).to(tl.int64)
+    cols = tl.arange(0, block_c).to(tl.int64)
+    row_mask = rows_off < rows
+    col_mask = cols < channels
+    dense_rows = tl.load(dense_offsets + rows_off, mask=row_mask, other=0).to(tl.int64)
+    values = tl.load(
+        z + dense_rows[:, None] * channels + cols[None, :],
+        mask=row_mask[:, None] & col_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    mu = tl.sum(values, axis=1) / channels
+    centered = tl.where(col_mask[None, :], values - mu[:, None], 0.0)
+    var = tl.sum(centered * centered, axis=1) / channels
+    tl.store(mean + rows_off, mu, mask=row_mask)
+    tl.store(rstd + rows_off, tl.rsqrt(var + eps), mask=row_mask)
+
+
 def lengths_from_args(args: argparse.Namespace) -> list[int]:
     if args.lengths is not None:
         return args.lengths
@@ -165,11 +204,33 @@ def direct_owned_groups(
     dense_offsets: torch.Tensor,
     lengths: list[int],
     weights: dict[str, torch.Tensor],
+    *,
+    row_stats: str = "tiled",
+    row_stat_block_rows: int = 4,
 ) -> tuple[torch.Tensor, list[OwnedGroup]]:
     rows = dense_offsets.numel()
     mean = torch.empty(rows, device=z.device, dtype=torch.float32)
     rstd = torch.empty_like(mean)
-    _compact_row_stats_kernel[(rows,)](z, dense_offsets, mean, rstd, rows, C_Z, 1e-5)
+    if row_stat_block_rows <= 0:
+        raise ValueError("row_stat_block_rows must be positive")
+    if row_stats == "scalar":
+        _compact_row_stats_kernel[(rows,)](z, dense_offsets, mean, rstd, rows, C_Z, 1e-5)
+    elif row_stats == "tiled":
+        grid = (triton.cdiv(rows, row_stat_block_rows),)
+        _compact_row_stats_tiled_kernel[grid](
+            z,
+            dense_offsets,
+            mean,
+            rstd,
+            rows,
+            C_Z,
+            1e-5,
+            row_stat_block_rows,
+            C_Z,
+            num_warps=8,
+        )
+    else:
+        raise ValueError(f"unknown row_stats implementation: {row_stats!r}")
     x_norm = torch.empty((rows, C_Z), device=z.device, dtype=z.dtype)
     groups: list[OwnedGroup] = []
     for start, length, count in group_spans(lengths):
@@ -211,8 +272,19 @@ def direct_owned_update(
     lengths: list[int],
     direction: str,
     weights: dict[str, torch.Tensor],
+    *,
+    row_stats: str = "tiled",
+    row_stat_block_rows: int = 4,
 ) -> torch.Tensor:
-    x_norm, groups = direct_owned_groups(module, z, dense_offsets, lengths, weights)
+    x_norm, groups = direct_owned_groups(
+        module,
+        z,
+        dense_offsets,
+        lengths,
+        weights,
+        row_stats=row_stats,
+        row_stat_block_rows=row_stat_block_rows,
+    )
     return producer_owned_finish(module, z, x_norm, groups, dense_offsets, direction, weights)
 
 
@@ -229,6 +301,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--row-stats", choices=["scalar", "tiled"], default="tiled")
+    parser.add_argument("--row-stat-block-rows", type=int, default=4)
     parser.add_argument("--output-json")
     return parser.parse_args()
 
@@ -254,13 +328,30 @@ def main() -> None:
             args.iters,
         )
         producer_out, producer_ms = cuda_time(
-            lambda: direct_owned_groups(module, z, dense_offsets, lengths, weights),
+            lambda: direct_owned_groups(
+                module,
+                z,
+                dense_offsets,
+                lengths,
+                weights,
+                row_stats=args.row_stats,
+                row_stat_block_rows=args.row_stat_block_rows,
+            ),
             args.warmup,
             args.iters,
         )
         x_norm, groups = producer_out
         candidate, candidate_ms = cuda_time(
-            lambda: direct_owned_update(module, z, dense_offsets, lengths, direction, weights),
+            lambda: direct_owned_update(
+                module,
+                z,
+                dense_offsets,
+                lengths,
+                direction,
+                weights,
+                row_stats=args.row_stats,
+                row_stat_block_rows=args.row_stat_block_rows,
+            ),
             args.warmup,
             args.iters,
         )
