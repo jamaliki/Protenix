@@ -73,7 +73,10 @@ if triton_triangle_ln_dual_gemm_available():
         eps: tl.constexpr,
     ) -> None:
         row = tl.program_id(0)
-        offs = tl.arange(0, _CHANNELS)
+        # Triton JIT kernels cannot reliably close over ordinary Python globals.
+        # The production guard fixes `channels == 256`, so keep the static block
+        # width literal here and still use the constexpr `channels` for masks.
+        offs = tl.arange(0, 256)
         mask = offs < channels
         values = tl.load(x + row * channels + offs, mask=mask, other=0.0).to(
             tl.float32
