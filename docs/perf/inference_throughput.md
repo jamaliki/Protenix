@@ -308,6 +308,14 @@ This is not a headline speedup, but it is a clean promoted kernel improvement:
 the isolated bottleneck moved, the enclosing block moved in the same component,
 memory was unchanged, and the base path kept the old tile.
 
+Local hill-climb closure: job `101998`
+(`runs/v2_transition_tile_hillclimb_20260704_070356_9dd32d5`) tested nearby
+`M/N/K/warps/stages` variants around the promoted tile.  The promoted
+`64x256x64`, 8-warp, 3-stage tile remained best (`6.422 ms`).  Smaller `K`,
+fewer warps, 2-stage or 4-stage variants, and larger `M` tiles either regressed
+or exceeded H100 shared-memory limits, so do not keep searching this local tile
+neighborhood without a new kernel design.
+
 Host-prefetch gate: job `99731`, run directory
 `runs/prefetch_gate_20260704_013822_0e4d701`, commit `0e4d701`, one H100,
 base checkpoint, synthetic 256-record campaign made by repeating the same 32
