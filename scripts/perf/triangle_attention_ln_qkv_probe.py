@@ -203,6 +203,8 @@ def parse_kernel_configs(value: str) -> list[KernelConfig]:
 
 def select_cases(value: str) -> list[ShapeCase]:
     by_name = {case.name: case for case in DEFAULT_CASES}
+    if value == "none":
+        return []
     if value == "all":
         return list(DEFAULT_CASES)
     cases = []
@@ -211,9 +213,39 @@ def select_cases(value: str) -> list[ShapeCase]:
             cases.append(by_name[name])
         except KeyError as exc:
             raise argparse.ArgumentTypeError(
-                f"unknown case {name!r}; choose from {', '.join(by_name)} or all"
+                f"unknown case {name!r}; choose from {', '.join(by_name)}, all, or none"
             ) from exc
     return cases
+
+
+def parse_custom_case(value: str) -> ShapeCase:
+    """Parse ``name:batch:tokens:c_z:no_heads[:c_hidden]`` for ad hoc screens."""
+
+    parts = value.split(":")
+    if len(parts) not in {5, 6}:
+        raise argparse.ArgumentTypeError(
+            "custom cases must be name:batch:tokens:c_z:no_heads[:c_hidden]"
+        )
+    name = parts[0]
+    if not name:
+        raise argparse.ArgumentTypeError("custom case name cannot be empty")
+    try:
+        batch, tokens, c_z, no_heads = (int(part) for part in parts[1:5])
+        c_hidden = int(parts[5]) if len(parts) == 6 else 32
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "custom case dimensions must be integers"
+        ) from exc
+    if min(batch, tokens, c_z, no_heads, c_hidden) <= 0:
+        raise argparse.ArgumentTypeError("custom case dimensions must be positive")
+    return ShapeCase(
+        name=name,
+        batch=batch,
+        tokens=tokens,
+        c_z=c_z,
+        no_heads=no_heads,
+        c_hidden=c_hidden,
+    )
 
 
 def make_module(case: ShapeCase, *, ending: bool, seed: int) -> TriangleAttention:
@@ -457,6 +489,16 @@ def run_case(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cases", type=select_cases, default=list(DEFAULT_CASES))
+    parser.add_argument(
+        "--custom-case",
+        action="append",
+        type=parse_custom_case,
+        default=[],
+        help=(
+            "Add an ad hoc shape as name:batch:tokens:c_z:no_heads[:c_hidden]. "
+            "Useful for screening mixed-token endpoints without editing the script."
+        ),
+    )
     parser.add_argument("--include-start", type=str_bool, default=True)
     parser.add_argument("--include-end", type=str_bool, default=True)
     parser.add_argument(
@@ -481,7 +523,10 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated block_m x block_n x num_warps Triton configs.",
     )
     parser.add_argument("--output-json", type=str, default=None)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.custom_case:
+        args.cases = [*args.cases, *args.custom_case]
+    return args
 
 
 def main() -> None:
@@ -492,6 +537,8 @@ def main() -> None:
         raise RuntimeError("triangle_attention_ln_qkv_probe requires Triton")
     if not args.include_start and not args.include_end:
         raise ValueError("at least one of --include-start/--include-end must be true")
+    if not args.cases:
+        raise ValueError("no shape cases selected")
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.manual_seed(args.seed)
@@ -507,6 +554,7 @@ def main() -> None:
         "args": {
             **vars(args),
             "cases": [case.__dict__ for case in args.cases],
+            "custom_case": [case.__dict__ for case in args.custom_case],
             "kernel_configs": [config.__dict__ for config in args.kernel_configs],
         },
         "results": results,
