@@ -406,8 +406,10 @@ kernel opportunity is a true ragged/segmented triangle-attention or
 triangle-multiplication schedule that avoids padded pair work while keeping
 CUEQ/cuDNN-class mainloops.  Small queue buckets, pair-transition-only
 compaction, residual-only triangle-multiplication epilogues, and more same-GPU
-workers have already plateaued for v2.  The
-detailed CUEQ reverse-engineering notes, rejected cuBLAS/CUTLASS grouped
+workers have already plateaued for v2.  The last simple CUTLASS wrapper idea
+also failed: grouped GEMM cannot express "one sequence group with 256 feature
+contractions in GEMM's `L` dimension" through the stock SM90 grouped scheduler.
+The detailed CUEQ reverse-engineering notes, rejected cuBLAS/CUTLASS grouped
 screens, and the proposed first fused CuTe boundary are in
 [docs/perf/inference_throughput.md](docs/perf/inference_throughput.md#cueq-reverse-engineering-the-native-boundary-worth-targeting).
 

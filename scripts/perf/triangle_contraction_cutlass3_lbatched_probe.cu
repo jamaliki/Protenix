@@ -43,8 +43,9 @@ using MnMajorStride = Stride<Int<1>, int64_t, int64_t>;
 // code the L stride to zero because normal grouped GEMM treats each problem as
 // one matrix.  This probe deliberately uses explicit CuTe stride-pointer types
 // so the L dimension walks from one pair channel to the next in the original
-// [D, B, N, N] tensor.  If this works, it answers whether a larger grouped
-// boundary can remove the metadata overhead that killed the B*D grouped probe.
+// [D, B, N, N] tensor.  Stock CUTLASS 3 still rejects this at can_implement:
+// the SM90 pointer-array grouped scheduler only supports rank-3 grouped shapes.
+// Keeping this probe makes that boundary explicit before writing custom CuTe.
 template <typename LayoutA, typename LayoutB>
 struct GroupedGemmTypes {
   using FusionOperation =
@@ -269,11 +270,17 @@ torch::Tensor run_impl(torch::Tensor const& lhs, torch::Tensor const& rhs, torch
       torch::TensorOptions().dtype(torch::kUInt8).device(lhs.device()));
 
   cutlass::Status status = gemm.can_implement(arguments);
-  TORCH_CHECK(status == cutlass::Status::kSuccess, "CUTLASS 3 L-batched can_implement failed");
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "CUTLASS 3 L-batched can_implement failed: ",
+              cutlassGetStatusString(status),
+              ". Stock SM90 pointer-array grouped GEMM only supports rank-3 grouped shapes; "
+              "rank-4 L batching requires a lower-level custom CuTe/CUDA scheduler.");
   status = gemm.initialize(arguments, workspace.data_ptr(), stream);
-  TORCH_CHECK(status == cutlass::Status::kSuccess, "CUTLASS 3 L-batched initialize failed");
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "CUTLASS 3 L-batched initialize failed: ", cutlassGetStatusString(status));
   status = gemm.run(stream);
-  TORCH_CHECK(status == cutlass::Status::kSuccess, "CUTLASS 3 L-batched run failed");
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "CUTLASS 3 L-batched run failed: ", cutlassGetStatusString(status));
   return out;
 }
 

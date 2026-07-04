@@ -11,10 +11,11 @@ This probe asks the next narrower native-kernel question:
     Can CUTLASS keep one exact-length problem per sequence record and use the
     GEMM ``L`` dimension for the 256 independent feature contractions?
 
-If this wins, it is the first useful contraction mainloop to fold into a larger
-segmented triangle-multiplication update.  It is still not a production path by
-itself: LayerNorm, gated projections, output normalization, and residual store
-would still need to stay inside the same native boundary.
+Result: this is a negative ABI screen with stock CUTLASS 3.  Pointer-array
+grouped GEMM supports rank-3 grouped problems; rank-4 ``L`` batching is only
+accepted for non-grouped array mode.  The files are kept as a short learning
+artifact because this was the tempting "obvious" wrapper before writing a true
+custom CuTe scheduler.
 """
 
 from __future__ import annotations

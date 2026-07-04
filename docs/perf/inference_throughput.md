@@ -4364,6 +4364,35 @@ short-term implementation ladder is:
    the old grouped wrapper, but it still does not justify production integration
    as a standalone contraction replacement.
 
+   CUTLASS 3 L-batched grouped follow-up: commits `fe5da8a`, `5efd1ba`, and
+   `1701f74` added
+   `scripts/perf/triangle_contraction_cutlass3_lbatched_probe.py` and its CUDA
+   extension.  This tested the obvious next fix for the `4096`-group overhead:
+   keep one grouped problem per sequence record and put the Protenix-v2 pair
+   channel (`c_z=256`) in GEMM's rank-4 `L` dimension.  The screen was still
+   useful even though it did not run:
+
+   - job `109940`
+     (`runs/triangle_cutlass3_lbatched_cuda_20260704_203508_fe5da8a`) showed
+     that CUTLASS' convenience pointer-array tags (`RowMajor*` and
+     `ColumnMajor*`) hard-code the `L` stride to zero.  That is correct for
+     ordinary grouped GEMM, where every group is one matrix, but it cannot walk
+     feature channels in the original `[D, B, N, N]` Protenix tensor.
+   - job `109944`
+     (`runs/triangle_cutlass3_lbatched_bstride_20260704_204412_1701f74`) then
+     used explicit CuTe stride-pointer types for A/B/D, compiled and linked the
+     SM90 grouped TMA kernel, but failed at `can_implement`.
+
+   The CUTLASS header explains the final failure directly: the SM90 pointer-array
+   cooperative kernel accepts rank-3 problem shapes for grouped GEMM, while
+   rank-4 problem shapes are accepted only for non-grouped array mode.  Therefore
+   the desired boundary, "B grouped records, L feature contractions per record",
+   is not expressible through the stock CUTLASS 3 grouped builder.  This rejects
+   the last plausible library-wrapper contraction path.  A real implementation
+   now has to drop below the grouped GEMM adapter into a custom CuTe/CUDA
+   scheduler, or widen the fusion boundary enough that a custom triangle update
+   kernel amortizes its own scheduling and epilogue work.
+
    Triton segmented scheduler follow-up: commits `d2cda3e` and `4125803` added
    `scripts/perf/triangle_contraction_triton_segmented_probe.py`.  This was the
    non-library version of the same question: one Triton launch, direct
@@ -4830,6 +4859,13 @@ Profiling and reproducibility helpers:
   outgoing contraction, but regresses short buckets and is flat for long
   incoming; use this as evidence that the next v2 kernel needs a wider fused
   triangle-multiplication boundary, not another bare grouped-GEMM wrapper.
+- `scripts/perf/triangle_contraction_cutlass3_lbatched_probe.py` and
+  `scripts/perf/triangle_contraction_cutlass3_lbatched_probe.cu`: CUTLASS 3
+  ABI screen for one grouped problem per sequence record with `c_z` carried as
+  GEMM's rank-4 `L` dimension.  It documents why this tempting wrapper is not
+  viable: CUTLASS pointer-array grouped GEMM hard-codes zero `L` stride for the
+  convenience layout tags, and even explicit CuTe stride pointers are rejected
+  because the SM90 grouped scheduler only supports rank-3 grouped shapes.
 - `scripts/perf/triangle_contraction_triton_segmented_probe.py`: direct Triton
   segmented contraction screen.  It removes host-built grouped-GEMM metadata and
   writes zero invalid regions in one launch, but is still much slower than dense
