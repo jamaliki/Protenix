@@ -12,9 +12,10 @@ assembles row-major compact update rows inside native code.
 
 This is not the final CuTe kernel.  It is a cheap acceptance test for whether
 moving the contraction/assembly boundary out of PyTorch helps before attempting
-a custom SM90 mainloop.  If this loses badly to the current direct path, the
-next native attempt must preserve more of the exact-group ``torch.bmm`` schedule
-or fuse a larger boundary.
+a custom SM90 mainloop.  The report deliberately separates the *actual* path
+that still pays the current Python/Triton producer from the post-producer
+native boundary.  That avoids confusing a useful kernel-boundary signal with a
+real full-update speedup.
 """
 
 from __future__ import annotations
@@ -176,18 +177,30 @@ def main() -> None:
             args.iters,
         )
         x_norm, groups = producer_out
-        update_out, update_ms = cuda_time(
+        _update_out, update_ms = cuda_time(
             lambda: native_contract_assemble(groups, dense_offsets.numel(), direction),
             args.warmup,
             args.iters,
         )
-        native_out, native_ms = cuda_time(
+        native_boundary_out, native_boundary_ms = cuda_time(
             lambda: compact_finish_from_update(
                 module,
                 z,
                 x_norm,
                 native_contract_assemble(groups, dense_offsets.numel(), direction),
                 dense_offsets,
+                weights,
+            ),
+            args.warmup,
+            args.iters,
+        )
+        native_full_out, native_full_ms = cuda_time(
+            lambda: native_cublas_update(
+                module,
+                z,
+                dense_offsets,
+                lengths,
+                direction,
                 weights,
             ),
             args.warmup,
@@ -204,11 +217,20 @@ def main() -> None:
             },
             "direct_producer_only": {"ms": producer_ms},
             "native_contract_assemble_only": {"ms": update_ms},
-            "native_full_reusing_direct_producer": {
-                "ms": native_ms,
-                "speedup_vs_baseline": base_ms / native_ms,
-                "speedup_vs_current_direct": current_ms / native_ms,
-                "parity_valid": compare(ref_valid, valid_from_dense(native_out, dense_offsets)),
+            "native_contract_finish_after_reused_producer": {
+                "ms": native_boundary_ms,
+                "note": "Excludes direct producer cost; use this only to judge the native post-producer boundary.",
+                "parity_valid": compare(
+                    ref_valid, valid_from_dense(native_boundary_out, dense_offsets)
+                ),
+            },
+            "native_full_with_current_producer": {
+                "ms": native_full_ms,
+                "speedup_vs_baseline": base_ms / native_full_ms,
+                "speedup_vs_current_direct": current_ms / native_full_ms,
+                "parity_valid": compare(
+                    ref_valid, valid_from_dense(native_full_out, dense_offsets)
+                ),
             },
         }
 
