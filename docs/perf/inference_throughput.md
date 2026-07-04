@@ -199,10 +199,19 @@ CIF/JSON dumping:
 
 The current B32 same-token variable-atom case is a `7.3x` predict speedup over the
 current unbatched path, but it is not the same measurement as the public
-repeated-`7r6r` wrapper/runner gate.  If an older build reports roughly
-`78s` model-forward per 32 records on this shape, rebuild from a newer commit
-before interpreting the gap as a missing flag; current optimized code measured
-`39.33s` model-forward on the comparable base-checkpoint gate.
+repeated-`7r6r` wrapper/runner gate and it is not a confirmed Protenix-v2
+number.  The table above is a base-checkpoint gate.
+
+Issue #1 follow-up: a user rebuilt a current-HEAD Protenix-v2 SIF at commit
+`1d6b0e1` and reran a similar B32 diagnostic (`N_token=251`,
+`N_atom=1851-1926`, `N_sample=1`, `N_cycle=10`, `N_step=200`, confidence and
+normal dumping enabled).  The log still selected
+`token-trunk+diffusion-token-atom-batch`, but reported `77.206s`
+model-forward, split into `62.092s` pairformer and `13.184s` diffusion.  This
+should be treated as a separate pairformer-bound Protenix-v2 performance target,
+not as evidence that batching is disabled: v2 doubles the pair channel
+(`c_z=256`) and enables `hidden_scale_up=True`, which widens the CUEQ triangle
+attention/multiplication and transition work.
 
 Host-prefetch gate: job `99731`, run directory
 `runs/prefetch_gate_20260704_013822_0e4d701`, commit `0e4d701`, one H100,
@@ -3390,6 +3399,15 @@ campaign latency is worse (`~224s` for B8/9 versus `~142s` for B16/5), but
 aggregate per-GPU generated samples/s improves.  The current best `N_sample=5`
 operational speedup is `6.412 / 0.753 = 8.5x` over the original low-sample
 boundary, still short of the `10x` target.
+
+Timed-only component logs make the mechanism clear.  In the same-node B16/5
+control, model-forward time was `4.23s` per input, split mainly into
+`1.85s` pairformer and `2.31s` diffusion.  In the winning B8/9 MPS run,
+model-forward time slowed to `6.75s` per input (`2.96s` pairformer,
+`3.70s` diffusion).  The aggregate win comes from filling otherwise idle GPU
+slots across independent workers, not from making the model path itself faster.
+That is why this operational mode does not remove the need for a true
+diffusion/pairformer kernel win.
 
 Interpretation:
 

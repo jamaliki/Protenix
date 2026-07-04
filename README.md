@@ -275,7 +275,7 @@ dumping:
 | --- | ---: | ---: | ---: |
 | 32 one-record JSON files in a directory | 342.7 s, 0.093 seq/s | 121.5 s, 0.263 seq/s | 2.82x end to end |
 | One combined JSON with 32 same-shape records | 361.8 s runner time | 69.3 s runner time | 5.2x after initialization |
-| 32 same-token, variable-atom 251-token records | 301.9 s summed predict at `--batch_size 1` | 41.2 s predict, 39.3 s model-forward at `--batch_size 32`; pairformer is 26.7 s with the large-row dual-GEMM transition guard | 7.3x predict vs current unbatched path |
+| 32 same-token, variable-atom 251-token records, base checkpoint | 301.9 s summed predict at `--batch_size 1` | 41.2 s predict, 39.3 s model-forward at `--batch_size 32`; pairformer is 26.7 s with the large-row dual-GEMM transition guard | 7.3x predict vs current unbatched path |
 | 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.1 s wall, 29.9 s summed predict, 0.968 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.83x single-process throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 41.6 s, 3.85 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, BF16 diffusion core, BF16 atom attention, Triton local atom attention, default Triton LayerNorm fallback, and cached diffusion pair bias | 5.11x over the old branch boundary |
@@ -284,10 +284,15 @@ dumping:
 
 For same-token, variable-atom campaigns, compare the `predict` or
 model-forward section rather than the outer Slurm/script wall time.  Current
-code now measures about `7.3x` for the comparable `B32, N_token=251,
-N_sample=1` predict path, while end-to-end wrapper speedups can look much
-smaller if the run includes model initialization, cold caches, file dumping, an
-older container, or a checkpoint variant that has not been re-benchmarked.
+code now measures about `7.3x` for the comparable base-checkpoint `B32,
+N_token=251, N_sample=1` predict path, while end-to-end wrapper speedups can
+look much smaller if the run includes model initialization, cold caches, file
+dumping, an older container, or a checkpoint variant that has not been
+re-benchmarked.  Protenix-v2 is a wider pairformer model (`c_z=256` with
+`hidden_scale_up=True`) and should be read as a separate performance target:
+a user-rebuilt current-HEAD v2 SIF still measured about `77s` model-forward
+for a similar B32 251-token variable-atom gate, dominated by `62s` in
+pairformer.
 Seeing `token-trunk+diffusion-token-atom-batch` in the log means batching is
 working; it does not mean the run is using the exact-shape `7r6r` path.
 
