@@ -116,9 +116,9 @@ def extension():
     if "TORCH_CUDA_ARCH_LIST" not in os.environ:
         os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
 
-    source = REPO_ROOT / "scripts/perf/triangle_contraction_cublas_grouped_probe.cu"
+    source = REPO_ROOT / "scripts/perf/triangle_contraction_cublas_probe.cu"
     _EXT = load(
-        name="protenix_triangle_contraction_cublas_grouped_probe",
+        name="protenix_triangle_contraction_cublas_probe",
         sources=[str(source)],
         extra_include_paths=_cuda_include_paths(),
         extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++17"],

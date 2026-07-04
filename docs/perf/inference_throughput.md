@@ -4133,6 +4133,33 @@ short-term implementation ladder is:
    The next contraction-level attempt should use a cuBLASLt/grouped-GEMM style
    dispatch or a more carefully scheduled CuTe grouped kernel before trying to
    fuse LayerNorm/projection/output-gate around it.
+
+   cuBLAS wrapper follow-up: commit `bc8b8b8`, job `109359`, run
+   `runs/triangle_contraction_cublas_record_20260704_154906_bc8b8b8`,
+   tested the same contraction core with
+   `scripts/perf/triangle_contraction_cublas_probe.py`.  CUDA-13
+   `cublasGemmGroupedBatchedEx` compiled and linked but rejected the BF16
+   tensor-core grouped call with `CUBLAS_STATUS_NOT_SUPPORTED` in jobs `109355`
+   and `109357`, so the probe fell back to one exact-length
+   `cublasGemmStridedBatchedEx` call per sequence record.  That path reads
+   directly from padded `[D, B, Nmax, Nmax]` storage and writes padded output,
+   so it tests wrapper-level exact-length work reduction without copy overhead.
+   It had valid-region BF16 parity and zero invalid-region output, but still
+   lost to dense `einsum`:
+
+   | bucket / direction | dense `einsum` | record-strided cuBLAS | decision |
+   | --- | ---: | ---: | --- |
+   | short outgoing | 0.175 ms | 0.263 ms (`0.67x`) | reject |
+   | short incoming | 0.154 ms | 0.241 ms (`0.64x`) | reject |
+   | long outgoing | 0.819 ms | 0.973 ms (`0.84x`) | reject |
+   | long incoming | 0.751 ms | 0.895 ms (`0.84x`) | reject |
+
+   This rules out a simple "wrap cuBLAS over the valid rectangles" production
+   path: even though it skips invalid cubic work, launch fan-out and the
+   less-favorable small-GEMM schedule lose to the dense batched schedule.  The
+   remaining credible contraction path is a real grouped/segmented CuTe kernel
+   that keeps the exact-length work reduction inside a small launch family with
+   a schedule designed for the `(features=256, batch=16, N=136-220)` v2 shapes.
 2. **Full segmented triangle-mul update:** fuse or internally schedule the
    LayerNorm, gated input projection, segmented contraction, output LayerNorm,
    output projection/gate, and residual store for valid rows.  This is the first
@@ -4296,6 +4323,11 @@ Profiling and reproducibility helpers:
   an optimistic benchmark-only boundary: exact-length groups are materialized
   before timing, so a win justifies a fuller segmented update kernel, while a
   loss rejects the schedule early.
+- `scripts/perf/triangle_contraction_cublas_probe.py` and
+  `scripts/perf/triangle_contraction_cublas_probe.cu`: no-copy exact-length
+  cuBLAS contraction screen.  This tests whether wrapper-level cuBLAS calls can
+  exploit per-record lengths before investing in a custom grouped/segmented
+  CuTe mainloop.
 - `scripts/perf/submit_tokyo_triangle_attention_ncu.sh` and
   `scripts/perf/tokyo_triangle_attention_ncu.sbatch`: Tokyo one-H100 Nsight
   Compute capture for one starting or ending CUEQ triangle-attention module.
