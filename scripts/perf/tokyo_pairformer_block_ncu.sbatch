@@ -36,6 +36,10 @@ NCU=${NCU:-/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/env-nsight/bin/ncu}
 DEV_BIN=${DEV_BIN:-/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/dev/bin}
 TOKENS=${TOKENS:-251}
 BATCH=${BATCH:-32}
+C_S=${C_S:-384}
+C_Z=${C_Z:-128}
+N_HEADS=${N_HEADS:-16}
+HIDDEN_SCALE_UP=${HIDDEN_SCALE_UP:-false}
 WARMUP=${WARMUP:-3}
 NCU_ITERS=${NCU_ITERS:-1}
 NCU_SET=${NCU_SET:-full}
@@ -77,10 +81,14 @@ nvidia-smi
   --set "$NCU_SET" \
   --target-processes all \
   --force-overwrite \
-  --export "$RUN_DIR/pairformer_block_B${BATCH}_N${TOKENS}_${NCU_SET}" \
+  --export "$RUN_DIR/pairformer_block_B${BATCH}_N${TOKENS}_Cz${C_Z}_hsu${HIDDEN_SCALE_UP}_${NCU_SET}" \
   "$PY" scripts/perf/pairformer_block_breakdown.py \
     --batch "$BATCH" \
     --tokens "$TOKENS" \
+    --c-s "$C_S" \
+    --c-z "$C_Z" \
+    --n-heads "$N_HEADS" \
+    --hidden-scale-up "$HIDDEN_SCALE_UP" \
     --input-dtype bfloat16 \
     --compute-dtype bfloat16 \
     --triangle-attention cuequivariance \
@@ -92,12 +100,12 @@ nvidia-smi
   2> "$RUN_DIR/ncu_stderr.txt"
 
 "$NCU" \
-  --import "$RUN_DIR/pairformer_block_B${BATCH}_N${TOKENS}_${NCU_SET}.ncu-rep" \
+  --import "$RUN_DIR/pairformer_block_B${BATCH}_N${TOKENS}_Cz${C_Z}_hsu${HIDDEN_SCALE_UP}_${NCU_SET}.ncu-rep" \
   --page summary \
   > "$RUN_DIR/ncu_summary.txt" 2>&1 || true
 
 "$NCU" \
-  --import "$RUN_DIR/pairformer_block_B${BATCH}_N${TOKENS}_${NCU_SET}.ncu-rep" \
+  --import "$RUN_DIR/pairformer_block_B${BATCH}_N${TOKENS}_Cz${C_Z}_hsu${HIDDEN_SCALE_UP}_${NCU_SET}.ncu-rep" \
   --csv --page raw \
   > "$RUN_DIR/ncu_raw.csv" 2> "$RUN_DIR/ncu_raw.err" || true
 
