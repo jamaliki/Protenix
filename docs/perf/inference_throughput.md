@@ -234,6 +234,27 @@ triangle multiplication:
 | overlay disabled | 88.408 | 21.454 | 21.330 | 1.00x | control |
 | overlay default-on | 68.686 | 11.506 | 11.414 | 1.29x | promote |
 
+Real Protenix-v2 same-token, variable-atom gate: job `103619`
+(`runs/v2_same_token_var_atom_real_gate_20260704_115033_e550944`), one H100,
+commit `e550944`, staged checkpoint SHA256
+`8f931f9774a396b67033d0e58628e1834f4a1448165e04254b40a780b0c0d599`, 32
+one-chain records with `N_token=251`, `N_atom=1834-1940`, `N_sample=1`,
+`N_step=200`, confidence enabled, normal CIF/JSON dumping:
+
+| case | predict sec | records/s by predict | model-forward sec | pairformer | diffusion | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| overlay disabled | 62.46 | 0.512 | 60.453 | 48.071 | 11.516 | 0.866 | control |
+| overlay default-on | 52.08 | 0.615 | 50.421 | 37.995 | 11.559 | 0.867 | promote |
+
+The paired end-to-end gate matches the block-level mechanism: the overlay gives
+a `1.20x` predict/model-forward win, and essentially all of it comes from the
+v2 pairformer (`1.27x`).  Compared with the earlier user-rebuilt v2 report at
+commit `1d6b0e1` (`77.206s` model-forward, `62.092s` pairformer), current HEAD
+is `1.53x` faster in model-forward and `1.63x` faster in pairformer.  It is
+still a wider model: the comparable optimized base-checkpoint B32 gate above
+was `41.16s` predict and `39.33s` model-forward, so the v2 row remains about
+`1.27x` slower than the base row even after this v2-specific fix.
+
 Base-shape guardrail: job `101774`
 (`runs/base_cueq_overlay_guard_20260704_063822_6e5a670`) repeated the same
 block screen with the base-checkpoint shape (`c_z=128`,
@@ -458,15 +479,18 @@ gate improved predict throughput by `1.023x` and the pairformer subtotal by
 safe for v2 because the default guard excludes `c_z=256`/8-head triangle
 attention, where the isolated screen lost to cuBLAS.
 
-Current-head Protenix-v2 end-to-end validation is still blocked by checkpoint
-availability in the Kiarash runtime, not by model code.  Job `102199`
-(`runs/v2_same_token_var_atom_current_gate_20260704_072851_000836b`) attempted
-the 32-record same-token/variable-atom v2 B32 gate at commit `000836b` with the
-H100 cache overlay enabled and `CUEQ_TRITON_CACHE_DIR` unset, but failed before
-model startup because `/mnt/lustre/users/kiarash-eitgbi/protenix_data/checkpoint/protenix-v2.pt`
-was absent and the public checkpoint URL returned HTTP 403.  Stage
-`protenix-v2.pt` under `$PROTENIX_ROOT_DIR/checkpoint/` before claiming an
-end-to-end v2 campaign speedup from the block-level profile.
+Current-head Protenix-v2 end-to-end validation is now unblocked in the Kiarash
+runtime.  The first attempt, job `102199`
+(`runs/v2_same_token_var_atom_current_gate_20260704_072851_000836b`), failed
+before model startup because
+`/mnt/lustre/users/kiarash-eitgbi/protenix_data/checkpoint/protenix-v2.pt` was
+absent and the public checkpoint URL returned HTTP 403.  The checkpoint was
+later staged manually with SHA256
+`8f931f9774a396b67033d0e58628e1834f4a1448165e04254b40a780b0c0d599`, and job
+`103619` produced the real v2 B32 result recorded above.  For reproducible v2
+speed comparisons, stage `protenix-v2.pt` under
+`$PROTENIX_ROOT_DIR/checkpoint/` first; otherwise the timing may only measure
+checkpoint download failure or cold setup behavior.
 
 Host-prefetch gate: job `99731`, run directory
 `runs/prefetch_gate_20260704_013822_0e4d701`, commit `0e4d701`, one H100,
@@ -3557,6 +3581,21 @@ signal, but the combined short+long block total is essentially flat/slower.
 A true ragged pairformer kernel would need to keep the one-launch/vendor-kernel
 quality of CUEQ while avoiding padded work.  That remains a large kernel design
 project, not a cleanup or batching knob.
+
+Protenix-v2 repeat: job `103618`
+(`runs/v2_ragged_islands_hotspot_20260704_114715_e550944`) reran the same
+question for a wider v2 `PairformerBlock` (`c_z=256`, `hidden_scale_up=True`,
+BF16, CUEQ attention/multiplication) on 16 lengths from `40` to `220` tokens.
+The one padded block had only `41.2%` valid-pair efficiency and took
+`27.747 ms`.  Coarse split buckets at `88`, `136`, and `184` tokens improved
+the block to `21.733 ms` (`1.28x`) by raising efficiency to `81.2%`, but exact
+length groups and singletons were both much slower (`57.25 ms`, about `0.48x`
+of padded).
+
+Interpretation: v2 has real padding headroom because the pair channel is wider,
+but the winning form is still **large grouped launches**, not one launch per
+sequence.  This is evidence for a future segmented/CuTe-style pairformer
+schedule or careful campaign length grouping, not for Python singleton islands.
 
 A small mask-format hypothesis was also screened before changing model code.
 Triangle attention already feeds CUEQ a boolean mask, but triangle

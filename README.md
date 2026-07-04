@@ -199,15 +199,20 @@ before CUEQ is imported; it does not run ONDEMAND tuning during inference, and
 it respects a user-supplied `CUEQ_TRITON_CACHE_DIR`.  On the v2-shaped
 PairformerBlock screen (`c_z=256`, `hidden_scale_up=True`) this moved block time
 from `88.4 ms` to `68.7 ms` by reducing each triangle-multiplication call from
-about `21.4 ms` to `11.5 ms`.  Set
+about `21.4 ms` to `11.5 ms`.  On the real Protenix-v2 B32 same-token,
+variable-atom gate (`N_token=251`, `N_step=200`) the same overlay moved predict
+time from `62.5s` to `52.1s` and model-forward time from `60.5s` to `50.4s`;
+the win was almost entirely in pairformer (`48.1s -> 38.0s`).  Set
 `PROTENIX_CUEQ_H100_TRITON_CACHE=0` for conservative bisects.
 
 If you use `protenix-v2`, make sure `PROTENIX_ROOT_DIR` points at a cache that
 already contains `checkpoint/protenix-v2.pt`.  The public checkpoint URL can
 return HTTP 403 in locked-down cluster jobs; in that case stage the file
 manually under `$PROTENIX_ROOT_DIR/checkpoint/protenix-v2.pt` before comparing
-speedups.  The branch now reports that path explicitly instead of surfacing a
-raw `urllib` traceback.
+speedups.  The Tokyo v2 gates used SHA256
+`8f931f9774a396b67033d0e58628e1834f4a1448165e04254b40a780b0c0d599`.  The
+branch now reports the expected path explicitly instead of surfacing a raw
+`urllib` traceback.
 
 Large same-token pairformer batches also use a Triton dual-GEMM transition
 input kernel by default (`PROTENIX_TRITON_TRANSITION_DUAL_GEMM=1`).  Pairformer
@@ -310,6 +315,7 @@ dumping:
 | 32 one-record JSON files in a directory | 342.7 s, 0.093 seq/s | 121.5 s, 0.263 seq/s | 2.82x end to end |
 | One combined JSON with 32 same-shape records | 361.8 s runner time | 69.3 s runner time | 5.2x after initialization |
 | 32 same-token, variable-atom 251-token records, base checkpoint | 301.9 s summed predict at `--batch_size 1` | 41.2 s predict, 39.3 s model-forward at `--batch_size 32`; pairformer is 26.7 s with the large-row dual-GEMM transition guard | 7.3x predict vs current unbatched path |
+| 32 same-token, variable-atom 251-token records, Protenix-v2 checkpoint | prior current-HEAD user rerun: 77.2 s model-forward, dominated by 62.1 s pairformer | 52.1 s predict, 50.4 s model-forward at `--batch_size 32`; pairformer is 38.0 s with the H100 CUEQ cache overlay | 1.53x model-forward vs that v2 rerun; v2 remains about 1.27x slower than the base-checkpoint row |
 | 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.1 s wall, 29.9 s summed predict, 0.968 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.83x single-process throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 38.3 s, 4.18 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, BF16 diffusion core, BF16 atom attention, Triton local atom attention, default Triton LayerNorm fallback, cached diffusion pair bias, and guarded triangle LN+q/k/v production | 5.55x over the old branch boundary |
@@ -324,13 +330,9 @@ look much smaller if the run includes model initialization, cold caches, file
 dumping, an older container, or a checkpoint variant that has not been
 re-benchmarked.  Protenix-v2 is a wider pairformer model (`c_z=256` with
 `hidden_scale_up=True`) and should be read as a separate performance target:
-a user-rebuilt current-HEAD v2 SIF still measured about `77s` model-forward
-for a similar B32 251-token variable-atom gate, dominated by `62s` in
-pairformer.  Block-level v2 profiling shows the H100 CUEQ cache overlay should
-reduce that dominant triangle-multiplication cost, but a current-HEAD
-same-checkpoint v2 end-to-end rerun still requires a staged `protenix-v2.pt`
-checkpoint; a Tokyo rerun attempt at commit `000836b` failed at checkpoint
-download with HTTP 403 before model startup.
+the current v2 same-checkpoint gate moved a prior `77.2s` model-forward report
+to `50.4s`, mainly by reducing pairformer from `62.1s` to `38.0s`.  That is a
+real v2 win, but not the same claim as the base-checkpoint `7.3x` row.
 Seeing `token-trunk+diffusion-token-atom-batch` in the log means batching is
 working; it does not mean the run is using the exact-shape `7r6r` path.
 
