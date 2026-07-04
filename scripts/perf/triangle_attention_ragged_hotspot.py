@@ -25,6 +25,7 @@ import _repo_bootstrap  # noqa: F401
 
 import argparse
 import json
+import statistics
 from collections import defaultdict
 from collections.abc import Callable
 
@@ -236,19 +237,33 @@ def run_grouped(
     return flatten_valid([value for value in output_by_index if value is not None], lengths)
 
 
-def cuda_time(fn: TensorFn, warmup: int, iters: int) -> tuple[torch.Tensor, float]:
+def cuda_time(
+    fn: TensorFn,
+    warmup: int,
+    iters: int,
+) -> tuple[torch.Tensor, float, dict[str, float]]:
     with torch.inference_mode():
         for _ in range(warmup):
             out = fn()
         torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
+
+        samples = []
         for _ in range(iters):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
             out = fn()
-        end.record()
-        end.synchronize()
-    return out, start.elapsed_time(end) / iters
+            end.record()
+            end.synchronize()
+            samples.append(start.elapsed_time(end))
+
+    median_ms = statistics.median(samples)
+    stats = {
+        "mean_ms": sum(samples) / len(samples),
+        "min_ms": min(samples),
+        "max_ms": max(samples),
+    }
+    return out, median_ms, stats
 
 
 def compare(reference: torch.Tensor, candidate: torch.Tensor) -> dict[str, float | int]:
@@ -319,19 +334,28 @@ def main() -> None:
                     groups_by_name["exact_length_groups"],
                 ),
             }
-            reference, padded_ms = cuda_time(
+            reference, padded_ms, padded_stats = cuda_time(
                 variants["padded_all"],
                 args.warmup,
                 args.iters,
             )
             direction_results: dict[str, object] = {
-                "padded_all": {"ms": padded_ms, "speedup_vs_padded": 1.0}
+                "padded_all": {
+                    "ms": padded_ms,
+                    "speedup_vs_padded": 1.0,
+                    **padded_stats,
+                }
             }
             for name in ("split_buckets", "exact_length_groups"):
-                output, ms = cuda_time(variants[name], args.warmup, args.iters)
+                output, ms, timing_stats = cuda_time(
+                    variants[name],
+                    args.warmup,
+                    args.iters,
+                )
                 direction_results[name] = {
                     "ms": ms,
                     "speedup_vs_padded": padded_ms / ms,
+                    **timing_stats,
                     "valid_vs_padded": compare(reference, output),
                 }
             results[direction] = direction_results
