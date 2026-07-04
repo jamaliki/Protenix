@@ -2468,6 +2468,43 @@ therefore be either:
 Both are real custom-kernel problems.  A plain PyTorch concatenation or simple
 Triton matmul is not close enough to promote.
 
+Triangle multiplication was also profiled because it is the next largest block
+component after triangle attention and pair transition.  The torch-profiler
+screen (`runs/triangle_multiplication_profiler2_20260704_002155_6d22921`) shows
+that both outgoing and incoming calls are mostly CUEQ/library work already:
+
+| launch group, per call | outgoing ms | incoming ms | interpretation |
+| --- | ---: | ---: | --- |
+| CUEQ fused gated dual GEMM, two launches | 1.862 | 1.862 | input projections/gates |
+| triangular `bmm`/CUTLASS GEMM | 1.338 | 1.283 | core triangular product |
+| CUEQ layernorm+transpose, two launches | 1.038 | 1.027 | normalized/layout producers |
+| residual `add_` | 0.501 | 0.501 | standalone memory-bound add |
+| copies/cats | <0.011 | <0.011 | not material |
+
+The standalone residual add is visible, but it is already a high-bandwidth
+vector add over the full pair tensor.  Removing it would require CUEQ to accept
+and add the residual inside its final store; a separate Triton add would not
+meaningfully beat PyTorch's kernel.
+
+CUEQ on-demand autotuning was worth testing because the triangle-multiplication
+kernel is shape-specialized.  In
+`runs/cueq_trimul_tuning_screen_20260704_002433_6d22921`, tuning took `169 s`
+for this B32/N251 shape and improved isolated triangle multiplication from
+`4.726 ms` average to `4.588 ms` average (`1.030x`).  Reusing that tuned cache
+in the full PairformerBlock screen
+(`runs/cueq_tuned_cache_block_screen_20260704_003134_6d22921`) gave:
+
+| metric | default cache | tuned cache | speedup |
+| --- | ---: | ---: | ---: |
+| tri_mul_out | 4.685 ms | 4.554 ms | 1.029x |
+| tri_mul_in | 4.629 ms | 4.497 ms | 1.030x |
+| PairformerBlock total | 36.777 ms | 36.524 ms | 1.0069x |
+
+Decision: do not promote CUEQ on-demand tuning as a default branch setting.  It
+is a real but small reusable-cache win, likely useful only for very long
+campaigns that repeatedly hit the same pairformer shape.  It is below the
+full-gate threshold as a code optimization.
+
 CuTe/CUTLASS extension toolchain status on Tokyo:
 
 | item | value |
