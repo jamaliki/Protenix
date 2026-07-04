@@ -45,8 +45,12 @@ def run_baseline(
     z: torch.Tensor,
     mask: torch.Tensor,
 ) -> torch.Tensor:
+    # The CUEQ inference path returns a fresh update and then adds the residual
+    # into that output; it does not mutate ``z``.  Do not clone here, otherwise
+    # the baseline pays an extra full pair-tensor copy that the PairformerBlock
+    # call site does not pay and the candidate below does not include.
     return module(
-        z.clone(),
+        z,
         mask=mask,
         inplace_safe=True,
         _add_with_inplace=True,
