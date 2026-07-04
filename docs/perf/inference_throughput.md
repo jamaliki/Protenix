@@ -4130,6 +4130,35 @@ Decision: do not add a production triangle-mul bucket path.  Keep the hotspot
 as a reusable filter, and only pursue ragged triangle work if the next prototype
 is a real one-launch segmented/CuTe boundary rather than multiple CUEQ calls.
 
+Residual-add native-epilogue ceiling: commit `9ddd129` added
+`scripts/perf/triangle_residual_add_ceiling.py` after inspecting the installed
+CUEQ API.  The public triangle-multiplication wrapper and the lower-level
+`cuequivariance::tri_mul_update` custom op return a new tensor and expose no
+residual/output argument, so a residual-in-final-store experiment is not a
+Protenix flag we can enable.  It would require changing or replacing the native
+CUEQ op.  Job `109933`, run
+`runs/triangle_residual_add_ceiling_20260704_202309_9ddd129`, ran the ceiling
+screen on one H100 with BF16 autocast, `c_z=256`, and the two Sam-style sorted
+v2 buckets.  The benchmark wrote both JSON outputs successfully; the Slurm job
+is marked failed only because a post-processing summary snippet crashed after
+the measured cases completed.
+
+| v2 bucket | direction | native CUEQ update + residual | CUEQ update only | residual add only | max speedup if CUEQ added residual in final store |
+| --- | --- | ---: | ---: | ---: | ---: |
+| short `B16/N124` | outgoing | 2.369 ms | 2.254 ms | 0.126 ms | 1.051x |
+| short `B16/N124` | incoming | 2.351 ms | 2.226 ms | 0.126 ms | 1.056x |
+| long `B16/N220` | outgoing | 3.935 ms | 3.527 ms | 0.390 ms | 1.116x |
+| long `B16/N220` | incoming | 3.861 ms | 3.486 ms | 0.390 ms | 1.107x |
+
+Interpretation: the residual add is visible and memory-bound, but the native
+epilogue ceiling is only about `5-6%` of short-bucket triangle multiplication
+and about `11%` of long-bucket triangle multiplication.  After PairformerBlock
+dilution this is a few percent at most, and it is not available without owning
+the CUEQ native boundary.  This is not the first CuTe/CUDA target.  It should
+only be folded in if we already implement a larger segmented triangle-update
+kernel; a standalone Protenix-side residual add kernel would not beat PyTorch's
+bandwidth kernel enough to matter.
+
 ### CUEQ reverse-engineering: the native boundary worth targeting
 
 The installed CUEQ package in the Tokyo `env-boltz2` environment was inspected
@@ -4820,6 +4849,10 @@ Profiling and reproducibility helpers:
   triangle-multiplication input LayerNorm + dual-GEMM screens.  Use the
   PairformerBlock `--lengths` gate before promotion; the production path is
   deliberately default-off and row-guarded because long v2 buckets regressed.
+- `scripts/perf/triangle_residual_add_ceiling.py`: native CUEQ residual-add
+  ceiling screen.  It measures the current CUEQ triangle update, the explicit
+  post-CUEQ residual add, and the maximum speedup a hypothetical CUEQ
+  residual-store epilogue could deliver before committing to a native op change.
 - `scripts/perf/submit_tokyo_triangle_attention_ncu.sh` and
   `scripts/perf/tokyo_triangle_attention_ncu.sbatch`: Tokyo one-H100 Nsight
   Compute capture for one starting or ending CUEQ triangle-attention module.

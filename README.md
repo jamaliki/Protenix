@@ -405,7 +405,8 @@ buckets are only about 67% pair-token efficient overall, so the next large
 kernel opportunity is a true ragged/segmented triangle-attention or
 triangle-multiplication schedule that avoids padded pair work while keeping
 CUEQ/cuDNN-class mainloops.  Small queue buckets, pair-transition-only
-compaction, and more same-GPU workers have already plateaued for v2.  The
+compaction, residual-only triangle-multiplication epilogues, and more same-GPU
+workers have already plateaued for v2.  The
 detailed CUEQ reverse-engineering notes, rejected cuBLAS/CUTLASS grouped
 screens, and the proposed first fused CuTe boundary are in
 [docs/perf/inference_throughput.md](docs/perf/inference_throughput.md#cueq-reverse-engineering-the-native-boundary-worth-targeting).
