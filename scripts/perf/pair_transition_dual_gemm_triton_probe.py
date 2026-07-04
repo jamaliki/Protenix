@@ -32,16 +32,12 @@ from protenix.model.modules.primitives import Transition
 TensorFn = Callable[[], torch.Tensor]
 Config = tuple[int, int, int, int, int]
 DEFAULT_CONFIGS: list[Config] = [
-    (32, 64, 64, 4, 4),
-    (32, 128, 64, 4, 4),
-    (64, 64, 64, 4, 4),
-    (64, 128, 64, 4, 4),
-    (128, 64, 64, 4, 4),
-    (128, 128, 64, 4, 4),
-    (64, 256, 64, 8, 4),
-    (128, 256, 64, 8, 4),
+    (16, 64, 64, 4, 3),
+    (32, 64, 64, 4, 3),
+    (32, 128, 64, 4, 3),
+    (64, 64, 64, 4, 3),
+    (64, 128, 64, 4, 3),
     (64, 128, 128, 4, 3),
-    (128, 128, 128, 4, 3),
 ]
 
 
@@ -239,11 +235,15 @@ def main() -> None:
         best_name, best_config, best_ms, best_hidden = "", configs[0], float("inf"), None
         for config in configs:
             name = config_name(config)
-            out, ms = time_cuda(
-                lambda cfg=config: dual_gemm_hidden(y, wa, wb, cfg),
-                args.warmup,
-                args.iters,
-            )
+            try:
+                out, ms = time_cuda(
+                    lambda cfg=config: dual_gemm_hidden(y, wa, wb, cfg),
+                    args.warmup,
+                    args.iters,
+                )
+            except Exception as exc:
+                rows[name] = {"error": f"{type(exc).__name__}: {exc}"}
+                continue
             rows[name] = {
                 "ms": ms,
                 "speedup_vs_two_gemm": ref_ms / ms,
