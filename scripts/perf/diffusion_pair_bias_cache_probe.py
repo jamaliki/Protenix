@@ -317,6 +317,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--c-s", type=int, default=384)
     parser.add_argument("--c-z", type=int, default=128)
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
+    parser.add_argument(
+        "--module-dtype",
+        choices=["fp32", "bf16"],
+        default="fp32",
+        help=(
+            "Store diffusion-transformer parameters in lower precision before "
+            "timing.  This tests whether repeated autocast weight conversion is "
+            "a real bottleneck; it is not a production default by itself."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--profile", action="store_true")
@@ -362,6 +372,8 @@ def main() -> None:
         n_blocks=args.blocks,
         n_heads=args.heads,
     ).cuda().eval()
+    if args.module_dtype == "bf16":
+        model.to(dtype=torch.bfloat16)
     inputs = _make_inputs(args)
 
     def eager() -> torch.Tensor:

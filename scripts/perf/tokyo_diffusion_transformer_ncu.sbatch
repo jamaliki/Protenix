@@ -44,6 +44,7 @@ C_A=${C_A:-768}
 C_S=${C_S:-384}
 C_Z=${C_Z:-128}
 DTYPE=${DTYPE:-bf16}
+MODULE_DTYPE=${MODULE_DTYPE:-fp32}
 CAPTURE=${CAPTURE:-cached_bias_reuse}
 WARMUP=${WARMUP:-3}
 NCU_ITERS=${NCU_ITERS:-1}
@@ -88,7 +89,7 @@ echo "repo=$(pwd) branch=$(git rev-parse --abbrev-ref HEAD) commit=$(git rev-par
 echo "python=$("$PY" --version 2>&1)"
 echo "cc=$CC"
 echo "ncu=$("$NCU" --version | head -5 | tr '\n' '; ')"
-echo "capture=$CAPTURE batch=$BATCH samples=$SAMPLES tokens=$TOKENS ncu_set=$NCU_SET ncu_metrics=${NCU_METRICS:-<set>}"
+echo "capture=$CAPTURE batch=$BATCH samples=$SAMPLES tokens=$TOKENS dtype=$DTYPE module_dtype=$MODULE_DTYPE ncu_set=$NCU_SET ncu_metrics=${NCU_METRICS:-<set>}"
 nvidia-smi
 
 NCU_ARGS=(
@@ -116,6 +117,7 @@ fi
     --c-s "$C_S" \
     --c-z "$C_Z" \
     --dtype "$DTYPE" \
+    --module-dtype "$MODULE_DTYPE" \
     --warmup "$WARMUP" \
     --ncu-capture "$CAPTURE" \
     --ncu-iters "$NCU_ITERS" \
