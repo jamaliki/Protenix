@@ -4379,6 +4379,32 @@ short-term implementation ladder is:
    shape guards or an internal scheduler that leaves short buckets on the
    current CUEQ path.
 
+   Varlen Triton attention follow-up: commits `a293063`, `9411614`,
+   `19911b2`, and `99de143` added
+   `scripts/perf/triangle_attention_varlen_triton_probe.py`.  This is a
+   benchmark-only one-launch descriptor scheduler for Protenix-v2 starting-node
+   triangle attention.  It keeps the real LayerNorm/projections/output GEMM at
+   the full-boundary gate, but replaces the padded CUEQ/cuDNN attention core
+   with a Triton mainloop over valid `(batch, row, query_tile)` descriptors.
+   Job `109898`, run
+   `runs/triangle_attention_varlen_epilogue_20260704_185323_99de143`, repeated
+   the short and long Sam-style v2 buckets on one H100 and also tested a fused
+   heads-last gate/flatten epilogue:
+
+   | v2 bucket | padded CUEQ core | best varlen core | CUEQ module | varlen full, generic epilogue | varlen full, fused epilogue | parity vs CUEQ module | decision |
+   | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+   | short `40-124` | 0.745 ms | 0.274 ms (`2.71x`) | 1.524 ms | 1.587 ms (`0.96x`) | 1.504 ms (`1.013x`) | max `0.00098`, mean `3.7e-5` | benchmark win only |
+   | long `136-220` | 3.260 ms | 1.775 ms (`1.84x`) | 5.660 ms | 5.674 ms (`0.997x`) | 5.407 ms (`1.047x`) | max `0.00098`, mean `2.8e-5` | benchmark win only |
+
+   The result is sharper than the Python-island screen.  The custom attention
+   mainloop has real valid-work headroom, but most of that win is consumed by
+   the producer/output boundary unless the epilogue is also fused.  Even then,
+   the integrated module win is only about `1%` on the short bucket and `5%` on
+   the long bucket.  Do not promote this as a production path yet.  The next
+   legitimate step would be a guarded starting+ending triangle-attention
+   implementation followed by the actual v2 `PairformerBlock` and full
+   Sam-style `N_sample=1/5` gates; otherwise the safe decision is to keep CUEQ.
+
    Fused producer follow-up: commits `9b238f1`, `9ba65f4`, `4660f23`,
    `9b58fc6`, and `a22eec7` tested the next larger triangle-multiplication
    boundary: fuse input LayerNorm with the dual input gated GEMM and write
@@ -4656,6 +4682,11 @@ Profiling and reproducibility helpers:
   islands.  It preserves CUEQ/cuDNN attention and only changes the physical
   grouping, so use it to decide whether a true segmented triangle-attention
   kernel has enough headroom before writing one.
+- `scripts/perf/triangle_attention_varlen_triton_probe.py`: benchmark-only
+  descriptor-scheduled Triton triangle-attention core.  It tests whether
+  skipping padded pair rows/query tiles/key ranges survives the real
+  LayerNorm/projection/epilogue boundary; the current fused-epilogue screen is
+  a small module-level win, not a promoted model path.
 - `scripts/perf/triangle_multiplication_ragged_hotspot.py`: v2 BF16
   CUEQ triangle-multiplication screen for padded versus smaller ragged islands;
   use it to filter segmented-kernel ideas before touching production code.
