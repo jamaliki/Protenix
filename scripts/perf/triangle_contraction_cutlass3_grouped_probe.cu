@@ -21,7 +21,7 @@
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/kernel_hardware_info.h>
 
-namespace {
+namespace protenix_cutlass3_grouped_probe {
 
 using namespace cute;
 
@@ -292,8 +292,9 @@ torch::Tensor run_grouped(torch::Tensor const& lhs, torch::Tensor const& rhs,
   return run_impl<cutlass::layout::ColumnMajor*, cutlass::layout::RowMajor*>(lhs, rhs, lengths);
 }
 
-}  // namespace
+}  // namespace protenix_cutlass3_grouped_probe
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("forward", &run_grouped, "SM90 CUTLASS 3 grouped triangle contraction probe");
+  m.def("forward", &protenix_cutlass3_grouped_probe::run_grouped,
+        "SM90 CUTLASS 3 grouped triangle contraction probe");
 }
