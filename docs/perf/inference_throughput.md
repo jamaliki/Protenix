@@ -3735,6 +3735,40 @@ operational point in one paired allocation:
 | CUDA MPS, `/tmp` socket, LN+q/k/v off | 16 | 6 | 4 | 2560 | 387.19 | 6.612 | same-node control; matches prior B4/16 |
 | CUDA MPS, `/tmp` socket, LN+q/k/v on | 16 | 6 | 4 | 2560 | 380.97 | 6.720 | current best, `1.016x` over control |
 
+LN+q/k/v minimum-row threshold follow-up: the default producer guard only fires
+when `B * N_token^2 >= 100000`.  That is sensible for B16, but under the
+throughput-oriented B4/16 MPS endpoint it means the producer skips mid-sized
+token buckets (`B4,N124` is only 61504 pair rows).  Job `103409`
+(`runs/ln_qkv_b4_threshold_screen_20260704_101053_dd80f99`) screened one
+`PairformerBlock` at B4 over representative token buckets.  Forcing the
+producer on was clearly bad at `N52` (`0.88x` block speed), but helped the
+mid/large buckets (`N100` about `1.05x`, `N124`/`N136` about `1.08-1.12x`,
+and `N172`/`N220` about `1.07-1.12x`).  This made `25000-50000` rows a plausible
+B4/MPS threshold: it avoids the tiny bucket while catching most useful mid-sized
+pairformer work.
+
+The representative MPS gate, job `103448`
+(`runs/mps_b4_lnqkv_minrows_nsample5_20260704_101843_dd80f99`), then tested
+that hypothesis in the actual mixed 40-220-token, `N_sample=5`, `N_step=200`,
+B4/16 workflow:
+
+| mode | wall samples/s | sum predict s | pairformer sum | diffusion sum | decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| default A, 100k rows | 6.698 | 6038.58 | 2529.84 | 3320.69 | control |
+| min rows 25k | 6.731 | 6022.81 | 2511.38 | 3325.74 | tiny win, below promotion threshold |
+| min rows 50k | 6.732 | 6024.68 | 2521.96 | 3316.02 | tiny win, below promotion threshold |
+| default B, 100k rows | 6.712 | 6039.98 | 2530.38 | 3320.93 | control |
+
+Average default throughput was `6.705` generated samples/s, so the lower
+thresholds improved wall throughput by only about `0.4%` and predict time by
+`0.25-0.3%`.  The intended pairformer subtotal did move, especially at 25k
+rows, but the gain is below the repeat-before-promotion threshold and does not
+materially close the remaining `N_sample=5` gap to 10x.  Decision: keep the
+production default at 100k rows.  Advanced users chasing sub-percent B4/MPS
+throughput on this exact shape can try
+`PROTENIX_TRITON_LN_QKV_CUEQ_MIN_ROWS=50000`, but it is not a documented
+default recommendation.
+
 The higher-width follow-up, job `102933`
 (`runs/mps_b4_highwidth_nsample5_20260704_083945_3a5215c`), tested
 `B4/18` at 5% and planned `B4/20` plus `B4/24`.  It was cancelled after
