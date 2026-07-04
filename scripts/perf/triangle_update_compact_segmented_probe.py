@@ -314,7 +314,7 @@ def parse_producers(text: str) -> list[str]:
 
 def parse_contractors(text: str) -> list[str]:
     contractors = [item.strip() for item in text.split(",") if item.strip()]
-    bad = sorted(set(contractors) - {"triton", "exact_group_bmm"})
+    bad = sorted(set(contractors) - {"triton", "exact_group_bmm", "exact_group_matmul_view"})
     if bad:
         raise argparse.ArgumentTypeError(f"unknown contractor(s): {', '.join(bad)}")
     return contractors
@@ -435,6 +435,61 @@ def exact_group_bmm_contract(
     return update
 
 
+def exact_group_matmul_view_contract(
+    ab: torch.Tensor,
+    lengths: list[int],
+    direction: str,
+) -> torch.Tensor:
+    """Contract exact-length groups without materializing ``torch.stack`` inputs.
+
+    This is a benchmark-only halfway house between the current compact ABI and
+    the desired native layout.  The previous exact-group contractor copied every
+    record into a fresh contiguous ``[records * D, N, N]`` buffer before calling
+    ``bmm``.  Here we instead expose each exact-length run as a non-contiguous
+    ``[D, records, N, N]`` view and let PyTorch's batched ``matmul`` consume the
+    strided inputs directly.
+
+    If this wins the long bucket, the immediate problem is materialization.  If
+    it still loses, the fused producer really has to write the grouped layout
+    directly and own the output/residual store as well.
+    """
+
+    spans = make_record_spans(lengths)
+    rows_total = ab.shape[1]
+    update = torch.empty((rows_total, C_Z), device=ab.device, dtype=ab.dtype)
+    for length in sorted(set(lengths)):
+        selected = [offset for offset, item in spans if item == length]
+        group_rows = length * length
+        group_count = len(selected)
+        # The Sam-style screens sort lengths, so same-length records are
+        # contiguous in compact row order.  Keep a guarded fallback so custom
+        # --lengths inputs still produce correct benchmark results.
+        contiguous = all(
+            selected[index] == selected[0] + index * group_rows
+            for index in range(group_count)
+        )
+        if not contiguous:
+            return exact_group_bmm_contract(ab, lengths, direction)
+
+        start = selected[0]
+        end = start + group_count * group_rows
+        lhs = ab[:C_Z, start:end].as_strided(
+            (C_Z, group_count, length, length),
+            (rows_total, group_rows, length, 1),
+        )
+        rhs = ab[C_Z:, start:end].as_strided(
+            (C_Z, group_count, length, length),
+            (rows_total, group_rows, length, 1),
+        )
+        if direction == "outgoing":
+            contracted = torch.matmul(lhs, rhs.transpose(-1, -2))
+        else:
+            contracted = torch.matmul(lhs.transpose(-1, -2), rhs)
+        records = contracted.permute(1, 2, 3, 0).reshape(group_count * group_rows, C_Z)
+        update[start:end] = records
+    return update
+
+
 def segmented_finish(
     module: torch.nn.Module,
     z: torch.Tensor,
@@ -518,6 +573,39 @@ def segmented_finish_exact_group_bmm(
     return out
 
 
+def segmented_finish_exact_group_matmul_view(
+    module: torch.nn.Module,
+    z: torch.Tensor,
+    x_norm: torch.Tensor,
+    ab: torch.Tensor,
+    dense_offsets: torch.Tensor,
+    lengths: list[int],
+    direction: str,
+    weights: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    update = exact_group_matmul_view_contract(ab, lengths, direction)
+    update_norm = layer_norm_transpose(
+        update,
+        module.layer_norm_out.weight,
+        module.layer_norm_out.bias,
+        eps=1e-5,
+        layout="nd->nd",
+    )
+    compact_delta = fused_sigmoid_gated_dual_gemm_dual_x(
+        x_norm,
+        update_norm,
+        weights["g_out"],
+        weights["p_out"],
+    )
+    out = torch.empty_like(z)
+    rows = dense_offsets.numel()
+    scatter_grid = (triton.cdiv(rows, 16), triton.cdiv(C_Z, 64))
+    _scatter_residual_kernel[scatter_grid](
+        compact_delta, z, dense_offsets, out, rows, C_Z, 16, 64, num_warps=4
+    )
+    return out
+
+
 def triton_producer_update(
     module: torch.nn.Module,
     z: torch.Tensor,
@@ -560,6 +648,10 @@ def triton_producer_update(
         return segmented_finish_exact_group_bmm(
             module, z, x_norm, ab, dense_offsets, lengths, direction, weights
         )
+    if contractor == "exact_group_matmul_view":
+        return segmented_finish_exact_group_matmul_view(
+            module, z, x_norm, ab, dense_offsets, lengths, direction, weights
+        )
     return segmented_finish(module, z, x_norm, ab, dense_offsets, descriptors, config, direction, weights)
 
 
@@ -594,6 +686,10 @@ def cueq_producer_update(
     )
     if contractor == "exact_group_bmm":
         return segmented_finish_exact_group_bmm(
+            module, z, x_norm, ab, dense_offsets, lengths, direction, weights
+        )
+    if contractor == "exact_group_matmul_view":
+        return segmented_finish_exact_group_matmul_view(
             module, z, x_norm, ab, dense_offsets, lengths, direction, weights
         )
     return segmented_finish(module, z, x_norm, ab, dense_offsets, descriptors, config, direction, weights)
@@ -692,7 +788,7 @@ def main() -> None:
                     label = (
                         config.label()
                         if contractor == "triton"
-                        else f"exact_group_bmm_from_{config.label()}_producer"
+                        else f"{contractor}_from_{config.label()}_producer"
                     )
                     candidate, ms = cuda_time(
                         lambda update_fn=update_fn, config=config, dense_offsets=dense_offsets, descriptors=descriptors, contractor=contractor: update_fn(

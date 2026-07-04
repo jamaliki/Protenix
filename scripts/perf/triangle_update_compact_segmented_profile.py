@@ -92,12 +92,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--producer", choices=["triton", "cueq"], default="triton")
     parser.add_argument(
         "--contractor",
-        choices=["triton", "exact_group_bmm"],
+        choices=["triton", "exact_group_bmm", "exact_group_matmul_view"],
         default="triton",
         help=(
-            "Contraction backend inside the compact update. Use "
-            "'exact_group_bmm' to profile the optimistic exact-length bmm "
-            "bridge from the full-update screen."
+            "Contraction backend inside the compact update. The exact-group "
+            "choices profile optimistic exact-length bridges before a native "
+            "producer-owned layout exists."
         ),
     )
     parser.add_argument(
