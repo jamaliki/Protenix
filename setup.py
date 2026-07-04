@@ -64,7 +64,10 @@ setup(
     ),
     include_package_data=True,
     package_data={
-        "protenix": ["model/layer_norm/kernel/*"],
+        "protenix": [
+            "model/layer_norm/kernel/*",
+            "model/triangular/cueq_h100_cache/*.json",
+        ],
     },
     install_requires=install_requires,
     license="Apache 2.0 License",

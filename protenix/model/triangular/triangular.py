@@ -26,6 +26,12 @@ from protenix.model.modules.fused_elementwise_triton import (
     triton_sigmoid_mul_heads_first,
     triton_sigmoid_mul_heads_first_swapped_gate,
 )
+from protenix.model.triangular.cueq_triton_cache import (
+    configure_cueq_h100_triton_cache,
+)
+
+configure_cueq_h100_triton_cache()
+
 from protenix.model.triangular.layers import (
     Attention,
     LayerNorm,
