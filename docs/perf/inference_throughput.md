@@ -4107,6 +4107,28 @@ short bucket needs the CUEQ fused LayerNorm/GatedGEMM path even though its
 records contain many sub-100-token proteins; using the physical `N=124` PyTorch
 fallback doubles the triangle-multiplication time.
 
+The row-wise compaction bridge was screened next.  Commit `5425d80` added
+`scripts/perf/triangle_multiplication_compact_rows_probe.py`, which compacts
+only valid pair rows for input LayerNorm/GatedGEMM and output
+LayerNorm/GatedGEMM, but still scatters dense `a/b` tensors to feed the existing
+`einsum` contraction.  Job `109469`, run
+`runs/triangle_mul_compact_rows_20260704_163823_5425d80`, found:
+
+| bucket / direction | padded CUEQ | compact valid-only | compact round-trip | decision |
+| --- | ---: | ---: | ---: | --- |
+| short outgoing | 2.581 ms | 3.615 ms (`0.71x`) | 3.821 ms (`0.68x`) | reject |
+| short incoming | 2.525 ms | 3.579 ms (`0.71x`) | 3.791 ms (`0.67x`) | reject |
+| long outgoing | 4.560 ms | 16.519 ms (`0.28x`) | 17.499 ms (`0.26x`) | reject |
+| long incoming | 4.478 ms | 16.412 ms (`0.27x`) | 17.412 ms (`0.26x`) | reject |
+
+The compact outputs match padded CUEQ on valid rows at BF16 noise levels
+(`max_abs <= 0.015625`), so this is also a clean economics result.  The failure
+is the bridge: gathering valid rows, scattering `a/b` back to dense
+`[D,B,N,N]`, and permuting the dense contraction output overwhelms the saved
+row-wise padded work.  Therefore a real native segmented update must keep the
+schedule segmented through the contraction and output epilogue; a Protenix-side
+compact/dense/compact adapter is not the path.
+
 The first attractive CuTe/CUDA target is therefore not "rewrite the whole
 pairformer".  It is a segmented triangle-multiplication update that keeps one
 large launch family while taking a `lengths: int32[B]` vector:
@@ -4312,6 +4334,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Full-block ragged pairformer islands | two split buckets improved the long `136-220` block `1.15x`, but slowed the short `40-124` block to `0.66x`; exact-length groups and singletons were much slower | launch count and lost batching eat the padding savings unless the ragged schedule is a real one-launch/vendor-quality kernel |
 | Bool masks for CUEQ triangle multiplication | block screen was flat at `N=124` and only +0.5% at `N=220` | mask dtype plumbing is not a meaningful bottleneck after triangle-attention bool-mask cleanup |
 | Raising CUEQ triangle-multiplication PyTorch fallback threshold for v2 | forcing the `N=124` bucket through the PyTorch fallback doubled triangle-mul time (`5.04 -> 10.04 ms`) and slowed the block (`10.67 -> 15.69 ms`); `N=220` was unchanged | the short physical bucket still needs CUEQ's fused LayerNorm/GatedGEMM path; fallback thresholds are not the ragged-v2 fix |
+| Compact valid-row triangle-multiplication bridge | valid-only compact row work was slower than padded CUEQ (`0.70x` short, `0.27x` long), and scattering back to padded layout was worse | do not bridge compact row-wise work through dense `a/b` tensors; a real segmented native update must stay segmented through contraction and output |
 | Materializing pairformer token-attention bias as contiguous `[B, H, Q, K]` | traced pairformer SDPA shape `[16, 16, 124, 24]` moved from math-dispatch attempt to a cuDNN frontend "no valid execution plans" error; fallback timing then segfaulted in the isolated screen | the non-contiguous bias layout is not the only blocker; head_dim 24 plus dense additive bias lacks a safe cuDNN plan in this runtime, so do not pay a bias copy hoping for a backend flip |
 | CUEQ `attention_pair_bias` for diffusion token attention | native pair-bias projection needed an explicit zero LayerNorm bias, then CUEQ's internal SDPA failed with `No valid execution plans built`; forced PyTorch fallback was slower than the current full conv2d+SDPA baseline | CUEQ's wrapper is not a drop-in win here; use it only if we can call a narrower fused pair-bias producer while keeping Protenix's SDPA fallback policy |
 | Compact rank-5 diffusion pair-bias cache | stored `5x` less cached bias, but the hybrid flattened-GEMM/rank-5-SDPA screen was slower than the current expanded rank-4 cache (`29.82 -> 35.05 ms` at `N=124`, `64.06 -> 69.85 ms` at `N=220`) | memory footprint is not the active limiter; preserve the faster cuDNN rank-4 SDPA schedule unless a future workload becomes memory-bound |
@@ -4448,6 +4471,11 @@ Profiling and reproducibility helpers:
   writes zero invalid regions in one launch, but is still much slower than dense
   `einsum`; use it as evidence that a non-vendor standalone contraction
   mainloop is the wrong boundary.
+- `scripts/perf/triangle_multiplication_compact_rows_probe.py`: compact
+  valid-row triangle-multiplication bridge.  It proves that gathering valid
+  rows and scattering dense `a/b` tensors around the existing contraction is
+  slower than padded CUEQ; a real segmented update has to keep the native
+  schedule segmented through contraction and epilogue.
 - `scripts/perf/submit_tokyo_triangle_attention_ncu.sh` and
   `scripts/perf/tokyo_triangle_attention_ncu.sbatch`: Tokyo one-H100 Nsight
   Compute capture for one starting or ending CUEQ triangle-attention module.
