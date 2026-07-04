@@ -252,6 +252,38 @@ def _profile_rows(fn: TensorFn, warmup: int, limit: int) -> list[dict[str, Any]]
     return rows[:limit]
 
 
+def _cuda_profile_capture(
+    name: str,
+    fn: TensorFn,
+    warmup: int,
+    iters: int,
+) -> torch.Tensor:
+    """Capture one warmed target region for Nsight Compute.
+
+    Nsight Compute is launched with ``--profile-from-start off``.  The CUDA
+    profiler APIs below then bracket only the already-warm transformer variant
+    we care about, so import time, module construction, Triton/autotune setup,
+    and pair-bias precomputation do not pollute the launch list.  This is the
+    difference between a useful kernel-boundary profile and a report dominated
+    by setup noise.
+    """
+
+    with torch.inference_mode():
+        out = fn()
+        for _ in range(warmup):
+            out = fn()
+        torch.cuda.synchronize()
+
+        torch.cuda.nvtx.range_push(name)
+        torch.cuda.cudart().cudaProfilerStart()
+        for _ in range(iters):
+            out = fn()
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+        torch.cuda.nvtx.range_pop()
+    return out
+
+
 def _case(
     name: str,
     fn: TensorFn,
@@ -289,6 +321,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-top", type=int, default=12)
+    parser.add_argument(
+        "--ncu-capture",
+        choices=[
+            "none",
+            "eager",
+            "cached_bias_reuse",
+            "cached_compact_bias_rank5_sdpa_reuse",
+            "cached_bias_rebuild_each_call",
+        ],
+        default="none",
+        help=(
+            "Run only one warmed CUDA-profiler capture for Nsight Compute. "
+            "Use with ncu --profile-from-start off."
+        ),
+    )
+    parser.add_argument(
+        "--ncu-iters",
+        type=int,
+        default=1,
+        help="Target calls inside the CUDA-profiler capture range.",
+    )
     parser.add_argument("--seed", type=int, default=123)
     return parser.parse_args()
 
@@ -363,6 +416,41 @@ def main() -> None:
             return _cached_transformer_compact_bias(
                 model, inputs["a"], inputs["s"], compact_biases, args.samples
             )
+
+    if args.ncu_capture != "none":
+        capture_fns: dict[str, TensorFn] = {
+            "eager": eager,
+            "cached_bias_reuse": cached_reuse,
+            "cached_compact_bias_rank5_sdpa_reuse": cached_compact_reuse,
+            "cached_bias_rebuild_each_call": cached_rebuild,
+        }
+        out = _cuda_profile_capture(
+            f"diffusion_transformer:{args.ncu_capture}",
+            capture_fns[args.ncu_capture],
+            args.warmup,
+            args.ncu_iters,
+        )
+        print(
+            json.dumps(
+                {
+                    "args": vars(args),
+                    "device": torch.cuda.get_device_name(),
+                    "torch_version": torch.__version__,
+                    "cuda_version": torch.version.cuda,
+                    "capture": args.ncu_capture,
+                    "out_shape": list(out.shape),
+                    "out_dtype": str(out.dtype),
+                    "out_all_finite": bool(torch.isfinite(out).all().item()),
+                    "cached_bias_mib": cached_bytes / 2**20,
+                    "compact_cached_bias_mib": compact_cached_bytes / 2**20,
+                    "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
+                    "peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
 
     cases = [
         {
