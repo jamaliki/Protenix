@@ -312,17 +312,7 @@ def main() -> None:
     ref, torch_ms = cuda_time(lambda: torch_contract(lhs, rhs, args.direction), **timing)
     candidates = {}
     for config in args.configs:
-        candidate, ms = cuda_time(
-            lambda config=config: triton_contract(
-                lhs,
-                rhs,
-                lengths_tensor,
-                args.direction,
-                config,
-            ),
-            **timing,
-        )
-        candidates[config.label()] = {
+        row = {
             "config": {
                 "block_m": config.block_m,
                 "block_n": config.block_n,
@@ -331,12 +321,34 @@ def main() -> None:
                 "num_warps": config.num_warps,
                 "num_stages": config.num_stages,
             },
-            "ms": ms,
-            "logical_tflops_exact": tflops(args.features, exact_work, ms),
-            "speedup_vs_dense_torch": torch_ms / ms,
-            "parity": valid_error(ref, candidate, lengths),
-            "invalid_abs_sum": invalid_abs_sum(candidate, lengths),
         }
+        try:
+            candidate, ms = cuda_time(
+                lambda config=config: triton_contract(
+                    lhs,
+                    rhs,
+                    lengths_tensor,
+                    args.direction,
+                    config,
+                ),
+                **timing,
+            )
+        except Exception as exc:  # pragma: no cover - diagnostic path.
+            # Triton config exploration should be failure-tolerant: an illegal
+            # tile is evidence, not a reason to lose all other timings from the
+            # same queued H100 job.
+            row["error"] = repr(exc)
+        else:
+            row.update(
+                {
+                    "ms": ms,
+                    "logical_tflops_exact": tflops(args.features, exact_work, ms),
+                    "speedup_vs_dense_torch": torch_ms / ms,
+                    "parity": valid_error(ref, candidate, lengths),
+                    "invalid_abs_sum": invalid_abs_sum(candidate, lengths),
+                }
+            )
+        candidates[config.label()] = row
 
     result = {
         "args": {
