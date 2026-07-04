@@ -251,6 +251,16 @@ gate then moved `N_sample=5` predict time only `1.009x` and showed almost no
 mechanistic `N_sample=1` pairformer movement, so this remains a
 kernel-learning/benchmarking knob, not a normal Sam-style v2 speed preset.
 
+A more aggressive compact segmented triangle-multiplication update was also
+tested as a full `PairformerBlock` replacement.  Its isolated short-bucket
+triangle-update screen looked promising, but after the real block paid the
+pack/scatter, invalid-row zeroing, attention, transition, and token paths, the
+short 40-124-token bucket slowed from `10.24 ms` to `27.14 ms`; the long
+136-220-token bucket slowed from `25.79 ms` to `123.76 ms`.  Do not enable or
+port that compact bridge as a production setting.  The remaining v2 kernel work
+needs a vendor-quality SM90/CuTe segmented triangle mainloop that owns the
+fusion boundary instead of wrapping CUEQ with slower compact staging kernels.
+
 For normal multi-step inference, the diffusion transformer also caches the
 step-invariant token pair-attention bias once per block.  This spends a few GiB
 on long mixed batches, but removes repeated pair-bias projection and sample-lane
@@ -403,8 +413,10 @@ mixed-token trunk buckets (`B16/N124` and `B16/N220`, `c_z=256`,
 the long bucket spends about 46% of one block in triangle attention, 29% in
 triangle multiplication, and 21% in the pair transition.  The two sorted
 buckets are only about 67% pair-token efficient overall, so the next large
-kernel opportunity is a true ragged/segmented triangle-multiplication update
-that avoids padded pair work while keeping CUEQ/cuDNN-class mainloops.
+kernel opportunity is still a true ragged/segmented triangle-multiplication
+update, but the latest compact-bridge screen shows the bar: it must avoid padded
+pair work while keeping CUEQ/cuDNN-class mainloops and avoiding extra
+pack/scatter staging.
 Triangle-attention varlen wrappers have now been tested at the full-block level
 and were slower once both orientations were wired fairly.  Small queue buckets,
 pair-transition-only compaction, residual-only triangle-multiplication

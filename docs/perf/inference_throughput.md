@@ -4717,9 +4717,9 @@ short-term implementation ladder is:
    explanation "the hand-written input producer is the only problem"; the long
    bucket remains about `0.3x` with either producer.  Do not promote this path as
    a general v2 default.  The remaining long-bucket path needs a vendor-class
-   SM90/CuTe compact contraction/update mainloop, or a narrow shape-guarded
-   short-bucket integration whose full-block and end-to-end dilution is measured
-   honestly.
+   SM90/CuTe compact contraction/update mainloop; the possible short-bucket
+   escape hatch still had to pass a full-block gate before it could become more
+   than a learning benchmark.
 
    Launch-level profiler follow-up: commit `a08d4e3` added
    `scripts/perf/triangle_update_compact_segmented_profile.py`, and job `109960`
@@ -4736,10 +4736,33 @@ short-term implementation ladder is:
    Python orchestration overhead.  The custom compact contraction is an order of
    magnitude slower than CUEQ/PyTorch's dense vendor schedule (`9.7 ms` versus
    `0.82 ms` for the triangular product), and the dense-ABI pack/scatter bridge
-   adds another `~2.7 ms` when using the compact CUEQ producer.  A next attempt
-   must either replace `_compact_contract_kernel` with a true SM90/CuTe
-   vendor-class mainloop and fuse away pack/scatter, or abandon the long-bucket
-   compact-update path and only consider a guarded short-bucket optimization.
+   adds another `~2.7 ms` when using the compact CUEQ producer.  This narrowed
+   the remaining question to either replacing `_compact_contract_kernel` with a
+   true SM90/CuTe vendor-class mainloop that fuses away pack/scatter, or proving
+   that a guarded short-bucket-only version survived full-block dilution.
+
+   Full `PairformerBlock` gate: commit `439c74a` added
+   `scripts/perf/pairformer_compact_segmented_triangle_update_probe.py`, and job
+   `109963` ran it in
+   `runs/pairformer_compact_segmented_triupdate_439c74a_20260704_211932`.  This
+   benchmark replaces both outgoing and incoming triangle-multiplication updates
+   inside a complete v2 block, keeps the dense block ABI, and explicitly zeroes
+   invalid pair rows after each compact update before later attention,
+   transition, and token paths can read them.
+
+   | v2 bucket | baseline block | compact update, Triton producer | compact update, CUEQ producer | valid-region parity | decision |
+   | --- | ---: | ---: | ---: | --- | --- |
+   | short `40-124` | `10.237 ms` | `27.144 ms` (`0.38x`) | `27.818 ms` (`0.37x`) | `z` max `0.0625`, mean `0.0017-0.0023`; `s` max `0.03125-0.0625` | reject |
+   | long `136-220` | `25.791 ms` | `123.764 ms` (`0.21x`) | `125.786 ms` (`0.21x`) | `z` max `0.0625-0.078125`, mean `0.0018-0.0024`; `s` max `0.03125-0.0625` | reject |
+
+   This closes the guarded short-bucket escape hatch for the current compact
+   bridge.  The isolated triangle-update win was real on a narrow boundary, but
+   the full block pays too much for compact staging, scatter/residual stores,
+   invalid-row zeroing, and the slower custom contraction schedule.  The next
+   serious Protenix-v2 attempt should not be another dense-ABI compact wrapper;
+   it needs a native segmented/CuTe triangle update that keeps the contraction
+   schedule vendor-class and eliminates the bridge costs.
+
 3. **Segmented triangle attention:** only after the multiplication schedule is
    credible, attempt grouped/segmented attention that preserves cuDNN/CUEQ-class
    softmax throughput.  This is harder because the current fast path's native
@@ -4786,6 +4809,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Bool masks for CUEQ triangle multiplication | block screen was flat at `N=124` and only +0.5% at `N=220` | mask dtype plumbing is not a meaningful bottleneck after triangle-attention bool-mask cleanup |
 | Raising CUEQ triangle-multiplication PyTorch fallback threshold for v2 | forcing the `N=124` bucket through the PyTorch fallback doubled triangle-mul time (`5.04 -> 10.04 ms`) and slowed the block (`10.67 -> 15.69 ms`); `N=220` was unchanged | the short physical bucket still needs CUEQ's fused LayerNorm/GatedGEMM path; fallback thresholds are not the ragged-v2 fix |
 | Compact valid-row triangle-multiplication bridge | valid-only compact row work was slower than padded CUEQ (`0.70x` short, `0.27x` long), and scattering back to padded layout was worse | do not bridge compact row-wise work through dense `a/b` tensors; a real segmented native update must stay segmented through contraction and output |
+| Compact segmented triangle-multiplication update inside a full v2 `PairformerBlock` | isolated short-bucket update improved, but the full block slowed badly: short `10.237 -> 27.144 ms` best (`0.38x`), long `25.791 -> 123.764 ms` best (`0.21x`) | the dense-ABI compact bridge pays too much pack/scatter, invalid-row zeroing, and custom-contraction cost; the next attempt needs a native vendor-quality CuTe/SM90 segmented update |
 | Unguarded fused triangle-multiplication input LayerNorm + dual-GEMM producer | short v2 blocks improved about `1.08x`, but long `B16/N220` blocks slowed to `0.94x`; the path is now default-off and guarded to <=300k physical pair rows | local producer fusion can be shape-specific; do not enable it globally for Sam-style v2 campaigns unless the long bucket is protected by fallback |
 | Materializing pairformer token-attention bias as contiguous `[B, H, Q, K]` | traced pairformer SDPA shape `[16, 16, 124, 24]` moved from math-dispatch attempt to a cuDNN frontend "no valid execution plans" error; fallback timing then segfaulted in the isolated screen | the non-contiguous bias layout is not the only blocker; head_dim 24 plus dense additive bias lacks a safe cuDNN plan in this runtime, so do not pay a bias copy hoping for a backend flip |
 | CUEQ `attention_pair_bias` for diffusion token attention | native pair-bias projection needed an explicit zero LayerNorm bias, then CUEQ's internal SDPA failed with `No valid execution plans built`; forced PyTorch fallback was slower than the current full conv2d+SDPA baseline | CUEQ's wrapper is not a drop-in win here; use it only if we can call a narrower fused pair-bias producer while keeping Protenix's SDPA fallback policy |
@@ -4939,6 +4963,12 @@ Profiling and reproducibility helpers:
   for the compact segmented update screen.  Use it when a timing result needs
   launch-level attribution, especially to separate producer, contraction,
   output-gate, pack, and scatter costs.
+- `scripts/perf/pairformer_compact_segmented_triangle_update_probe.py`: full
+  v2 `PairformerBlock` gate for the compact segmented triangle-update idea.  It
+  replaces both triangle-multiplication updates, zeroes invalid pair rows before
+  downstream consumers, and answers whether an isolated update-boundary win
+  survives attention/transition/token dilution.  Current result: rejected
+  (`0.37-0.38x` short bucket, `0.21x` long bucket).
 - `scripts/perf/triangle_contraction_cutlass_probe.py` and
   `scripts/perf/triangle_contraction_cutlass_probe_sm90.cu`: first native
   CUTLASS/CuTe screen for the triangle-multiplication contraction core.  This is
@@ -5025,9 +5055,11 @@ Do not expect another large gain from config changes.  For the current
 Sam-style Protenix-v2 target, the next proper same-output campaign should be
 one of:
 
-1. a true one-launch segmented/CuTe boundary for pairformer triangle attention
-   or triangle multiplication that avoids padded pair work without fragmenting
-   the block into many CUEQ calls;
+1. a true one-launch segmented/CuTe boundary for pairformer triangle
+   multiplication first, not another dense-ABI compact bridge.  It must avoid
+   padded pair work, preserve a CUEQ-class contraction/update mainloop, and fuse
+   away pack/scatter/invalid-row materialization costs before attention is worth
+   revisiting;
 2. a vendor-quality fused LayerNorm/projection producer around CUEQ triangle
    attention that preserves the cuDNN SDPA mainloop;
 3. only after those, a deliberate atom/diffusion kernel-layout rewrite for the
