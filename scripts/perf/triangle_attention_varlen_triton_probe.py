@@ -341,6 +341,42 @@ def triton_varlen_core(
     return out
 
 
+def cueq_module_forward(
+    module: TriangleAttention,
+    z: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    return module(z, mask=mask, triangle_attention="cuequivariance")
+
+
+def triton_varlen_module_forward(
+    module: TriangleAttention,
+    z: torch.Tensor,
+    mask: torch.Tensor,
+    lengths: torch.Tensor,
+    descriptors: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    block_m: int,
+    block_n: int,
+    warps: int,
+    scale: float,
+) -> torch.Tensor:
+    # This intentionally pays the surrounding producer/consumer costs.  The
+    # core screen above answers whether the attention mainloop has promise; this
+    # boundary asks whether that promise survives the real module plumbing.
+    tensors = prepare_attention_tensors(module, z, mask)
+    heads_last = triton_varlen_core(
+        tensors,
+        lengths,
+        descriptors,
+        block_m=block_m,
+        block_n=block_n,
+        warps=warps,
+        scale=scale,
+    )
+    return module.mha._wrap_up(heads_last, tensors["x_norm"])
+
+
 def flatten_valid_core(
     tensor: torch.Tensor,
     lengths: list[int],
@@ -351,6 +387,16 @@ def flatten_valid_core(
     return torch.cat(chunks, dim=0)
 
 
+def flatten_valid_pair(
+    tensor: torch.Tensor,
+    lengths: list[int],
+) -> torch.Tensor:
+    chunks = []
+    for row, length in zip(tensor, lengths, strict=True):
+        chunks.append(row[:length, :length].reshape(-1, row.shape[-1]))
+    return torch.cat(chunks, dim=0)
+
+
 def compare_valid(
     reference: torch.Tensor,
     candidate: torch.Tensor,
@@ -358,6 +404,22 @@ def compare_valid(
 ) -> dict[str, float | int]:
     ref = flatten_valid_core(reference, lengths)
     cand = flatten_valid_core(candidate, lengths)
+    diff = (cand.float() - ref.float()).abs()
+    finite = diff[torch.isfinite(diff)]
+    return {
+        "max_abs": float(finite.max().item()) if finite.numel() else float("nan"),
+        "mean_abs": float(finite.mean().item()) if finite.numel() else float("nan"),
+        "nan_count": int(torch.isnan(diff).sum().item()),
+    }
+
+
+def compare_valid_pair(
+    reference: torch.Tensor,
+    candidate: torch.Tensor,
+    lengths: list[int],
+) -> dict[str, float | int]:
+    ref = flatten_valid_pair(reference, lengths)
+    cand = flatten_valid_pair(candidate, lengths)
     diff = (cand.float() - ref.float()).abs()
     finite = diff[torch.isfinite(diff)]
     return {
@@ -426,6 +488,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument(
+        "--skip-full-boundary",
+        action="store_true",
+        help="Only time the precomputed q/k/v/bias attention core.",
+    )
     parser.add_argument("--seed", type=int, default=123)
     return parser.parse_args()
 
@@ -452,6 +519,14 @@ def main() -> None:
             args.warmup,
             args.iters,
         )
+        full_reference = None
+        full_cueq_timing = None
+        if not args.skip_full_boundary:
+            full_reference, full_cueq_timing = cuda_time(
+                lambda: cueq_module_forward(module, z, mask),
+                args.warmup,
+                args.iters,
+            )
 
         candidates = []
         for block_m, block_n, warps in args.tiles:
@@ -473,32 +548,68 @@ def main() -> None:
                 args.warmup,
                 args.iters,
             )
-            candidates.append(
-                {
-                    "tile": f"{block_m}x{block_n}x{warps}",
-                    "timing": timing,
-                    "speedup_vs_cueq_core": cueq_timing["ms"] / timing["ms"],
-                    "parity_vs_cueq_valid": compare_valid(
-                        reference,
-                        candidate,
+            row = {
+                "tile": f"{block_m}x{block_n}x{warps}",
+                "timing": timing,
+                "speedup_vs_cueq_core": cueq_timing["ms"] / timing["ms"],
+                "parity_vs_cueq_valid": compare_valid(
+                    reference,
+                    candidate,
+                    args.lengths,
+                ),
+                "descriptors": {
+                    "count": int(descriptors[0].numel()),
+                    **work_stats(args.lengths, block_m),
+                },
+            }
+            if full_reference is not None and full_cueq_timing is not None:
+                full_candidate, full_timing = cuda_time(
+                    lambda descriptors=descriptors, block_m=block_m, block_n=block_n, warps=warps: triton_varlen_module_forward(
+                        module,
+                        z,
+                        mask,
+                        lengths_tensor,
+                        descriptors,
+                        block_m=block_m,
+                        block_n=block_n,
+                        warps=warps,
+                        scale=scale,
+                    ),
+                    args.warmup,
+                    args.iters,
+                )
+                row["full_boundary"] = {
+                    "timing": full_timing,
+                    "speedup_vs_cueq_module": full_cueq_timing["ms"]
+                    / full_timing["ms"],
+                    "parity_vs_cueq_valid": compare_valid_pair(
+                        full_reference,
+                        full_candidate,
                         args.lengths,
                     ),
-                    "descriptors": {
-                        "count": int(descriptors[0].numel()),
-                        **work_stats(args.lengths, block_m),
-                    },
                 }
-            )
+            candidates.append(row)
 
     best = max(candidates, key=lambda row: row["speedup_vs_cueq_core"])
+    full_candidates = [row for row in candidates if "full_boundary" in row]
+    best_full = (
+        max(
+            full_candidates,
+            key=lambda row: row["full_boundary"]["speedup_vs_cueq_module"],
+        )
+        if full_candidates
+        else None
+    )
     print(
         json.dumps(
             {
                 "args": {**vars(args), "lengths": args.lengths},
                 "fixed_dtype": str(DTYPE),
                 "cueq_core": cueq_timing,
+                "cueq_module": full_cueq_timing,
                 "candidates": candidates,
                 "best": best,
+                "best_full_boundary": best_full,
                 "device": torch.cuda.get_device_name(),
                 "torch": {"version": torch.__version__, "cuda": torch.version.cuda},
                 "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
