@@ -3920,18 +3920,24 @@ Interpretation:
   isolation and contention cap the win quickly.
 - CUDA MPS materially improves overlap across independent workers.  Adding
   `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` helps once there are enough workers.  For
-  `N_sample=1`, treat **five MPS workers per H100 at 20% each** as the
-  practical knee.  For maximum `N_sample=5` aggregate throughput, the best
-  measured operational mode is **sixteen B4 workers at 6% each**.
+  base-checkpoint `N_sample=1`, treat **five MPS workers per H100 at 20% each**
+  as the practical knee.  For maximum base-checkpoint `N_sample=5` aggregate
+  throughput, the best measured operational mode is **sixteen B4 workers at 6%
+  each**.  Protenix-v2 has a wider pair representation and needs its own
+  operating point: the best measured v2 `N_sample=5` mode is **eight B8 workers
+  at 12% each**.
 - Compared with the current single-process low-sample rate (`4.18` generated
   samples/s), the B4/sixteen-worker `6.720` generated samples/s result is a
   `1.61x` operational gain.  Compared with the original low-sample branch
   boundary (`0.753` generated samples/s), the measured B4/sixteen-worker MPS
   result is about `8.9x` per-GPU throughput.
-- For `N_sample=1`, current single-process throughput is `0.968` records/s
-  versus the original `0.166` records/s default (`5.83x`).  Five MPS workers at
-  20% raise that to `1.769` records/s, or about `10.7x` over the original
-  default for the many-independent-sequence endpoint.
+- For `N_sample=1`, current base-checkpoint single-process throughput is
+  `0.968` records/s versus the original `0.166` records/s default (`5.83x`).
+  Five MPS workers at 20% raise that to `1.769` records/s, or about `10.7x`
+  over the original default for the many-independent-sequence endpoint.  The
+  corresponding Protenix-v2 MPS gate reached `1.25` records/s, only `1.57x`
+  over the current v2 single-process rate; do not quote the base-checkpoint
+  `10.7x` result as a v2 claim.
 - This is not a substitute for kernel work: each worker individually slows down
   as width increases, and the aggregate curve is already flattening.  The
   `N_sample=1` endpoint now clears the requested `10x` per-GPU target
@@ -3942,6 +3948,30 @@ Interpretation:
 Decision: document and recommend CUDA MPS concurrency for throughput-oriented
 design campaigns with enough independent shards.  Keep the production model
 code unchanged; the benchmark harness remains the reproducibility tool.
+
+Protenix-v2 MPS width gate: job `104161`, run
+`runs/v2_mps_width_nsample5_20260704_135124_402df98`, one H100, 32 mixed
+40-220-token synthetic records per worker, confidence enabled, `N_step=200`,
+`N_sample=5`, commit `402df98` with the rejected compact-pair-transition path
+explicitly disabled.  The Slurm job ended with a non-zero status only because
+the final aggregation snippet forgot to export `RUN_DIR`; all case summaries
+were complete and a top-level `summary.json` was reconstructed from them.
+
+| mode | workers | MPS % | per-worker batch | generated samples | timed wall s | generated samples/s | speedup vs v2 single |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| single process | 1 | none | 16 | 160 | 48.60 | 3.292 | 1.00x |
+| CUDA MPS | 4 | 25 | 16 | 640 | 151.94 | 4.212 | 1.28x |
+| CUDA MPS | 5 | 20 | 16 | 800 | 183.47 | 4.360 | 1.32x |
+| CUDA MPS | 8 | 12 | 8 | 1280 | 276.98 | 4.621 | 1.40x |
+| CUDA MPS | 10 | 10 | 4 | 1600 | 349.62 | 4.576 | 1.39x |
+
+Interpretation: the base-checkpoint high-width MPS result does not transfer to
+Protenix-v2.  V2's wider pairformer creates strong same-GPU contention during
+warmup and in the long token buckets, while timed denoising shifts substantial
+time into diffusion transformer/atom work under many concurrent contexts.
+Operational MPS still helps, but for Sam-style v2 predictions the honest
+headline is `4.62` generated samples/s at B8/8 (`1.40x` over current v2
+single-process), not the base-checkpoint `6.72` generated samples/s result.
 
 ## Negative results worth remembering
 
@@ -3960,6 +3990,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Lowering mixed-token `N_sample=5` batch size from 16 to 8 | current full gate slowed from `3.56` to `3.0-3.1` generated samples/s because diffusion/atom work split into four smaller launch groups | tighter token ranges are useful only if the saved padding beats the lost batching efficiency |
 | Explicit mixed-token bucket sizes `96`, `64`, `48`, and `32` at B16 | all slowed the representative N200 gate; best explicit bucket fell from `3.649` to `3.270` generated samples/s and narrower buckets reached `2.307` generated samples/s | queue bucketing saves some padded pairformer work only by fragmenting diffusion/atom batches; the real solution needs ragged kernels or segmented schedules, not more launch groups |
 | Internal pairformer-only trunk buckets while keeping diffusion B16 | best case `trunk64` improved pairformer `15.736 -> 15.461s`, but diffusion worsened `24.098 -> 24.689s` and throughput fell `3.608 -> 3.575` generated samples/s; narrower trunk buckets were much worse | Python-level sub-batching changes launch/cache balance and is not the segmented-pairformer solution; remove the knob and target true ragged kernels/schedules |
+| Compact pair-transition production path | compacting valid pair rows improved the isolated transition sublayer, but the full v2 PairformerBlock screen moved only `1.02x` on short mixed lengths, `0.99x` on long mixed lengths, and `1.06x` on all mixed lengths | row-wise compaction is not enough because triangle attention/multiplication still dominate the block; the default-off production flag and block benchmark were removed |
 | Forcing CUEQ triangle attention below its default `Q <= 100` PyTorch fallback threshold | useful isolated effect at `B8, N100` (`1.018 -> 0.534 ms`) but neutral at `B8, N76`, worse at `B4/B8, N52`, and neutral for the promoted B16 shapes | this explains one short-bucket artifact but cannot rescue token bucketing because the full-gate failure was dominated by diffusion/atom fragmentation |
 | Full-block ragged pairformer islands | two split buckets improved the long `136-220` block `1.15x`, but slowed the short `40-124` block to `0.66x`; exact-length groups and singletons were much slower | launch count and lost batching eat the padding savings unless the ragged schedule is a real one-launch/vendor-quality kernel |
 | Bool masks for CUEQ triangle multiplication | block screen was flat at `N=124` and only +0.5% at `N=220` | mask dtype plumbing is not a meaningful bottleneck after triangle-attention bool-mask cleanup |
@@ -3993,6 +4024,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Inference DataLoader workers for exact-shape batches | B8 had a small screen win, but B32 hit tensor-sharing failures unless switched to slower file-system sharing; clean B32 no-worker batching was better | do not add host-pipeline complexity unless it survives the actual many-input gate |
 | Parallel or async CIF/JSON dumping | per-batch parallel dumping improved one B32 dump section only `5.35s -> 5.09s` and total predict+dump only `47.75s -> 47.47s`; a stronger async writer pipeline on a 256-record/8-batch gate was also flat (`413.65s -> 412.36s` seed wall, all outputs present) | dumping looks idle from the GPU view, but writer threads contend with the same host/filesystem path that prepares later batches; do not carry default-off writer pools unless an end-to-end campaign gate moves |
 | CUDA graph replay of the diffusion-token transformer | exact and mildly faster in isolation (`1.07x` at `N=124`, `1.02x` at `N=220`), but the long-shape ceiling is under 2% e2e | launch overhead is not the meat of the remaining transformer bottleneck; revisit only as part of a larger full-denoising graph |
+| Reusing the base-checkpoint B4/16 MPS recipe for Protenix-v2 | v2 B4/16 hit CUDA OOM in the diffusion transformer after the long-token warmup filled the GPU, and the narrower v2 width screen found B8/8 (`4.621` samples/s) slightly ahead of B4/10 (`4.576` samples/s) | Protenix-v2's wider `z` representation changes the concurrency knee; use v2-specific gates and do not quote base-model MPS numbers for Sam-style v2 predictions |
 | Merging campaign JSONs before preprocessing | 64-file directory gate moved only from 197.54 s to 195.70 s (`1.009x`) and worsened preprocessing failure granularity | the remaining e2e gap is not mainly per-file JSON preprocessing |
 | Naive padded mixed-shape pairformer batching | valid-region differences accumulated over 48 blocks: FP32 `s/z` mean abs `0.012/0.006`, BF16 `0.236/0.168` for 245 -> 384 tokens | do not claim bitwise parity; the promoted path masks all token readers, sorts by length to reduce physical-shape drift/waste, and keeps exact mode available |
 

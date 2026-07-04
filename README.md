@@ -320,8 +320,10 @@ dumping:
 | 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.1 s wall, 29.9 s summed predict, 0.968 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.83x single-process throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 38.3 s, 4.18 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, BF16 diffusion core, BF16 atom attention, Triton local atom attention, default Triton LayerNorm fallback, cached diffusion pair bias, and guarded triangle LN+q/k/v production | 5.55x over the old branch boundary |
-| Same mixed-token `N_sample=1` workload, many campaign shards on one H100 | 0.166 records/s original low-sample boundary | 1.77 records/s with five `--batch_size 16` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20` | 10.7x per-GPU operational throughput |
-| Same mixed-token `N_sample=5` workload, many campaign shards on one H100 | 0.753 generated samples/s original low-sample boundary | 6.72 generated samples/s with sixteen `--batch_size 4` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=6` | 8.9x per-GPU operational throughput |
+| Same mixed-token `N_sample=1` workload, many campaign shards on one H100, base checkpoint | 0.166 records/s original low-sample boundary | 1.77 records/s with five `--batch_size 16` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20` | 10.7x per-GPU operational throughput |
+| Same mixed-token `N_sample=5` workload, many campaign shards on one H100, base checkpoint | 0.753 generated samples/s original low-sample boundary | 6.72 generated samples/s with sixteen `--batch_size 4` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=6` | 8.9x per-GPU operational throughput |
+| Same Protenix-v2 mixed-token workload, many campaign shards on one H100, `N_sample=1` | current v2 single-process reference: 0.796 records/s at `--batch_size 16`; a matched original v2 default still needs measuring | 1.25 records/s with five `--batch_size 16` workers under CUDA MPS at 20% | 1.57x over current v2 single-process throughput |
+| Same Protenix-v2 mixed-token workload, many campaign shards on one H100, `N_sample=5` | current v2 single-process reference: 3.29 generated samples/s at `--batch_size 16` | 4.62 generated samples/s with eight `--batch_size 8` workers under CUDA MPS at 12%; ten `--batch_size 4` workers were slightly slower and sixteen B4 workers OOMed | 1.40x over current v2 single-process throughput |
 
 For same-token, variable-atom campaigns, compare the `predict` or
 model-forward section rather than the outer Slurm/script wall time.  Current
@@ -335,10 +337,11 @@ the current v2 same-checkpoint gate moved a prior `77.2s` model-forward report
 to `50.4s`, mainly by reducing pairformer from `62.1s` to `38.0s`.  That is a
 real v2 win, but not the same claim as the base-checkpoint `7.3x` row.  For
 mixed-token, low-sample v2 campaigns, the current single-process reference is
-`3.41` generated samples/s at `--batch_size 16` with `N_sample=5`; this remains
-split almost evenly between the wider pairformer and diffusion, so the next
-large win needs true ragged/segmented pairformer work rather than more queue
-bucket tuning.
+`3.29-3.41` generated samples/s at `--batch_size 16` with `N_sample=5`;
+same-GPU MPS raises that only to `4.62` generated samples/s with eight B8
+workers.  This remains split between the wider pairformer and denoising work,
+so the next large win needs true ragged/segmented pairformer work rather than
+more queue bucket tuning or blindly adding MPS workers.
 Seeing `token-trunk+diffusion-token-atom-batch` in the log means batching is
 working; it does not mean the run is using the exact-shape `7r6r` path.
 
@@ -346,11 +349,14 @@ For the mixed-token, low-sample workload, keep `--batch_size 16` as the current
 single-process fixed-batch default: B8 loses diffusion/atom batching efficiency
 when run by itself, while B32 loses more to padded trunk and
 diffusion-transformer shapes.  Under CUDA MPS, where several independent
-campaign shards overlap on one H100, the best `N_sample=5` throughput gate so
-far uses very small per-worker batches: sixteen `--batch_size 4` workers at
-`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=6`.  This is a throughput-only setting:
-each individual shard is slower than the B8/B16 modes, but aggregate
-generated samples/sec per H100 is higher.
+campaign shards overlap on one H100, tune the worker shape to the checkpoint.
+For the base checkpoint the best `N_sample=5` gate so far is sixteen
+`--batch_size 4` workers at `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=6`.  For
+Protenix-v2, whose wider pairformer contends much more strongly, use eight
+`--batch_size 8` workers at 12% for the measured `N_sample=5` knee; the base
+B4/16 recipe OOMed for v2.  These are throughput-only settings: each
+individual shard is slower than the single-process B16 mode, but aggregate
+samples/sec per H100 is higher.
 
 #### Optional: fill one H100 with multiple campaign workers
 
@@ -364,23 +370,27 @@ Important details:
 
 - Keep each worker on the same optimized settings above.  For a simple balanced
   mode and for `N_sample=1`, use `--batch_size 16` with five workers at 20%.
-  For maximum `N_sample=5` aggregate throughput, the current best gate is
-  `--batch_size 4` with sixteen workers at 6%; each shard is substantially
-  slower, but the H100 is better filled.
+  For maximum base-checkpoint `N_sample=5` aggregate throughput, the current
+  best gate is `--batch_size 4` with sixteen workers at 6%.  For Protenix-v2
+  `N_sample=5`, use `--batch_size 8` with eight workers at 12%; v2 B4/10 was
+  slightly slower and v2 B4/16 ran out of memory.
 - Start CUDA MPS with pipe and log directories on a node-local filesystem such
   as `/tmp`.  Do not put `CUDA_MPS_PIPE_DIRECTORY` on Lustre; the MPS control
   socket may fail there.
 - In the current H100 gates, five MPS workers with
   `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20` remain the practical knee for
-  `N_sample=1`: they reached `1.77` records/s, about `10.7x` over the original
-  low-sample branch boundary (`0.166` records/s).  For mixed `N_sample=5`,
-  smaller per-worker batches helped once MPS recovered occupancy: sixteen
+  base-checkpoint `N_sample=1`: they reached `1.77` records/s, about `10.7x`
+  over the original low-sample branch boundary (`0.166` records/s).  The same
+  v2 setting reached `1.25` records/s, only `1.57x` over the current v2
+  single-process rate.  For mixed base-checkpoint `N_sample=5`, smaller
+  per-worker batches helped once MPS recovered occupancy: sixteen
   `--batch_size 4` workers at 6% reached `6.72` generated samples/s after the
   triangle LN+q/k/v default, about `1.61x` over the current single-process
-  rate (`4.18` generated samples/s) and `8.9x` over the original low-sample
-  boundary (`0.753` generated samples/s).  B4 with 12 or 14 workers and B8
-  with 10 workers were slower; a B4/18 follow-up was already below the B4/16
-  rate before it finished, so do not keep adding workers blindly.
+  rate (`4.18` generated samples/s).  For Protenix-v2 `N_sample=5`, the best
+  measured point is eight `--batch_size 8` workers at 12%, `4.62` generated
+  samples/s or `1.40x` over current v2 single-process.  This v2 result is the
+  right number to quote for Sam-style predictions; do not reuse the base-model
+  `6.72` generated samples/s row for v2.
 - Keep `PROTENIX_PREFETCH_DATALOADER=1` for long MPS campaigns if host memory
   allows it, but treat it as a modest host-overlap polish rather than the main
   speedup.  In paired five-worker MPS gates it added `1-2%` throughput while
@@ -398,14 +408,16 @@ export PROTENIX_PREFETCH_DATALOADER=1
 
 export CUDA_MPS_PIPE_DIRECTORY="/tmp/protenix_mps_${SLURM_JOB_ID}/pipe"
 export CUDA_MPS_LOG_DIRECTORY="/tmp/protenix_mps_${SLURM_JOB_ID}/log"
-# Maximum N_sample=5 throughput preset.  For N_sample=1/balanced operation,
-# use CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20, five shards, and --batch_size 16.
+# Base-checkpoint N_sample=5 maximum-throughput preset.  For Protenix-v2
+# N_sample=5, use percentage=12, eight shards, and --batch_size 8 instead.
+# For N_sample=1/balanced operation, use percentage=20, five shards, and B16.
 export CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=6
 mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
 nvidia-cuda-mps-control -d
 
 # Launch independent shards per H100; run another wave after wait returns.
-# For maximum N_sample=5 throughput, use sixteen shard files and --batch_size 4.
+# The loop below is the base-checkpoint N_sample=5 preset.  For Protenix-v2,
+# use shard_{0..7}.json and --batch_size 8 after setting MPS percentage to 12.
 for shard in shard_{0..15}.json; do
   protenix pred -i "$shard" -o "out/${shard%.json}" \
     -s 101 -c 10 -p 200 -e 5 -d bf16 \
