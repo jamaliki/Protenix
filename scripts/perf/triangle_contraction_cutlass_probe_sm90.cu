@@ -31,8 +31,8 @@ using ElementCompute = float;
 // stack of small square GEMMs.  Testing this boundary first tells us whether our
 // native schedule can match the vendor-quality dense contraction before we fuse
 // the surrounding projection and output-gate stages.
-using TileShape = Shape<_64, _64, _64>;
-using ClusterShape = Shape<_1, _1, _1>;
+using TileShape = Shape<_128, _128, _64>;
+using ClusterShape = Shape<_2, _1, _1>;
 
 using FusionOperation =
     cutlass::epilogue::fusion::Sm90EVT<cutlass::epilogue::fusion::Sm90AccFetch>;
