@@ -4392,6 +4392,42 @@ short-term implementation ladder is:
    fixed by nearby producer tiles, and the standalone full-probe composition is
    not promotion evidence when it disagrees with the block.  Keep using the
    PairformerBlock and full Sam-style v2 gates for default decisions.
+
+   Output-consumer fusion follow-up: commit `4264004` added
+   `scripts/perf/triangle_output_ln_dualgemm_residual_probe.py` to test the
+   consumer side of triangle multiplication before adding another runtime path.
+   The candidate fused `layer_norm_transpose(update_dbij)`, the output
+   gate/value GEMMs, and the residual store while leaving the triangular
+   contraction itself untouched.  The isolated boundary screen looked
+   attractive on one H100, job `109743`,
+   `runs/triangle_output_ln_dualgemm_residual_20260704_181458_4264004`:
+
+   | v2 bucket | CUEQ output boundary | fused output boundary | best tile | parity |
+   | --- | ---: | ---: | --- | --- |
+   | short variable `B16/N124` | 1.178 ms | 0.911 ms (`1.293x`) | `32x128x64`, 4 warps | max abs 0.5, mean abs 0.0064 |
+   | long variable `B16/N220` | 3.677 ms | 3.170 ms (`1.160x`) | `32x128x64`, 4 warps | max abs 0.5, mean abs 0.0097 |
+
+   That was only a hypothesis.  Commit `a2c7027` then wired the same boundary
+   behind a default-off `PROTENIX_TRITON_TRIANGLE_OUTPUT_LN_DUAL_GEMM` flag and
+   ran the authoritative block gate in job `109744`,
+   `runs/v2_triangle_output_ln_dualgemm_block_20260704_181819_a2c7027`, with the
+   older input-LN producer flag disabled:
+
+   | v2 bucket | block off | block on | triangle-mul movement | decision |
+   | --- | ---: | ---: | --- | --- |
+   | short variable `B16/N124` | 10.113 ms | 9.461 ms (`1.069x`) | outgoing `2.587 -> 2.219 ms`, incoming `2.411 -> 2.119 ms` | real short-shape movement |
+   | long variable `B16/N220` | 25.565 ms | 28.959 ms (`0.883x`) | outgoing `3.968 -> 5.759 ms`, incoming `3.901 -> 5.612 ms` | reject |
+
+   Decision: remove the runtime hook and keep only the benchmark as negative
+   evidence.  The isolated output-boundary kernel is faster, but integrating it
+   requires leaving CUEQ's integrated triangle-multiplication primitive and
+   rebuilding the update through Python-level producer/contraction pieces.  On
+   the long Sam-style v2 bucket, that lost orchestration costs much more than
+   the fused output consumer saves.  This is the same lesson as the producer
+   screen in a sharper form: the next credible triangle-multiplication kernel
+   cannot be a consumer epilogue bolted onto a decomposed CUEQ path; it has to
+   own the larger segmented update boundary or preserve a CUEQ/CUTLASS-quality
+   internal schedule.
 2. **Full segmented triangle-mul update:** fuse or internally schedule the
    LayerNorm, gated input projection, segmented contraction, output LayerNorm,
    output projection/gate, and residual store for valid rows.  This is the first
