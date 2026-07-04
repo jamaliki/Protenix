@@ -1393,6 +1393,38 @@ diffusion win without changing every small FP32 normalization in the model.
 The shape policy is covered by `tests.test_triton_layer_norm` and is already
 included in all later current-stack gates.
 
+Current-HEAD follow-up gates rejected broadening this LayerNorm policy further.
+Job `100097`
+(`runs/layer_norm_force_all_current_gate_20260704_030540_c1f70d5`) repeated
+the warmed-cache force-all comparison at commit `c1f70d5`, now with the full
+current stack and confidence enabled:
+
+| case | predict sec | generated samples/s | pairformer | diffusion | confidence | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| auto A | 41.00 | 3.902 | 15.55 | 21.26 | 2.50 | baseline |
+| force-all A | 40.19 | 3.981 | 15.59 | 20.38 | 2.54 | small positive signal |
+| auto B | 41.05 | 3.898 | 15.75 | 21.10 | 2.52 | baseline repeat |
+| force-all B | 40.52 | 3.949 | 15.57 | 20.74 | 2.56 | about `1.7%` avg throughput win |
+
+That was not promoted directly because force-all turns every supported FP32
+LayerNorm shape into a Triton launch.  The shape probe job `100238`
+(`runs/layer_norm_shape_probe_20260704_033040_c1f70d5`) showed the current auto
+policy leaves contiguous FP32 fallback calls at widths `128`, `256`, small-row
+`384`, and an odd confidence width `833`, while large-row width `768` is already
+covered.  Two narrower gates then failed to make the signal robust:
+
+| job | candidate policy | auto avg predict | candidate avg predict | decision |
+| --- | --- | ---: | ---: | --- |
+| `100171` | add FP32 width `128`, keep the `8192` row floor | 41.04 | 40.84 | only `0.5%`; below promotion threshold |
+| `100259` | observed FP32 widths `128,256,384,768,833`, min rows `1` | 40.69 | 41.23 | slower in both A/B repeats |
+
+Decision: keep the conservative auto policy from `a271f5e`.  The validated
+throughput work should move to a larger boundary instead of chasing the
+remaining native LayerNorm calls one shape at a time.  The likely larger
+remaining kernels are still the diffusion token transformer, the pairformer
+triangle-attention/transition boundaries, and the MPS multi-worker occupancy
+path for campaign throughput.
+
 The existing experimental Triton elementwise/residual/transition-input flags are
 not a shortcut for this mixed-campaign workload.  Job `95635`
 (`/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile/runs/fusion_flags_pair_b16_n200_20260702_170343`)
