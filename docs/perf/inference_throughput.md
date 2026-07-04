@@ -1189,6 +1189,29 @@ multi-step batched diffusion and can be disabled with
 `PROTENIX_CACHE_DIFFUSION_PAIR_BIAS=0`; `N_step=1` scout runs skip it because
 there is no reuse window.
 
+Compact-bias follow-up: job `102298`
+(`runs/diffusion_compact_bias_probe_20260704_074515_fd5b5e9`) tested the
+tempting memory-saving variant after the pair-bias cache promotion.  The current
+production cache stores the final attention mask as
+`[B * N_sample, heads, N, N]`, which preserves the fast flattened rank-4 SDPA
+path but repeats a sample-invariant bias.  The probe kept all AdaLN, q/k/v,
+output-projection, and transition GEMMs flattened, then viewed only q/k/v as
+`[B, N_sample, heads, N, D]` at SDPA so a compact
+`[B, 1, heads, N, N]` bias could broadcast over samples.
+
+| bucket | eager recompute | current expanded cache | compact rank-5 cache | expanded cache | compact cache | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `B16, N_sample=5, N=124` | `33.45 ms` | `29.82 ms` | `35.05 ms` | `900.9 MiB` | `180.2 MiB` | reject for throughput |
+| `B16, N_sample=5, N=220` | `73.79 ms` | `64.06 ms` | `69.85 ms` | `2835.9 MiB` | `567.2 MiB` | reject for throughput |
+
+The compact path is useful negative evidence.  It cuts the cached-bias footprint
+by `5x`, but the rank-5 broadcast-bias SDPA schedule is slower than the current
+rank-4 expanded-bias path at both real buckets, and it changes BF16 attention
+accumulation order (`max_abs` about `0.08-0.10` versus the expanded-cache
+reference).  Because H100 memory is not the limiter for the current throughput
+gate, do not trade the faster rank-4 schedule for the compact cache unless a
+future workload becomes memory-bound.
+
 Post-cache launch profile: job `97110`
 (`runs/post_cache_profile_n20_20260703_093234_3275f96`) captured a
 representative `N_step=20`, `N_sample=5`, mixed-token, B16 trace after the pair
@@ -3644,6 +3667,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Bool masks for CUEQ triangle multiplication | block screen was flat at `N=124` and only +0.5% at `N=220` | mask dtype plumbing is not a meaningful bottleneck after triangle-attention bool-mask cleanup |
 | Materializing pairformer token-attention bias as contiguous `[B, H, Q, K]` | traced pairformer SDPA shape `[16, 16, 124, 24]` moved from math-dispatch attempt to a cuDNN frontend "no valid execution plans" error; fallback timing then segfaulted in the isolated screen | the non-contiguous bias layout is not the only blocker; head_dim 24 plus dense additive bias lacks a safe cuDNN plan in this runtime, so do not pay a bias copy hoping for a backend flip |
 | CUEQ `attention_pair_bias` for diffusion token attention | native pair-bias projection needed an explicit zero LayerNorm bias, then CUEQ's internal SDPA failed with `No valid execution plans built`; forced PyTorch fallback was slower than the current full conv2d+SDPA baseline | CUEQ's wrapper is not a drop-in win here; use it only if we can call a narrower fused pair-bias producer while keeping Protenix's SDPA fallback policy |
+| Compact rank-5 diffusion pair-bias cache | stored `5x` less cached bias, but the hybrid flattened-GEMM/rank-5-SDPA screen was slower than the current expanded rank-4 cache (`29.82 -> 35.05 ms` at `N=124`, `64.06 -> 69.85 ms` at `N=220`) | memory footprint is not the active limiter; preserve the faster cuDNN rank-4 SDPA schedule unless a future workload becomes memory-bound |
 | Reusing Triton `TriAttentionFunction` for pairformer token attention | isolated `N=220` hotspot improved, but the full mixed-sequence gate averaged only `45.16s -> 44.89s` predict (`+0.6%`) and one repeat regressed | padding `D=24` to `D=32` and copying layouts is too much integration overhead; if revisited, write a direct dense-bias `D=24` kernel instead |
 | Direct dense-bias D24 Triton token attention | isolated core improved about `5.3-5.7x` and the full attention boundary `1.6-2.3x`, but the representative mixed `N_sample=5`, `N_step=200` gate slowed from `41.38s` to `41.92s` on average | even a good narrow attention kernel is too small after pair-bias caching; remove rejected default-off runtime hooks and target larger pairformer/triangle boundaries |
 | `torch.compile` around the diffusion-token transformer | isolated 24-block screens improved `1.29-1.34x`; the first model gate failed in a cuDNN SDPA plan, and the safer no-cuDNN-SDPA gate was flat/slower (`44.59 -> 44.92s`, repeat `43.87 -> 43.95s`) | block-level fusion remains attractive, but a generic Inductor wrapper does not move the real campaign path |
