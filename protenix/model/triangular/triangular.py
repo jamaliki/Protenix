@@ -41,6 +41,10 @@ from protenix.model.triangular.layers import (
 from protenix.model.triangular.ln_qkv_triton import (
     triton_ln_qkv_to_cueq_heads_first,
 )
+from protenix.model.triangular.triangle_ln_dual_gemm_triton import (
+    triangle_update_with_ln_dual_gemm,
+    triton_triangle_ln_dual_gemm_enabled,
+)
 from protenix.model.triangular.triangle_output_gate_residual_triton import (
     triangle_update_with_residual,
     triton_triangle_output_gate_residual_enabled,
@@ -257,6 +261,40 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
         self.linear_b_p = OpenfoldLinear(self.c_z, self.c_hidden, bias=False)
         self.linear_b_g = OpenfoldLinear(
             self.c_z, self.c_hidden, bias=False, init="gating"
+        )
+        self._triton_input_producer_cache_key = None
+        self._triton_input_producer_weight_p = None
+        self._triton_input_producer_weight_g = None
+
+    def _triton_input_producer_weights(
+        self,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weights = (
+            self.linear_a_p.weight,
+            self.linear_b_p.weight,
+            self.linear_a_g.weight,
+            self.linear_b_g.weight,
+        )
+        cache_key = tuple(
+            (weight.data_ptr(), weight._version, dtype, device) for weight in weights
+        )
+        if cache_key != self._triton_input_producer_cache_key:
+            # CUEQ consumes the two input projections as one `[2D, D]` dual-GEMM
+            # weight.  Concatenating/casting it inside every triangle call would
+            # add host overhead and extra allocator traffic across 48 pairformer
+            # blocks, so keep a tiny invalidated-by-version cache on the module.
+            self._triton_input_producer_weight_p = torch.cat(
+                [weights[0], weights[1]], 0
+            ).to(device=device, dtype=dtype).contiguous()
+            self._triton_input_producer_weight_g = torch.cat(
+                [weights[2], weights[3]], 0
+            ).to(device=device, dtype=dtype).contiguous()
+            self._triton_input_producer_cache_key = cache_key
+        return (
+            self._triton_input_producer_weight_p,
+            self._triton_input_producer_weight_g,
         )
 
     def _inference_forward(
@@ -555,6 +593,35 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
         # Therefore, we include a check here: if c != c_z, we fall back to using plain PyTorch.
         # This situation may occur in our template module.
         if triangle_multiplicative == "cuequivariance" and (self.c_z == self.c_hidden):
+            if (
+                _input_inplace_safe
+                and _add_with_inplace
+                and triton_triangle_ln_dual_gemm_enabled()
+            ):
+                weight_p, weight_g = self._triton_input_producer_weights(
+                    dtype=z.dtype,
+                    device=z.device,
+                )
+                weight_out_g, weight_out_z = self._triton_output_gate_weights(
+                    dtype=z.dtype,
+                    device=z.device,
+                )
+                fused_update = triangle_update_with_ln_dual_gemm(
+                    z,
+                    direction="outgoing" if self._outgoing else "incoming",
+                    mask=(z.new_ones(z.shape[:-1]) if mask is None else mask),
+                    norm_in_weight=self.layer_norm_in.weight,
+                    norm_in_bias=self.layer_norm_in.bias,
+                    p_in_weight=weight_p,
+                    g_in_weight=weight_g,
+                    norm_out_weight=self.layer_norm_out.weight,
+                    norm_out_bias=self.layer_norm_out.bias,
+                    p_out_weight=weight_out_z,
+                    g_out_weight=weight_out_g,
+                    eps=1e-5,
+                )
+                if fused_update is not None:
+                    return fused_update
             if (
                 _input_inplace_safe
                 and _add_with_inplace
