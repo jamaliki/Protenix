@@ -358,6 +358,18 @@ B4/16 recipe OOMed for v2.  These are throughput-only settings: each
 individual shard is slower than the single-process B16 mode, but aggregate
 samples/sec per H100 is higher.
 
+For Sam-style Protenix-v2 work, treat the v2 rows above as the target workload,
+not the base-checkpoint headline.  A focused H100 profile of the exact sorted
+mixed-token trunk buckets (`B16/N124` and `B16/N220`, `c_z=256`,
+`hidden_scale_up=True`) shows the remaining v2 cost is real pairformer work:
+the long bucket spends about 46% of one block in triangle attention, 29% in
+triangle multiplication, and 21% in the pair transition.  The two sorted
+buckets are only about 67% pair-token efficient overall, so the next large
+kernel opportunity is a true ragged/segmented triangle-attention or
+triangle-multiplication schedule that avoids padded pair work while keeping
+CUEQ/cuDNN-class mainloops.  Small queue buckets, pair-transition-only
+compaction, and more same-GPU workers have already plateaued for v2.
+
 #### Optional: fill one H100 with multiple campaign workers
 
 For large design campaigns, throughput can improve further by running several

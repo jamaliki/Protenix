@@ -3973,6 +3973,54 @@ Operational MPS still helps, but for Sam-style v2 predictions the honest
 headline is `4.62` generated samples/s at B8/8 (`1.40x` over current v2
 single-process), not the base-checkpoint `6.72` generated samples/s result.
 
+Protenix-v2 mixed-token pairformer profile: jobs `105740` and `105741` captured
+the two physical pairformer block shapes used by the sorted Sam-style
+`B16`, 40-220-token workload at commit `2b3f65c`:
+`runs/v2_mixed_pairformer_ncu_B16_N124_20260704_143549_2b3f65c` and
+`runs/v2_mixed_pairformer_ncu_B16_N220_20260704_143549_2b3f65c`.  The matching
+CUDA-event screen is
+`runs/v2_mixed_pairformer_events_20260704_144744_2b3f65c`.  Shapes were BF16,
+one H100, `c_z=256`, `hidden_scale_up=True`, CUEQ triangle attention and
+CUEQ triangle multiplication.
+
+The sorted buckets have very different padding efficiency:
+
+| bucket | lengths | physical shape | valid pair efficiency | ideal pair-work-only ceiling |
+| --- | --- | --- | ---: | ---: |
+| short | two each of `40,52,64,76,88,100,112,124` | `B16/N124` | 48.6% | 2.06x |
+| long | two each of `136,160,172,184,196,208,216,220` | `B16/N220` | 73.4% | 1.36x |
+| combined | all 32 records after sorting | two physical buckets | 67.4% | 1.48x |
+
+CUDA-event block timing:
+
+| shape | total block ms | triangle attention | triangle multiplication | pair transition | token/single |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `B16/N124` | 10.65 | 3.32 ms (31.2%) | 5.03 ms (47.2%) | 1.81 ms (17.0%) | 0.49 ms (4.6%) |
+| `B16/N220` | 27.01 | 12.42 ms (46.0%) | 7.85 ms (29.1%) | 5.61 ms (20.8%) | 1.14 ms (4.2%) |
+
+The long bucket is the actual v2 throughput wall: triangle attention is the
+largest stage, but the block is not dominated by one weak launch.  The NCU
+family summary for `B16/N220` was:
+
+| kernel family | launches | total ms | roofline signal | interpretation |
+| --- | ---: | ---: | --- | --- |
+| cuDNN SDPA inside CUEQ triangle attention | 2 | 5.20 | ~75% compute-memory throughput, ~59% SM, low occupancy | largest mainloop; preserve vendor SDPA unless replacing it with a vendor-quality ragged attention kernel |
+| PyTorch vectorized elementwise/residual/gate traffic | 53 | 4.34 | many launches around 90-92% memory throughput | broad HBM traffic, too spread out for one small epilogue patch |
+| CUEQ `fused_sigmoid_gated_dual_gemm` | 4 | 3.90 | large calls ~55% memory, smaller calls ~88% memory | triangle multiplication remains material, but the H100 cache overlay fixed the worst fallback |
+| pair-transition stage | mixed Triton/cuBLAS/elementwise launches | 5.61 by CUDA events | hidden-boundary kernels are memory-heavy, but the whole stage is only 21% of the long block | attractive only as part of a larger boundary; row compaction already failed the full-block gate |
+| CUEQ q/k/v layout helpers | 2 | 1.65 | ~82-89% DRAM | visible, but tile-only retunes are exhausted |
+| LayerNorm kernels | 10 | 3.49 including CUEQ `layer_norm_transpose` | mostly memory-bound | useful only if fused into a larger producer/consumer boundary |
+
+Decision: for Protenix-v2, stop spending effort on queue bucketing,
+pair-transition-only compaction, or small layout retunes.  The next serious
+implementation target is a true ragged/segmented pairformer triangle boundary:
+either segmented triangle attention/multiplication over the valid rows inside
+one launch family, or a CUEQ/CuTe-level producer that removes padding/layout
+traffic while keeping cuDNN/CUEQ-class mainloops.  A naive "mega-kernel" that
+replaces cuDNN SDPA or cuBLAS GEMMs is unlikely to win; the measured bottleneck
+is doing too much padded pair work plus several already-specialized
+memory-bound boundaries, not a single obviously bad PyTorch matmul.
+
 ## Negative results worth remembering
 
 These failed because the real workload, not the isolated kernel, is the gate:
