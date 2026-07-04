@@ -2414,6 +2414,60 @@ before custom-matmul overheads.  That is a real target, but not a 2x target:
 the implementation has to be vendor-quality, or the lost GEMM efficiency will
 erase the saved HBM traffic.
 
+#### 2026-07-04 follow-up: current many-sequence pairformer target
+
+After the many-sequence batching fixes and the ending-attention contiguous
+producer, the practical `B32, N_token=251, N_atom=1834-1940, N_sample=1` gate is
+again dominated by the pairformer trunk.  A fresh PairformerBlock screen
+(`runs/transition_combo_block_screen_20260703_235608_9e427ed`) ranked the
+current promoted block as:
+
+| subrange | mean ms | block share |
+| --- | ---: | ---: |
+| ending triangle attention, contiguous producer | 8.78 | 23.8% |
+| starting triangle attention | 8.32 | 22.6% |
+| pair transition | 7.93 | 21.5% |
+| outgoing triangle multiplication | 4.70 | 12.8% |
+| incoming triangle multiplication | 4.64 | 12.6% |
+| token attention | 2.36 | 6.4% |
+| single transition | 0.14 | 0.4% |
+
+The matching triangle-attention split screen
+(`runs/triangle_attention_current_split_20260704_001116_99cd4b8`) shows why a
+"mega kernel" has to be chosen carefully:
+
+| triangle-attention subrange | start ms | ending-contiguous ms | interpretation |
+| --- | ---: | ---: | --- |
+| CUEQ attention | 3.148 | 3.224 | largest piece, vendor/custom mainloop |
+| qkv projection plus CUEQ layout | 1.848 | 1.943 | one fused qkv GEMM already, plus layout producer |
+| LayerNorm | 1.263 | 1.263 | memory-bound normalized-input producer |
+| gate epilogue | 0.511 | 0.524 | memory-bound but already streaming Triton |
+| output projection | 0.375 | 0.375 | small cuBLAS GEMM |
+| gate projection | 0.372 | 0.372 | small cuBLAS GEMM |
+| triangle-bias projection | 0.295 | 0.298 | small cuBLAS GEMM |
+
+Two obvious projection/epilogue fusion probes were rejected:
+
+| probe | baseline | candidate | decision |
+| --- | ---: | ---: | --- |
+| combine qkv+gate+bias into one wider projection, then copy slices honestly | 7.89/8.04 ms | 11.81/12.02 ms | reject; wider GEMM and slice copies dominate |
+| fuse gate sigmoid/multiply with output projection in a naive Triton matmul | 0.880 ms | 1.993 ms | reject; cannot match cuBLAS-class `linear_o` efficiency |
+
+These are negative results, but they are useful.  The current qkv path is
+already a single wide qkv projection; the remaining easy-looking fusion is
+mostly about avoiding normalized-input and gated-output HBM traffic without
+giving up tensor-core throughput.  A legitimate next CuTe/CUTLASS attempt would
+therefore be either:
+
+1. a vendor-quality gated output projection that keeps the `linear_o` GEMM
+   throughput while applying `sigmoid(gate) * heads_first` in the A operand
+   iterator, or
+2. a LayerNorm+qkv producer that normalizes `x` inside the qkv GEMM mainloop and
+   still writes CUEQ's physical q/k/v layout directly.
+
+Both are real custom-kernel problems.  A plain PyTorch concatenation or simple
+Triton matmul is not close enough to promote.
+
 CuTe/CUTLASS extension toolchain status on Tokyo:
 
 | item | value |
