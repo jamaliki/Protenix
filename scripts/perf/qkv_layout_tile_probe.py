@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
 """Screen CUEQ triangle-attention q/k/v layout tile choices.
 
-The production CUEQ triangle-attention path keeps the fused q/k/v GEMM intact,
-then uses a streaming Triton kernel to split the fused output and write CUEQ's
-physical heads-first tensors.  Nsight Compute shows that kernel is HBM-bound at
-large many-sequence batches.  This probe asks only the narrow tile question:
-can a different one-dimensional streaming tile improve the layout pass enough
-to justify changing production defaults?
-
-This is benchmark-only code.  Production still lives in
-``protenix.model.triangular.qkv_layout_triton`` and should only change after a
-full PairformerBlock gate moves, not from an isolated copy-kernel win alone.
+Benchmark-only: production lives in ``triangular/qkv_layout_triton.py`` and
+should change only after a full PairformerBlock gate moves.  The two kernels
+below mirror the normal and ending-node swapped CUEQ layouts, whose address maps
+are intentionally different.
 """
 
 from __future__ import annotations
@@ -19,7 +13,6 @@ import _repo_bootstrap  # noqa: F401
 
 import argparse
 import json
-from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -27,9 +20,18 @@ import triton
 import triton.language as tl
 
 
-TensorFn = Callable[[], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
 Config = tuple[int, int]
-
+DEFAULT_CONFIGS: list[Config] = [
+    (128, 4),
+    (256, 4),
+    (512, 4),
+    (1024, 4),
+    (2048, 4),
+    (4096, 4),
+    (1024, 8),
+    (2048, 8),
+    (4096, 8),
+]
 
 def parse_config(spec: str) -> Config:
     parts = tuple(int(part) for part in spec.lower().replace("w", "x").split("x"))
@@ -37,11 +39,9 @@ def parse_config(spec: str) -> Config:
         raise argparse.ArgumentTypeError("configs must be BLOCKxWARPS")
     return parts  # type: ignore[return-value]
 
-
 def config_name(config: Config) -> str:
     block, warps = config
     return f"b{block}_w{warps}"
-
 
 @triton.jit
 def _qkv_to_heads_first_kernel(
@@ -75,7 +75,6 @@ def _qkv_to_heads_first_kernel(
     tl.store(q_ptr + offsets, q, mask=mask)
     tl.store(k_ptr + offsets, k, mask=mask)
     tl.store(v_ptr + offsets, v, mask=mask)
-
 
 @triton.jit
 def _qkv_to_heads_first_swapped_kernel(
@@ -114,7 +113,6 @@ def _qkv_to_heads_first_swapped_kernel(
     tl.store(k_ptr + offsets, k, mask=mask)
     tl.store(v_ptr + offsets, v, mask=mask)
 
-
 def triton_layout(qkv: torch.Tensor, heads: int, config: Config, *, swapped: bool):
     block, warps = config
     head_dim = qkv.shape[-1] // (3 * heads)
@@ -133,16 +131,7 @@ def triton_layout(qkv: torch.Tensor, heads: int, config: Config, *, swapped: boo
         total = leading * qkv.shape[-2] * heads * qkv.shape[-3] * head_dim
         grid = (triton.cdiv(total, block),)
         _qkv_to_heads_first_swapped_kernel[grid](
-            qkv,
-            q,
-            k,
-            v,
-            total,
-            qkv.shape[-3],
-            qkv.shape[-2],
-            heads,
-            head_dim,
-            block,
+            qkv, q, k, v, total, qkv.shape[-3], qkv.shape[-2], heads, head_dim, block,
             num_warps=warps,
         )
         return q, k, v
@@ -153,19 +142,10 @@ def triton_layout(qkv: torch.Tensor, heads: int, config: Config, *, swapped: boo
     total = leading_i * heads * qkv.shape[-2] * head_dim
     grid = (triton.cdiv(total, block),)
     _qkv_to_heads_first_kernel[grid](
-        qkv,
-        q,
-        k,
-        v,
-        total,
-        qkv.shape[-2],
-        heads,
-        head_dim,
-        block,
+        qkv, q, k, v, total, qkv.shape[-2], heads, head_dim, block,
         num_warps=warps,
     )
     return q, k, v
-
 
 def torch_layout(qkv: torch.Tensor, heads: int, *, swapped: bool):
     head_dim = qkv.shape[-1] // (3 * heads)
@@ -179,8 +159,7 @@ def torch_layout(qkv: torch.Tensor, heads: int, *, swapped: bool):
         v = v.transpose(-4, -2)
     return q.contiguous(), k.contiguous(), v.contiguous()
 
-
-def time_cuda(fn: TensorFn, warmup: int, iters: int):
+def time_cuda(fn, warmup: int, iters: int):
     with torch.inference_mode():
         for _ in range(warmup):
             out = fn()
@@ -193,7 +172,6 @@ def time_cuda(fn: TensorFn, warmup: int, iters: int):
         end.record()
         end.synchronize()
     return out, start.elapsed_time(end) / iters
-
 
 def diff_stats(reference, candidate) -> dict[str, float | int | bool]:
     max_abs = 0.0
@@ -217,7 +195,6 @@ def diff_stats(reference, candidate) -> dict[str, float | int | bool]:
         "nan_count": nan_count,
     }
 
-
 def screen_layout(
     qkv: torch.Tensor,
     args: argparse.Namespace,
@@ -234,7 +211,6 @@ def screen_layout(
     rows: dict[str, Any] = {}
     best_name = ""
     best_ms = float("inf")
-    best_out = None
     for config in args.configs:
         name = config_name(config)
         out, ms = time_cuda(
@@ -250,8 +226,6 @@ def screen_layout(
         if ms < best_ms:
             best_name = name
             best_ms = ms
-            best_out = out
-    assert best_out is not None
     return {
         "current": {
             "name": config_name(current_cfg),
@@ -262,48 +236,34 @@ def screen_layout(
         "best": rows[best_name] | {"name": best_name},
     }
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--batch", type=int, default=32)
-    parser.add_argument("--tokens", type=int, default=251)
-    parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument("--head-dim", type=int, default=32)
+    for name, default in [
+        ("batch", 32),
+        ("tokens", 251),
+        ("heads", 8),
+        ("head-dim", 32),
+        ("warmup", 4),
+        ("iters", 10),
+        ("seed", 123),
+    ]:
+        parser.add_argument(f"--{name}", type=int, default=default)
     parser.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
-    parser.add_argument("--warmup", type=int, default=4)
-    parser.add_argument("--iters", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--configs", nargs="*", type=parse_config)
     parser.add_argument("--output-json")
     return parser.parse_args()
-
 
 def main() -> None:
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     if args.configs is None:
-        args.configs = [
-            (128, 4),
-            (256, 4),
-            (512, 4),
-            (1024, 4),
-            (2048, 4),
-            (4096, 4),
-            (1024, 8),
-            (2048, 8),
-            (4096, 8),
-        ]
+        args.configs = DEFAULT_CONFIGS
     torch.manual_seed(args.seed)
     dtype = getattr(torch, args.dtype)
     hidden = args.heads * args.head_dim
     qkv = torch.randn(
-        args.batch,
-        args.tokens,
-        args.tokens,
-        3 * hidden,
-        device="cuda",
-        dtype=dtype,
+        args.batch, args.tokens, args.tokens, 3 * hidden, device="cuda", dtype=dtype
     )
 
     with torch.inference_mode():
@@ -312,13 +272,13 @@ def main() -> None:
 
     result = {
         "args": vars(args) | {"configs": [config_name(config) for config in args.configs]},
-        "shape": {
-            "batch": args.batch,
-            "tokens": args.tokens,
-            "heads": args.heads,
-            "head_dim": args.head_dim,
-            "qkv_numel": qkv.numel(),
-        },
+        "shape": dict(
+            batch=args.batch,
+            tokens=args.tokens,
+            heads=args.heads,
+            head_dim=args.head_dim,
+            qkv_numel=qkv.numel(),
+        ),
         "normal": normal,
         "swapped": swapped,
         "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
@@ -331,7 +291,6 @@ def main() -> None:
         with open(args.output_json, "w", encoding="utf-8") as handle:
             handle.write(text + "\n")
     print(text)
-
 
 if __name__ == "__main__":
     main()
