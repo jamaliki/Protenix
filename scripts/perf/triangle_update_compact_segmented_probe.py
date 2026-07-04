@@ -257,15 +257,24 @@ if triton is not None and tl is not None:
         out,
         rows,
         channels: tl.constexpr,
+        block_rows: tl.constexpr,
         block_c: tl.constexpr,
     ) -> None:
-        row = tl.program_id(0)
+        # The first compact screen used one program per valid pair row.  On the
+        # long v2 bucket that means millions of tiny programs, so launch/control
+        # overhead dominates a bandwidth-bound residual store.  Tile rows here:
+        # each program moves a small `[block_rows, block_c]` slab from compact
+        # valid-row order back into the padded dense tensor.
+        row = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
         c = tl.program_id(1) * block_c + tl.arange(0, block_c)
-        dense_row = tl.load(dense_offsets + row).to(tl.int64)
-        mask = (row < rows) & (c < channels)
-        delta = tl.load(compact_delta + row * channels + c, mask=mask, other=0.0)
-        residual = tl.load(z + dense_row * channels + c, mask=mask, other=0.0)
-        tl.store(out + dense_row * channels + c, delta + residual, mask=mask)
+        dense_row = tl.load(dense_offsets + row, mask=row < rows, other=0).to(tl.int64)
+        compact_ptrs = compact_delta + row[:, None] * channels + c[None, :]
+        dense_ptrs = z + dense_row[:, None] * channels + c[None, :]
+        out_ptrs = out + dense_row[:, None] * channels + c[None, :]
+        mask = (row[:, None] < rows) & (c[None, :] < channels)
+        delta = tl.load(compact_ptrs, mask=mask, other=0.0)
+        residual = tl.load(dense_ptrs, mask=mask, other=0.0)
+        tl.store(out_ptrs, delta + residual, mask=mask)
 
     @triton.jit
     def _pack_valid_rows_kernel(
@@ -469,8 +478,10 @@ def segmented_finish(
         weights["p_out"],
     )
     out = torch.empty_like(z)
-    scatter_grid = (rows, triton.cdiv(C_Z, 64))
-    _scatter_residual_kernel[scatter_grid](compact_delta, z, dense_offsets, out, rows, C_Z, 64)
+    scatter_grid = (triton.cdiv(rows, 16), triton.cdiv(C_Z, 64))
+    _scatter_residual_kernel[scatter_grid](
+        compact_delta, z, dense_offsets, out, rows, C_Z, 16, 64, num_warps=4
+    )
     return out
 
 
@@ -500,8 +511,10 @@ def segmented_finish_exact_group_bmm(
     )
     out = torch.empty_like(z)
     rows = dense_offsets.numel()
-    scatter_grid = (rows, triton.cdiv(C_Z, 64))
-    _scatter_residual_kernel[scatter_grid](compact_delta, z, dense_offsets, out, rows, C_Z, 64)
+    scatter_grid = (triton.cdiv(rows, 16), triton.cdiv(C_Z, 64))
+    _scatter_residual_kernel[scatter_grid](
+        compact_delta, z, dense_offsets, out, rows, C_Z, 16, 64, num_warps=4
+    )
     return out
 
 
