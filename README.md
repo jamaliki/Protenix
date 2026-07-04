@@ -427,7 +427,13 @@ reached `1.21-1.59x` on the short bucket but still regressed the long bucket to
 `0.68-0.79x`.  A no-stack strided-`matmul` variant removed explicit
 `torch.stack`/`cat`, but PyTorch still materialized the strided batch internally
 and the long bucket stayed slower (`0.72-0.74x`).  That makes these screens a
-learning signal for a native segmented update, not a deployable v2 path.
+learning signal for a native segmented update, not a deployable v2 path.  The
+stronger producer-owned upper-bound screen is now positive: if the input
+producer has already written exact-length group tensors, contraction plus the
+current output/residual boundary is `1.50-1.51x` faster than padded CUEQ on the
+long v2 bucket and `2.52-2.57x` faster on the short bucket.  That justifies the
+next native kernel, but only if the producer writes that layout directly; adding
+today's compact producer cost would erase much of the long-bucket win.
 Whole-Pairformer CUDA graph replay was also screened as a lower-risk
 launch-overhead fix.  It was exact and helped the short v2 bucket by about
 `3%`, but the full 48-block long bucket was flat (`~1.00x`) once changed

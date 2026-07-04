@@ -4527,6 +4527,40 @@ short-term implementation ladder is:
    row-major `[valid_rows, D]` output directly or fuse the output LayerNorm,
    gate/projection, and residual store while still in grouped layout.
 
+   Producer-owned finish upper-bound: commit `8b88f27` added
+   `scripts/perf/triangle_update_producer_owned_finish_probe.py`.  This is the
+   acceptance test for writing the real native producer boundary.  It
+   pre-materializes the exact-length contractor inputs before timing, as if the
+   input LayerNorm + dual-GEMM producer had already written `[records * D, N, N]`
+   group tensors directly.  The timed candidate then runs exact-group
+   contraction, assembles the row-major update, and reuses the current compact
+   output LayerNorm/gate/projection plus residual scatter.  Job `110576`, run
+   `runs/triangle_update_producer_owned_finish_8b88f27_20260704_223005`, produced:
+
+   | bucket / direction | padded CUEQ update | current compact producer only | producer-owned finish | output-only lower bound | decision |
+   | --- | ---: | ---: | ---: | ---: | --- |
+   | short incoming | `2.476 ms` | `0.402 ms` | `0.965 ms` (`2.57x`) | `0.837 ms` (`2.96x`) | justify native |
+   | short outgoing | `2.477 ms` | `0.405 ms` | `0.982 ms` (`2.52x`) | `0.841 ms` (`2.95x`) | justify native |
+   | long incoming | `4.127 ms` | `1.816 ms` | `2.748 ms` (`1.50x`) | `2.268 ms` (`1.82x`) | justify native |
+   | long outgoing | `4.223 ms` | `1.816 ms` | `2.788 ms` (`1.51x`) | `2.275 ms` (`1.86x`) | justify native |
+
+   Valid-region drift stayed at the same BF16 level as the compact producer
+   screens (`max_abs <= 0.03125`, mean about `4-7e-6`).  Interpretation: this is
+   the first wide-v2 triangle-update screen that stays positive on the long
+   bucket after removing padded CUEQ work.  It also shows why the production
+   kernel must own the producer layout: if today's compact producer cost
+   (`1.816 ms` long) is simply added back to the producer-owned finish, the long
+   bucket would be flat/slower.  The next implementation target is therefore a
+   producer-owned exact-group update kernel, not another wrapper:
+
+   - input LayerNorm + dual gated projection writes grouped contractor tensors
+     directly, without compact row-major `ab` followed by `stack`/`copy`;
+   - contraction preserves the fast exact-group tensor-core path;
+   - output assembly either writes row-major `[valid_rows, D]` directly or keeps
+     output LayerNorm/gate/residual fused while still in grouped layout;
+   - the full v2 `PairformerBlock` gate must still pass before any model default
+     changes.
+
    Pairformer CUDA graph follow-up: commit `75761ba` added
    `scripts/perf/pairformer_cudagraph_probe.py` to check whether launch/Python
    overhead is a large enough target before committing to native CuTe kernels.
@@ -5136,6 +5170,13 @@ Profiling and reproducibility helpers:
   for the compact segmented update screen.  Use it when a timing result needs
   launch-level attribution, especially to separate producer, contraction,
   output-gate, pack, and scatter costs.
+- `scripts/perf/triangle_update_producer_owned_finish_probe.py`: upper-bound
+  screen for the next native triangle-update boundary.  It pre-materializes
+  exact-length contractor inputs as if the producer had written them directly,
+  then times contraction plus the current output/residual boundary.  Current
+  result: positive even on the long v2 bucket (`1.50-1.51x`), so a native
+  producer-owned exact-group kernel is justified; not a production speedup by
+  itself because producer materialization is excluded.
 - `scripts/perf/pairformer_compact_segmented_triangle_update_probe.py`: full
   v2 `PairformerBlock` gate for the compact segmented triangle-update idea.  It
   replaces both triangle-multiplication updates, zeroes invalid pair rows before
