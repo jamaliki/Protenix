@@ -21,14 +21,19 @@ C_S=${C_S:-384}
 C_Z=${C_Z:-128}
 DTYPE=${DTYPE:-bf16}
 MODULE_DTYPE=${MODULE_DTYPE:-fp32}
+PROTENIX_ATTENTION_FORCE_FP32=${PROTENIX_ATTENTION_FORCE_FP32:-0}
 CAPTURE=${CAPTURE:-cached_bias_reuse}
 WARMUP=${WARMUP:-3}
 NCU_ITERS=${NCU_ITERS:-1}
 NCU_SET=${NCU_SET:-full}
-DEFAULT_NCU_METRICS="gpu__time_duration.sum,gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed,TPC.TriageCompute.sm__pipe_tensor_cycles_active_realtime.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active"
+DEFAULT_NCU_METRICS="gpu__time_duration.sum,gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed,TPC.TriageCompute.sm__pipe_tensor_cycles_active_realtime.avg.pct_of_peak_sustained_active,sm__warps_active.avg.pct_of_peak_sustained_active"
 NCU_METRICS=${NCU_METRICS-$DEFAULT_NCU_METRICS}
+REPORT_SUFFIX=$NCU_SET
+if [[ -n "$NCU_METRICS" ]]; then
+  REPORT_SUFFIX=${NCU_LABEL:-duration_sol}
+fi
 
-RUN_DIR=${RUN_DIR:-"$REPO/runs/diffusion_transformer_ncu_${CAPTURE}_B${BATCH}_S${SAMPLES}_N${TOKENS}_${STAMP}_${COMMIT}"}
+RUN_DIR=${RUN_DIR:-"$REPO/runs/diffusion_transformer_ncu_${CAPTURE}_B${BATCH}_S${SAMPLES}_N${TOKENS}_${REPORT_SUFFIX}_${STAMP}_${COMMIT}"}
 mkdir -p "$RUN_DIR/slurm_logs"
 
 cat > "$RUN_DIR/ncu_job_env.sh" <<EOF
@@ -45,11 +50,13 @@ export C_S=$C_S
 export C_Z=$C_Z
 export DTYPE=$DTYPE
 export MODULE_DTYPE=$MODULE_DTYPE
+export PROTENIX_ATTENTION_FORCE_FP32=$PROTENIX_ATTENTION_FORCE_FP32
 export CAPTURE=$CAPTURE
 export WARMUP=$WARMUP
 export NCU_ITERS=$NCU_ITERS
 export NCU_SET=$NCU_SET
 export NCU_METRICS=$NCU_METRICS
+export NCU_LABEL=${NCU_LABEL:-}
 EOF
 
 JOB_ID=$(

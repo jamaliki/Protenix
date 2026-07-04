@@ -45,11 +45,12 @@ C_S=${C_S:-384}
 C_Z=${C_Z:-128}
 DTYPE=${DTYPE:-bf16}
 MODULE_DTYPE=${MODULE_DTYPE:-fp32}
+PROTENIX_ATTENTION_FORCE_FP32=${PROTENIX_ATTENTION_FORCE_FP32:-0}
 CAPTURE=${CAPTURE:-cached_bias_reuse}
 WARMUP=${WARMUP:-3}
 NCU_ITERS=${NCU_ITERS:-1}
 NCU_SET=${NCU_SET:-full}
-DEFAULT_NCU_METRICS="gpu__time_duration.sum,gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed,TPC.TriageCompute.sm__pipe_tensor_cycles_active_realtime.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active"
+DEFAULT_NCU_METRICS="gpu__time_duration.sum,gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed,TPC.TriageCompute.sm__pipe_tensor_cycles_active_realtime.avg.pct_of_peak_sustained_active,sm__warps_active.avg.pct_of_peak_sustained_active"
 NCU_METRICS=${NCU_METRICS-$DEFAULT_NCU_METRICS}
 
 cd "$PROTENIX_REPO"
@@ -66,6 +67,7 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
 export WANDB_MODE=disabled
 export WANDB_DISABLED=true
+export PROTENIX_ATTENTION_FORCE_FP32
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export TORCHINDUCTOR_CACHE_DIR="$RUN_DIR/torchinductor_cache"
 export TRITON_CACHE_DIR="$RUN_DIR/triton_cache"
@@ -89,7 +91,7 @@ echo "repo=$(pwd) branch=$(git rev-parse --abbrev-ref HEAD) commit=$(git rev-par
 echo "python=$("$PY" --version 2>&1)"
 echo "cc=$CC"
 echo "ncu=$("$NCU" --version | head -5 | tr '\n' '; ')"
-echo "capture=$CAPTURE batch=$BATCH samples=$SAMPLES tokens=$TOKENS dtype=$DTYPE module_dtype=$MODULE_DTYPE ncu_set=$NCU_SET ncu_metrics=${NCU_METRICS:-<set>}"
+echo "capture=$CAPTURE batch=$BATCH samples=$SAMPLES tokens=$TOKENS dtype=$DTYPE module_dtype=$MODULE_DTYPE attention_force_fp32=$PROTENIX_ATTENTION_FORCE_FP32 ncu_set=$NCU_SET ncu_metrics=${NCU_METRICS:-<set>}"
 nvidia-smi
 
 NCU_ARGS=(

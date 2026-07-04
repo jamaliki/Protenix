@@ -23,7 +23,7 @@ METRIC_COLS = {
     "dram %": "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed",
     "mem %": "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed",
     "SM %": "sm__throughput.avg.pct_of_peak_sustained_elapsed",
-    "tensor %": "TPC.TriageCompute.sm__pipe_tensor_cycles_active_realtime.avg.pct_of_peak_sustained_elapsed",
+    "tensor %": "TPC.TriageCompute.sm__pipe_tensor_cycles_active_realtime.avg.pct_of_peak_sustained_active",
     "occ %": "sm__warps_active.avg.pct_of_peak_sustained_active",
 }
 
@@ -53,6 +53,32 @@ def parse_float(value: str | None) -> float:
         return math.nan
 
 
+def time_scale_to_ms(unit: str | None) -> float:
+    """Return the multiplier that converts an NCU duration unit to ms.
+
+    Nsight Compute writes units as the second CSV row, not in the column name.
+    For example, ``gpu__time_duration.sum`` is usually reported in ``us`` for
+    short kernels.  Keeping the output in milliseconds makes one-block NCU
+    summaries comparable with CUDA-event hotspot timings and end-to-end logs.
+    """
+
+    normalized = (unit or "").strip().lower()
+    return {
+        "ns": 1e-6,
+        "nsecond": 1e-6,
+        "nseconds": 1e-6,
+        "us": 1e-3,
+        "usecond": 1e-3,
+        "useconds": 1e-3,
+        "ms": 1.0,
+        "msecond": 1.0,
+        "mseconds": 1.0,
+        "s": 1e3,
+        "second": 1e3,
+        "seconds": 1e3,
+    }.get(normalized, 1.0)
+
+
 def normalize_kernel_name(name: str) -> str:
     """Collapse generated template details while preserving family identity."""
     name = re.sub(r"<.*", "<...>", name)
@@ -72,13 +98,15 @@ def markdown_row(values: list[str]) -> str:
     return "| " + " | ".join(values) + " |"
 
 
-def print_launch_table(rows: list[dict[str, str]], *, top: int, name_width: int) -> None:
+def print_launch_table(
+    rows: list[dict[str, str]], *, top: int, name_width: int, time_ms_scale: float
+) -> None:
     metric_labels = [label for label, col in METRIC_COLS.items() if col in rows[0]]
     headers = ["id", "kernel", "ms", *metric_labels]
     print(markdown_row(headers))
     print(markdown_row(["---", "---", "---:"] + ["---:"] * len(metric_labels)))
     for row in rows[:top]:
-        elapsed = parse_float(row.get(TIME_COL))
+        elapsed = parse_float(row.get(TIME_COL)) * time_ms_scale
         if not math.isfinite(elapsed):
             continue
         values = [
@@ -92,11 +120,13 @@ def print_launch_table(rows: list[dict[str, str]], *, top: int, name_width: int)
         print(markdown_row(values))
 
 
-def print_family_table(rows: list[dict[str, str]], *, top: int) -> None:
+def print_family_table(
+    rows: list[dict[str, str]], *, top: int, time_ms_scale: float
+) -> None:
     families: dict[str, KernelFamily] = {}
     total_ms = 0.0
     for row in rows:
-        elapsed = parse_float(row.get(TIME_COL))
+        elapsed = parse_float(row.get(TIME_COL)) * time_ms_scale
         name = row.get("Kernel Name", "")
         if not math.isfinite(elapsed) or not name:
             continue
@@ -130,19 +160,24 @@ def main() -> None:
     args = parser.parse_args()
 
     with args.csv_path.open(newline="") as handle:
-        rows = list(csv.DictReader(handle))
+        reader = csv.DictReader(handle)
+        units_row = next(reader, None)
+        rows = list(reader)
     if not rows:
         raise SystemExit(f"no rows found in {args.csv_path}")
     if TIME_COL not in rows[0]:
         raise SystemExit(f"{TIME_COL!r} not found in {args.csv_path}")
+    time_ms_scale = time_scale_to_ms(None if units_row is None else units_row.get(TIME_COL))
 
     rows = sorted(rows, key=lambda row: parse_float(row.get(TIME_COL)), reverse=True)
     rows = [row for row in rows if row.get("Kernel Name")]
 
     print("## Top launches\n")
-    print_launch_table(rows, top=args.top, name_width=args.name_width)
+    print_launch_table(
+        rows, top=args.top, name_width=args.name_width, time_ms_scale=time_ms_scale
+    )
     print("\n## Kernel families\n")
-    print_family_table(rows, top=args.top)
+    print_family_table(rows, top=args.top, time_ms_scale=time_ms_scale)
 
 
 if __name__ == "__main__":

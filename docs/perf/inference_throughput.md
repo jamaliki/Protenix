@@ -255,6 +255,81 @@ still a wider model: the comparable optimized base-checkpoint B32 gate above
 was `41.16s` predict and `39.33s` model-forward, so the v2 row remains about
 `1.27x` slower than the base row even after this v2-specific fix.
 
+Real Protenix-v2 mixed-token, low-sample gate: job `103719`
+(`runs/v2_mixed_token_low_sample_gate_20260704_120451_0ecd10c`) measured the
+actual many-sequence target workload: 32 synthetic poly-A records with token
+lengths `40, 52, ..., 220` repeated twice, `--batch_size 16`, confidence
+enabled, `N_step=200`, staged `protenix-v2.pt`, BF16 diffusion core, BF16 full
+token attention, and cached diffusion pair bias.
+
+| case | predict sec | records/s | generated samples/s | pairformer | diffusion | diffusion transformer | confidence |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `N_sample=1` | 39.970 | 0.801 | 0.801 | 21.672 | 15.417 | 7.088 | 0.916 |
+| `N_sample=5` | 46.960 | 0.681 | 3.407 | 21.627 | 20.457 | 11.169 | 2.888 |
+
+This is the current Sam-style v2 reference point.  It is not interchangeable
+with the base-checkpoint `5-6x` rows: v2's wider pair channel keeps the
+pairformer at roughly `21.6s`, and the diffusion stack is still another
+`20.5s` at `N_sample=5`.  Compared with the current base-checkpoint mixed
+rows, v2 is about `25%` slower at `N_sample=1` and about `18%` slower at
+`N_sample=5`; compared with the original low-sample branch boundary, the
+current v2 path is roughly `4.8x` (`N_sample=1`) and `4.5x` (`N_sample=5`), but
+the true original v2 default baseline still needs a matched measurement before
+claiming a v2-specific headline speedup.
+
+The obvious v2 token-bucket heuristic was rejected.  Job `103806`
+(`runs/v2_mixed_bucket88_gate_20260704_121455_0ecd10c`) split the same
+`N_sample=5` queue at about 88-token width.  Pairformer moved only slightly
+(`21.644s -> 21.358s`), while diffusion worsened (`20.419s -> 23.639s`) because
+the token/atom diffusion work fragmented into smaller launch groups.  End to
+end, throughput fell from `3.412` to `3.230` generated samples/s.  For v2, as
+for the base model, the next win is not another Python queue bucket; it needs a
+segmented/ragged pairformer schedule that avoids padded pair work without
+breaking the large diffusion batch.
+
+Diffusion-token transformer NCU for the optimized v2 mixed shape: jobs `103968`
+and `103969`
+(`runs/diffusion_transformer_ncu_cached_bias_reuse_B16_S5_N220_duration*_bf16_1block_20260704_1238_0ecd10c`)
+captured one warmed cached-bias block at `B=16`, `N_sample=5`, `N=220`,
+`c_z=256`, BF16 module weights, and `PROTENIX_ATTENTION_FORCE_FP32=0`.  The
+duration-only and SOL captures were deliberately one block rather than all 24
+blocks, so Nsight Compute could collect launch ranking and roofline signals
+without spending an hour profiling repeated identical blocks.  The NCU raw CSV
+reports `gpu__time_duration.sum` in microseconds for this run; the summarizer
+now reads the unit row and converts to milliseconds.
+
+| kernel family | launches | total ms | roofline signal |
+| --- | ---: | ---: | --- |
+| PyTorch vectorized elementwise kernels | 18 | 0.448 | memory-bound (`~78-86%` memory on the larger add/mul/fill kernels, low tensor use) |
+| BF16 GEMMs, mostly `768x768` projections | 7 | 0.327 | mixed compute/memory (`~56-74%` SM, `~12-23%` tensor, low occupancy) |
+| BF16 SDPA (`fmha_cutlassF_bf16...`) | 1 | 0.251 | material but no longer dominant (`70%` memory, `54%` SM, `10%` tensor) |
+| attention-output copy / pad boundary | 1 copy + SDPA-internal pad | about 0.35 | memory/plumbing, not tensor-core math |
+| `384 -> 768` s/gate GEMMs | 6 | 0.123 | small GEMMs; launch/GEMM efficiency matters more than peak FLOPs |
+| LayerNorm fallback | 4 | 0.063 | small after the Triton fallback |
+
+Interpretation: after BF16 attention and cached pair bias, the v2 diffusion
+token block is not sitting near an H100 tensor-core roofline.  The remaining
+time is a mix of memory-bound elementwise kernels, copies/padding inside the
+attention wrapper, and several medium GEMMs.  A generic "mega-kernel" that
+replaces cuDNN SDPA is not the right next move; the credible diffusion boundary
+would have to fuse a larger slice of the block's elementwise/gate/residual
+plumbing while preserving cuBLAS/cuDNN for the main matrix multiplies.  Even a
+large diffusion-token win would only move about half of the v2 mixed
+`N_sample=5` predict section, so the larger unresolved target remains
+v2 pairformer padding for variable token lengths.
+
+Fast LayerNorm check: job `103979`
+(`runs/diffusion_profile_fastln_patched_B16_S5_N220_1block_20260704_1252_0ecd10c`)
+patched the compile helper locally to find CUDA 13 headers under the
+micromamba/PyTorch `site-packages/nvidia/cu13` layout and successfully built
+`fast_layer_norm_cuda_v2.so`.  The result was slower for this BF16 v2 diffusion
+shape: cached one-block time moved from `1.520 ms` with the current Triton
+fallback to `1.535 ms` with the C++ fast LayerNorm extension, and the four
+LayerNorm launches moved from about `0.063-0.069 ms` to about `0.073 ms`.
+Decision: do not promote the compile-helper patch or keep the built `.so` in
+the remote worktree; the extension was removed so subsequent gates stay on the
+faster current fallback.
+
 Base-shape guardrail: job `101774`
 (`runs/base_cueq_overlay_guard_20260704_063822_6e5a670`) repeated the same
 block screen with the base-checkpoint shape (`c_z=128`,
