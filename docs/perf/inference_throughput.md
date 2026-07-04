@@ -4440,6 +4440,32 @@ short-term implementation ladder is:
    implementation followed by the actual v2 `PairformerBlock` and full
    Sam-style `N_sample=1/5` gates; otherwise the safe decision is to keep CUEQ.
 
+   PairformerBlock varlen-attention screen: commit `eca9a1b` added
+   `scripts/perf/pairformer_varlen_triangle_attention_probe.py` and job
+   `109919` ran the next integration question in
+   `runs/pairformer_varlen_attn_block_eca9a1b_20260704_194721`.  The screen
+   reused the benchmark-only varlen triangle-attention module boundary inside a
+   full v2 `PairformerBlock` with `c_z=256`, `hidden_scale_up=True`, BF16,
+   random zero-initialized projections, CUEQ triangle multiplication, and the
+   current contiguous ending-node CUEQ path.  The fair candidate replaces only
+   starting-node triangle attention; the start+end candidate is intentionally a
+   lower-quality prototype because it physically transposes for ending-node
+   attention instead of reproducing the current contiguous ending producer.
+
+   | bucket | baseline block | best start-varlen block | best start+end-varlen-transpose block | decision |
+   | --- | ---: | ---: | ---: | --- |
+   | short `40-124` | 10.286 ms | 10.186 ms (`1.010x`) | 10.396 ms (`0.989x`) | reject production wiring |
+   | long `136-220` | 25.878 ms | 25.644 ms (`1.009x`) | 26.055 ms (`0.993x`) | reject production wiring |
+
+   Valid-region drift stayed within BF16 downstream tolerance (`z` max abs
+   `0.0625`, mean abs about `0.0015`; `s` max abs `0.03125`, mean abs about
+   `0.0023-0.0026`).  This closes the obvious "just use the varlen attention
+   core in PairformerBlock" path: the full block only moves about one percent,
+   and the naive ending-node version is slower once it gives back the optimized
+   CUEQ ending producer.  A future triangle-attention attempt must own a larger
+   production boundary, especially the LayerNorm/qkv/bias/gate/output producer
+   for both starting and ending orientations, or it should not displace CUEQ.
+
    Fused producer follow-up: commits `9b238f1`, `9ba65f4`, `4660f23`,
    `9b58fc6`, and `a22eec7` tested the next larger triangle-multiplication
    boundary: fuse input LayerNorm with the dual input gated GEMM and write
@@ -4722,6 +4748,11 @@ Profiling and reproducibility helpers:
   skipping padded pair rows/query tiles/key ranges survives the real
   LayerNorm/projection/epilogue boundary; the current fused-epilogue screen is
   a small module-level win, not a promoted model path.
+- `scripts/perf/pairformer_varlen_triangle_attention_probe.py`: full
+  PairformerBlock screen for that same varlen triangle-attention boundary.  It
+  answers whether the module-level attention win survives the real v2 block
+  with CUEQ triangle multiplication, pair transition, token attention, and the
+  current optimized ending-node CUEQ path.
 - `scripts/perf/triangle_multiplication_ragged_hotspot.py`: v2 BF16
   CUEQ triangle-multiplication screen for padded versus smaller ragged islands;
   use it to filter segmented-kernel ideas before touching production code.
