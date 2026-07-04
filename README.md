@@ -280,7 +280,7 @@ dumping:
 | 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.1 s wall, 29.9 s summed predict, 0.968 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.83x single-process throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 41.6 s, 3.85 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, BF16 diffusion core, BF16 atom attention, Triton local atom attention, default Triton LayerNorm fallback, and cached diffusion pair bias | 5.11x over the old branch boundary |
 | Same mixed-token `N_sample=1` workload, many campaign shards on one H100 | 0.166 records/s original low-sample boundary | 1.77 records/s with five `--batch_size 16` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20` | 10.7x per-GPU operational throughput |
-| Same mixed-token workload, many campaign shards on one H100 | 0.753 generated samples/s original low-sample boundary | 5.53 generated samples/s with five `--batch_size 16` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20` | 7.3x per-GPU operational throughput |
+| Same mixed-token `N_sample=5` workload, many campaign shards on one H100 | 0.753 generated samples/s original low-sample boundary | 6.41 generated samples/s with nine `--batch_size 8` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=11` | 8.5x per-GPU operational throughput |
 
 For same-token, variable-atom campaigns, compare the `predict` or
 model-forward section rather than the outer Slurm/script wall time.  Current
@@ -292,8 +292,12 @@ Seeing `token-trunk+diffusion-token-atom-batch` in the log means batching is
 working; it does not mean the run is using the exact-shape `7r6r` path.
 
 For the mixed-token, low-sample workload, keep `--batch_size 16` as the current
-fixed-batch default: B8 loses diffusion/atom batching efficiency, while B32
-loses more to padded trunk and diffusion-transformer shapes.
+single-process fixed-batch default: B8 loses diffusion/atom batching efficiency
+when run by itself, while B32 loses more to padded trunk and
+diffusion-transformer shapes.  Under CUDA MPS, where several independent
+campaign shards overlap on one H100, the best `N_sample=5` throughput gate so
+far uses smaller per-worker batches: nine `--batch_size 8` workers at
+`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=11`.
 
 #### Optional: fill one H100 with multiple campaign workers
 
@@ -305,21 +309,24 @@ JSON shards and care about aggregate samples/sec more than one shard's latency.
 
 Important details:
 
-- Keep each worker on the same optimized settings above, especially
-  `--batch_size 16` for mixed 40-220-token proteins.
+- Keep each worker on the same optimized settings above.  For a simple balanced
+  mode and for `N_sample=1`, use `--batch_size 16` with five workers at 20%.
+  For maximum `N_sample=5` aggregate throughput, the current best gate is
+  `--batch_size 8` with nine workers at 11%; each shard is slower, but the H100
+  is better filled.
 - Start CUDA MPS with pipe and log directories on a node-local filesystem such
   as `/tmp`.  Do not put `CUDA_MPS_PIPE_DIRECTORY` on Lustre; the MPS control
   socket may fail there.
 - In the current H100 gates, five MPS workers with
-  `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20` are the practical knee.  On the mixed
-  `N_sample=1`, `N_step=200` workload they reached `1.77` records/s, which is
-  about `10.7x` over the original low-sample branch boundary (`0.166`
-  records/s).  On the mixed `N_sample=5`, `N_step=200` workload they reached
-  `5.53` generated samples/s, `1.44x` over the prior single-process promoted
-  rate (`3.85` generated samples/s) and about `7.3x` over the original
-  low-sample branch boundary (`0.753` generated samples/s).  Seven workers at
-  `14%` reached `5.55` generated samples/s once for `N_sample=5`, but that is
-  within noise while adding more memory pressure and per-shard latency.
+  `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20` remain the practical knee for
+  `N_sample=1`: they reached `1.77` records/s, about `10.7x` over the original
+  low-sample branch boundary (`0.166` records/s).  For mixed `N_sample=5`,
+  smaller per-worker batches helped once MPS recovered occupancy: nine
+  `--batch_size 8` workers at 11% reached `6.41` generated samples/s, `1.67x`
+  over the prior single-process promoted rate (`3.85` generated samples/s) and
+  about `8.5x` over the original low-sample boundary (`0.753` generated
+  samples/s).  Ten B8 workers regressed to `6.29` generated samples/s, so do
+  not keep adding workers blindly.
 - Keep `PROTENIX_PREFETCH_DATALOADER=1` for long MPS campaigns if host memory
   allows it, but treat it as a modest host-overlap polish rather than the main
   speedup.  In paired five-worker MPS gates it added `1-2%` throughput while
@@ -341,7 +348,9 @@ export CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20
 mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
 nvidia-cuda-mps-control -d
 
-# Launch five shards per H100; run another wave after wait returns.
+# Launch independent shards per H100; run another wave after wait returns.
+# Use 5 shards with --batch_size 16 for N_sample=1 or balanced operation.
+# Use 9 shards with --batch_size 8 for maximum N_sample=5 throughput.
 for shard in shard_0.json shard_1.json shard_2.json shard_3.json shard_4.json; do
   protenix pred -i "$shard" -o "out/${shard%.json}" \
     -s 101 -c 10 -p 200 -e 5 -d bf16 \

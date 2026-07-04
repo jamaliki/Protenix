@@ -3357,21 +3357,54 @@ because it is a small reproducible end-to-end win, but do not treat it as a
 kernel or model-forward optimization.  The MPS-mode speedup still comes from
 filling under-occupied GPU time with independent workers.
 
+MPS batch-width hill climb for the `N_sample=5` endpoint: commit `1d6b0e1`,
+one H100, same synthetic mixed 32-record 40-220-token shape family per worker,
+`N_step=200`, confidence and normal dumping enabled, prefetch on.  The first
+attempt, job `100929`, is intentionally not counted because the sbatch omitted
+the dev compiler environment and Triton could not JIT local attention
+(`Failed to find C compiler`).  The corrected gates set `CC/CXX` from
+`/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/dev/bin`.
+
+Job `100969`, run directory
+`runs/mps_batchwidth_nsample5_cc_20260704_051411_1d6b0e1`, compared the
+documented B16/five-worker control to smaller per-worker batches:
+
+| mode | workers | active thread % | batch size | generated samples | wall s | wall samples/s | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| CUDA MPS, `/tmp` socket | 5 | 20 | 16 | 800 | 141.99 | 5.634 | same-node control; matches prior prefetch gate |
+| CUDA MPS, `/tmp` socket | 6 | 16 | 12 | 960 | 177.54 | 5.407 | reject |
+| CUDA MPS, `/tmp` socket | 8 | 12 | 8 | 1280 | 214.62 | 5.964 | useful; smaller batches need more overlap |
+
+Follow-up job `101137`, run directory
+`runs/mps_b8_width_nsample5_20260704_053429_1d6b0e1`, hill-climbed B8 width:
+
+| mode | workers | active thread % | batch size | generated samples | wall s | wall samples/s | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| CUDA MPS, `/tmp` socket | 9 | 11 | 8 | 1440 | 224.57 | 6.412 | best measured `N_sample=5` throughput mode |
+| CUDA MPS, `/tmp` socket | 10 | 10 | 8 | 1600 | 254.54 | 6.286 | regressed; too much contention |
+
+Interpretation: `--batch_size 8` is still the wrong single-process default, but
+with enough independent MPS workers it reduces padded work per shard while MPS
+recovers GPU occupancy.  This is a throughput-only mode: each worker's own
+campaign latency is worse (`~224s` for B8/9 versus `~142s` for B16/5), but
+aggregate per-GPU generated samples/s improves.  The current best `N_sample=5`
+operational speedup is `6.412 / 0.753 = 8.5x` over the original low-sample
+boundary, still short of the `10x` target.
+
 Interpretation:
 
 - Ordinary process concurrency proves there is some underfill, but context
   isolation and contention cap the win quickly.
 - CUDA MPS materially improves overlap across independent workers.  Adding
-  `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` helps once there are enough workers:
-  five workers at `20%` reached `5.532` generated samples/s.  Seven workers at
-  `14%` produced the highest single measured number (`5.545`) but only by
-  `0.2%`, while adding more memory pressure and per-shard latency.  Treat
-  **five MPS workers per H100 at 20% each** as the practical knee for both
-  `N_sample=1` and `N_sample=5`.
+  `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` helps once there are enough workers.  For
+  `N_sample=1`, treat **five MPS workers per H100 at 20% each** as the
+  practical knee.  For maximum `N_sample=5` aggregate throughput, the best
+  measured operational mode is **nine B8 workers at 11% each**.
 - Compared with the prior promoted single-process low-sample rate (`3.85`
-  generated samples/s), `5.532` generated samples/s is a `1.44x` operational
-  gain.  Compared with the original low-sample branch boundary (`0.753`
-  generated samples/s), it is about `7.3x` per-GPU throughput.
+  generated samples/s), the B8/nine-worker `6.412` generated samples/s result
+  is a `1.67x` operational gain.  Compared with the original low-sample branch
+  boundary (`0.753` generated samples/s), it is about `8.5x` per-GPU
+  throughput.
 - For `N_sample=1`, current single-process throughput is `0.968` records/s
   versus the original `0.166` records/s default (`5.83x`).  Five MPS workers at
   20% raise that to `1.769` records/s, or about `10.7x` over the original
@@ -3379,7 +3412,7 @@ Interpretation:
 - This is not a substitute for kernel work: each worker individually slows down
   as width increases, and the aggregate curve is already flattening.  The
   `N_sample=1` endpoint now clears the requested `10x` per-GPU target
-  operationally, but the `N_sample=5` endpoint remains at about `7.3x`.  Closing
+  operationally, but the `N_sample=5` endpoint remains at about `8.5x`.  Closing
   that gap still needs a larger true kernel/layout win, not just more same-GPU
   processes.
 
