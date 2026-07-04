@@ -328,14 +328,22 @@ dumping:
 | One combined JSON with 32 same-shape records | 361.8 s runner time | 69.3 s runner time | 5.2x after initialization |
 | 32 same-token, variable-atom 251-token records, base checkpoint | 301.9 s summed predict at `--batch_size 1` | 41.2 s predict, 39.3 s model-forward at `--batch_size 32`; pairformer is 26.7 s with the large-row dual-GEMM transition guard | 7.3x predict vs current unbatched path |
 | 32 same-token, variable-atom 251-token records, Protenix-v2 checkpoint | prior current-HEAD user rerun: 77.2 s model-forward, dominated by 62.1 s pairformer | 52.1 s predict, 50.4 s model-forward at `--batch_size 32`; pairformer is 38.0 s with the H100 CUEQ cache overlay | 1.53x model-forward vs that v2 rerun; v2 remains about 1.27x slower than the base-checkpoint row |
-| 32 variable-length proteins, 40-220 tokens, Protenix-v2 checkpoint, `N_sample=5`, `N_step=200` | true original v2 default still needs a matched measurement | 47.0 s, 3.41 generated samples/s at `--batch_size 16` in the original v2 low-sample gate; the later paired transition-guard gate moved pairformer about `21.4s -> 19.9-20.2s` within-job | current Sam-style v2 reference point; the transition guard is a small pairformer win, not a headline 10x result |
+| 32 variable-length proteins, 40-220 tokens, Protenix-v2 checkpoint, `N_sample=1`, matched upstream-compatible gate | upstream v2 plus only the safe LayerNorm fallback: 290 s wall, 231.2 s model-forward, 0.110 records/s wall | 144 s wall, 81.9 s predict, 0.222 records/s wall at `--batch_size 16` | 2.01x wall, 2.82x model/predict |
+| Same Protenix-v2 mixed-token gate, `N_sample=5` | upstream v2 plus only the safe LayerNorm fallback: 327 s wall, 267.0 s model-forward, 0.489 generated samples/s wall | 163 s wall, 98.8 s predict, 0.982 generated samples/s wall at `--batch_size 16` | 2.01x wall, 2.70x model/predict |
 | 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.1 s wall, 29.9 s summed predict, 0.968 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.83x single-process throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 38.3 s, 4.18 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, BF16 diffusion core, BF16 atom attention, Triton local atom attention, default Triton LayerNorm fallback, cached diffusion pair bias, and guarded triangle LN+q/k/v production | 5.55x over the old branch boundary |
 | Same mixed-token `N_sample=1` workload, many campaign shards on one H100, base checkpoint | 0.166 records/s original low-sample boundary | 1.77 records/s with five `--batch_size 16` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20` | 10.7x per-GPU operational throughput |
 | Same mixed-token `N_sample=5` workload, many campaign shards on one H100, base checkpoint | 0.753 generated samples/s original low-sample boundary | 6.72 generated samples/s with sixteen `--batch_size 4` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=6` | 8.9x per-GPU operational throughput |
-| Same Protenix-v2 mixed-token workload, many campaign shards on one H100, `N_sample=1` | current v2 single-process reference: 0.796 records/s at `--batch_size 16`; a matched original v2 default still needs measuring | 1.25 records/s with five `--batch_size 16` workers under CUDA MPS at 20% | 1.57x over current v2 single-process throughput |
+| Same Protenix-v2 mixed-token workload, many campaign shards on one H100, `N_sample=1` | current v2 single-process reference: 0.796 records/s at `--batch_size 16`; a pristine original v2 default still needs measuring | 1.25 records/s with five `--batch_size 16` workers under CUDA MPS at 20% | 1.57x over current v2 single-process throughput |
 | Same Protenix-v2 mixed-token workload, many campaign shards on one H100, `N_sample=5` | current v2 single-process reference: 3.29 generated samples/s at `--batch_size 16` | 4.62 generated samples/s with eight `--batch_size 8` workers under CUDA MPS at 12%; ten `--batch_size 4` workers were slightly slower and sixteen B4 workers OOMed | 1.40x over current v2 single-process throughput |
+
+The matched Protenix-v2 rows use an "upstream-compatible" control because the
+pristine upstream `fast_layer_norm_cuda_v2` extension currently fails to build
+in the Tokyo CUDA 13/PyTorch 2.11 environment.  The control is upstream code
+plus only this branch's safe LayerNorm fallback, and both sides use that same
+fallback.  Treat those rows as the conservative v2 speedup to quote for
+Sam-style mixed-sequence predictions.
 
 For same-token, variable-atom campaigns, compare the `predict` or
 model-forward section rather than the outer Slurm/script wall time.  Current
@@ -348,12 +356,16 @@ re-benchmarked.  Protenix-v2 is a wider pairformer model (`c_z=256` with
 the current v2 same-checkpoint gate moved a prior `77.2s` model-forward report
 to `50.4s`, mainly by reducing pairformer from `62.1s` to `38.0s`.  That is a
 real v2 win, but not the same claim as the base-checkpoint `7.3x` row.  For
-mixed-token, low-sample v2 campaigns, the current single-process reference is
-`3.29-3.41` generated samples/s at `--batch_size 16` with `N_sample=5`;
-same-GPU MPS raises that only to `4.62` generated samples/s with eight B8
-workers.  This remains split between the wider pairformer and denoising work,
-so the next large win needs true ragged/segmented pairformer work rather than
-more queue bucket tuning or blindly adding MPS workers.
+mixed-token, low-sample v2 campaigns, the matched upstream-compatible gate is
+about `2.0x` end to end and `2.7-2.8x` inside model/predict, not the
+base-checkpoint `5-6x` headline.  Older warmed current-only v2 gates reached
+`3.29-3.41` generated samples/s at `--batch_size 16` with `N_sample=5`, and
+same-GPU MPS raised that current-only rate to `4.62` generated samples/s with
+eight B8 workers; those are useful capacity numbers, but they are not matched
+speedups over upstream.  The remaining cost is split between the wider
+pairformer and denoising work, so the next large win needs true
+ragged/segmented pairformer work rather than more queue bucket tuning or
+blindly adding MPS workers.
 Seeing `token-trunk+diffusion-token-atom-batch` in the log means batching is
 working; it does not mean the run is using the exact-shape `7r6r` path.
 
@@ -371,7 +383,11 @@ individual shard is slower than the single-process B16 mode, but aggregate
 samples/sec per H100 is higher.
 
 For Sam-style Protenix-v2 work, treat the v2 rows above as the target workload,
-not the base-checkpoint headline.  A focused H100 profile of the exact sorted
+not the base-checkpoint headline.  The current matched win is closer to `2x`
+end to end because Protenix-v2 has a wider pair representation (`c_z=256`,
+`hidden_scale_up=True`) and low-sample, mixed-token batches do not amortize the
+trunk as aggressively as large-sample single-sequence jobs.  A focused H100
+profile of the exact sorted
 mixed-token trunk buckets (`B16/N124` and `B16/N220`, `c_z=256`,
 `hidden_scale_up=True`) shows the remaining v2 cost is real pairformer work:
 the long bucket spends about 46% of one block in triangle attention, 29% in

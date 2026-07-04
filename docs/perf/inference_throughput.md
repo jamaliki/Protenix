@@ -273,9 +273,44 @@ pairformer at roughly `21.6s`, and the diffusion stack is still another
 `20.5s` at `N_sample=5`.  Compared with the current base-checkpoint mixed
 rows, v2 is about `25%` slower at `N_sample=1` and about `18%` slower at
 `N_sample=5`; compared with the original low-sample branch boundary, the
-current v2 path is roughly `4.8x` (`N_sample=1`) and `4.5x` (`N_sample=5`), but
-the true original v2 default baseline still needs a matched measurement before
-claiming a v2-specific headline speedup.
+current v2 path is roughly `4.8x` (`N_sample=1`) and `4.5x` (`N_sample=5`).
+That earlier gate was current-branch-only; the matched executable baseline is
+below.  A pristine original v2 default still needs a compatible CUDA/PyTorch
+environment before claiming a pristine-upstream speedup.
+
+Matched upstream-compatible Protenix-v2 gate for Sam-style predictions: job
+`109913`
+(`runs/v2_sam_paired_upstream_compat_current_20260704_192226_c3bfc36_ee9f1a2`)
+measured the current branch against an upstream-compatible v2 baseline on the
+same one H100.  The pristine upstream commit `c3bfc36` could not run in the
+Tokyo CUDA 13/PyTorch 2.11 environment because the mandatory
+`fast_layer_norm_cuda_v2` extension failed to compile; jobs `109906` and
+`109907` failed before inference.  To make a fair executable control, the
+baseline used upstream code plus only the safe LayerNorm fallback files copied
+from this branch, and both sides set `PROTENIX_DISABLE_FAST_LAYER_NORM=1`.
+This is therefore the conservative matched number to quote for Sam Pellock's
+`protenix-v2` workload, not a pristine-upstream number.
+
+The input was 32 protein-only records with lengths
+`40, 40, 52, 52, ..., 220, 220`, no MSA/template, BF16, confidence retained,
+`--batch_size 16` on the current branch, and CUEQ triangle kernels on both
+sides.  Throughput below reports generated structures per second, so
+`N_sample=5` has 160 generated samples.
+
+| case | baseline wall | current wall | wall speedup | baseline model/predict | current predict | model speedup | current pairformer | current diffusion | current confidence |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `N_sample=1` | `290s` (`0.110`/s) | `144s` (`0.222`/s) | `2.01x` | `231.24s` (`0.138`/s) | `81.89s` (`0.391`/s) | `2.82x` | `26.39s` | `16.76s` | `3.67s` |
+| `N_sample=5` | `327s` (`0.489`/s) | `163s` (`0.982`/s) | `2.01x` | `267.03s` (`0.599`/s) | `98.75s` (`1.620`/s) | `2.70x` | `26.22s` | `31.58s` | `5.87s` |
+
+Interpretation: for the actual wide-`z` v2 workload, the current branch is
+closer to a `2x` end-to-end improvement over an executable default baseline
+than to the base-checkpoint `5-6x` headline.  The model-side batching/fusion
+work is stronger (`2.7-2.8x`), but full wall time still includes Python
+orchestration, feature/output work, and per-batch setup.  Confidence is
+retained and is no longer the main target (`3-6s` across the two current
+batches); the remaining material v2 compute is the wider pairformer plus
+diffusion.  Further large gains need a real ragged/segmented pairformer kernel
+boundary, not more configuration-only tuning.
 
 The obvious v2 token-bucket heuristic was rejected.  Job `103806`
 (`runs/v2_mixed_bucket88_gate_20260704_121455_0ecd10c`) split the same
