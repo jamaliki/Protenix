@@ -4048,6 +4048,96 @@ Decision: do not add a production triangle-mul bucket path.  Keep the hotspot
 as a reusable filter, and only pursue ragged triangle work if the next prototype
 is a real one-launch segmented/CuTe boundary rather than multiple CUEQ calls.
 
+### CUEQ reverse-engineering: the native boundary worth targeting
+
+The installed CUEQ package in the Tokyo `env-boltz2` environment was inspected
+after the v2 mixed-token profile.  The important result is that CUEQ is not fast
+because it hides one magical "mega-kernel"; it is fast because it keeps the
+large pieces on vendor-quality dense schedules and fuses the narrow memory-bound
+layout boundaries around them.  That is the standard a Protenix kernel has to
+meet before it belongs in the production path.
+
+For triangle attention, the public CUEQ wrapper is dense.  It accepts q/k/v in
+`[B, I, H, S, D]`, a dense triangle bias in `[B, 1, H, S_q, S_k]`, and an
+optional dense mask in `[B, I, 1, 1, S_k]`.  On H100 the wrapper materializes the
+required q/k/v and bias layouts and calls CUEQ's CUDA extension, which in turn
+uses a cuDNN FMHA-style dense interface parameterized by scalar `B`, `I`, `H`,
+`S_q`, `S_k`, and `D`.  There is no public per-record length array.  Therefore,
+true ragged triangle attention is not a Protenix-side flag; it needs either a
+new grouped/segmented native attention op or a patch to CUEQ's native attention
+interface.  Python grouping into many smaller CUEQ calls is exactly the launch
+fragmentation pattern that the ragged-islands screens rejected.
+
+Triangle multiplication exposes a cleaner first native boundary.  CUEQ's dense
+inference path does the following for `x: [B, N, N, D]`:
+
+1. fused LayerNorm plus layout production;
+2. a Triton fused sigmoid-gated dual GEMM over the flattened `B*N*N` pair rows,
+   optionally storing the result transposed as `[2D, B, N, N]`;
+3. a tensor-core triangular contraction, equivalent to
+   `out[d,b,i,j] = sum_k a[d,b,i,k] * b[d,b,j,k]` for outgoing updates, with
+   the analogous incoming orientation;
+4. fused output LayerNorm/layout conversion back to `[B, N, N, D]`;
+5. a second fused gated dual GEMM for the output projection/gate.
+
+The H100 cache overlay in this branch helps because step 2 is autotuned by
+rounded `M`, `N`, `K`, dtype, and transpose mode.  Protenix-v2's wide
+`c_z=256` shape needed larger H100 tiles that were absent from CUEQ's shipped
+cache.  Once those tiles are supplied, the remaining CUEQ triangle-multiplication
+cost is not an obvious weak kernel; it is the dense schedule doing padded work
+for mixed token lengths.
+
+The first attractive CuTe/CUDA target is therefore not "rewrite the whole
+pairformer".  It is a segmented triangle-multiplication update that keeps one
+large launch family while taking a `lengths: int32[B]` vector:
+
+```text
+segmented_triangle_multiplicative_update(
+    z_padded: bf16[B, Nmax, Nmax, 256],
+    lengths: int32[B],
+    direction: outgoing|incoming,
+    module weights,
+) -> bf16[B, Nmax, Nmax, 256]
+```
+
+The production ABI should keep dense padded input/output tensors so the rest of
+the pairformer does not need an immediate ragged storage rewrite, but its native
+kernels should skip invalid `(i, j, k)` work internally from `lengths`.  The
+short-term implementation ladder is:
+
+1. **CuTe contraction screen:** replace only the `a,b -> update` triangular
+   contraction after CUEQ's gated input projection.  This is the smallest way to
+   test whether our tile schedule can beat the current dense tensor-core
+   contraction while respecting per-record lengths.  It is not enough for a full
+   win because LayerNorm/projection still run over padded pair rows.
+2. **Full segmented triangle-mul update:** fuse or internally schedule the
+   LayerNorm, gated input projection, segmented contraction, output LayerNorm,
+   output projection/gate, and residual store for valid rows.  This is the first
+   candidate that can attack most of the measured triangle-multiplication
+   padding waste without fragmenting the block into many CUEQ calls.
+3. **Segmented triangle attention:** only after the multiplication schedule is
+   credible, attempt grouped/segmented attention that preserves cuDNN/CUEQ-class
+   softmax throughput.  This is harder because the current fast path's native
+   attention interface is dense.
+
+Promotion bar for the first real segmented triangle-mul candidate:
+
+- tested on the Sam-style v2 buckets (`B16/N124` and `B16/N220`, BF16,
+  `c_z=256`, `hidden_scale_up=True`);
+- valid-region parity versus current CUEQ at BF16 noise levels, with padded
+  regions explicitly ignored or zeroed by contract;
+- at least a double-digit triangle-multiplication boundary win on both buckets
+  before model integration.  The previous multi-call split only delivered
+  `1.03-1.05x`, which is not enough after full-block dilution;
+- no extra gather/scatter or host-side launch fragmentation;
+- a representative full Protenix-v2 `N_sample=1` and `N_sample=5` gate before
+  changing defaults.
+
+This is the "go for the meat" path for Protenix-v2.  It attacks the wider-z
+pairformer work Sam's workload actually pays for, while preserving the lesson
+from CUEQ: do not replace vendor-quality dense kernels with a slower custom
+kernel merely because the custom kernel fuses more source-level operations.
+
 ## Negative results worth remembering
 
 These failed because the real workload, not the isolated kernel, is the gate:
