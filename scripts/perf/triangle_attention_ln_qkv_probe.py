@@ -20,6 +20,10 @@ boundaries in the same process:
   weights, and writes CUEQ's physical ``[B, I, H, J, D]`` (or swapped ending
   ``[B, J, H, I, D]``) layout directly.
 
+Use ``--store-normalized true`` for the production-usable boundary: triangle
+attention still needs the normalized activation for the bias and gate
+projections, so a real integration must write ``x_norm`` as well as q/k/v.
+
 The fused kernel intentionally uses BF16 tensor-core dot products after FP32
 row statistics, matching the throughput-oriented inference mode we care about.
 If it cannot beat the cached producer here, a production integration would only
@@ -82,6 +86,7 @@ if triton is not None and tl is not None:
         gamma_ptr,
         beta_ptr,
         weight_ptr,
+        norm_out_ptr,
         q_ptr,
         k_ptr,
         v_ptr,
@@ -93,6 +98,7 @@ if triton is not None and tl is not None:
         head_dim: tl.constexpr,
         eps: tl.constexpr,
         swapped: tl.constexpr,
+        store_normalized: tl.constexpr,
         block_m: tl.constexpr,
         block_n: tl.constexpr,
         block_k: tl.constexpr,
@@ -123,6 +129,13 @@ if triton is not None and tl is not None:
         beta = tl.load(beta_ptr + k_offsets, mask=k_mask, other=0.0).to(tl.float32)
         norm = centered * inv_std[:, None]
         norm = tl.where(k_mask[None, :], norm * gamma[None, :] + beta[None, :], 0.0)
+        if store_normalized:
+            norm_offsets = row_offsets[:, None] * c_z + k_offsets[None, :]
+            tl.store(
+                norm_out_ptr + norm_offsets,
+                norm,
+                mask=(component == 0) & row_mask[:, None] & k_mask[None, :],
+            )
 
         hidden = head_count * head_dim
         weight_rows = component * hidden + hidden_offsets
@@ -294,15 +307,19 @@ def current_producer(
     x: torch.Tensor,
     *,
     swapped: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    store_normalized: bool,
+) -> tuple[torch.Tensor, ...]:
     x_norm = module.layer_norm(x)
-    return module.mha._prep_qkv(
+    q, k, v = module.mha._prep_qkv(
         x_norm,
         x_norm,
         apply_scale=False,
         cueq_heads_first=True,
         cueq_swap_pair_axes=swapped,
     )
+    if store_normalized:
+        return x_norm, q, k, v
+    return q, k, v
 
 
 def cached_producer(
@@ -311,7 +328,8 @@ def cached_producer(
     weight: torch.Tensor,
     *,
     swapped: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    store_normalized: bool,
+) -> tuple[torch.Tensor, ...]:
     x_norm = module.layer_norm(x)
     with torch.amp.autocast("cuda", enabled=False):
         qkv = F.linear(x_norm, weight)
@@ -322,6 +340,8 @@ def cached_producer(
     )
     if out is None:
         raise RuntimeError("Triton qkv layout helper rejected the benchmark shape")
+    if store_normalized:
+        return x_norm, *out
     return out
 
 
@@ -332,7 +352,8 @@ def fused_producer(
     *,
     swapped: bool,
     config: KernelConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    store_normalized: bool,
+) -> tuple[torch.Tensor, ...]:
     if triton is None or tl is None:
         raise RuntimeError("Triton is required for fused producer benchmark")
     if x.dtype != torch.bfloat16:
@@ -350,6 +371,7 @@ def fused_producer(
     q = torch.empty(out_shape, dtype=x.dtype, device=x.device)
     k = torch.empty_like(q)
     v = torch.empty_like(q)
+    norm_out = torch.empty_like(x) if store_normalized else q
 
     total_rows = batch * i_count * j_count
     hidden = head_count * head_dim
@@ -364,6 +386,7 @@ def fused_producer(
         module.layer_norm.weight,
         module.layer_norm.bias,
         weight,
+        norm_out,
         q,
         k,
         v,
@@ -375,21 +398,24 @@ def fused_producer(
         head_dim,
         module.layer_norm.eps,
         swapped,
+        store_normalized,
         config.block_m,
         config.block_n,
         block_k,
         num_warps=config.num_warps,
         num_stages=3,
     )
+    if store_normalized:
+        return norm_out, q, k, v
     return q, k, v
 
 
 def time_cuda(
-    fn: Callable[[], tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    fn: Callable[[], tuple[torch.Tensor, ...]],
     *,
     warmup: int,
     iters: int,
-) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], float]:
+) -> tuple[tuple[torch.Tensor, ...], float]:
     out = fn()
     for _ in range(warmup):
         out = fn()
@@ -435,12 +461,23 @@ def run_case(
 
     with torch.inference_mode(), cuda_autocast(args.compute_dtype):
         current_out, current_ms = time_cuda(
-            lambda: current_producer(module, x, swapped=swapped),
+            lambda: current_producer(
+                module,
+                x,
+                swapped=swapped,
+                store_normalized=args.store_normalized,
+            ),
             warmup=args.warmup,
             iters=args.iters,
         )
         cached_out, cached_ms = time_cuda(
-            lambda: cached_producer(module, x, weight, swapped=swapped),
+            lambda: cached_producer(
+                module,
+                x,
+                weight,
+                swapped=swapped,
+                store_normalized=args.store_normalized,
+            ),
             warmup=args.warmup,
             iters=args.iters,
         )
@@ -454,6 +491,7 @@ def run_case(
                     weight,
                     swapped=swapped,
                     config=config,
+                    store_normalized=args.store_normalized,
                 ),
                 warmup=args.warmup,
                 iters=args.iters,
@@ -516,6 +554,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--store-normalized",
+        type=str_bool,
+        default=False,
+        help=(
+            "Also write and compare the normalized activation. This is the "
+            "production-usable boundary because triangle attention reuses "
+            "x_norm for bias and gate projections."
+        ),
+    )
     parser.add_argument(
         "--kernel-configs",
         type=parse_kernel_configs,
