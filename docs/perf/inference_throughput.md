@@ -4416,6 +4416,32 @@ short-term implementation ladder is:
    enough that a custom triangle update amortizes its own scheduling and epilogue
    work.
 
+   Pairformer CUDA graph follow-up: commit `75761ba` added
+   `scripts/perf/pairformer_cudagraph_probe.py` to check whether launch/Python
+   overhead is a large enough target before committing to native CuTe kernels.
+   The probe captures a real v2-width `PairformerStack` (`c_z=256`,
+   `hidden_scale_up=True`, CUEQ triangle attention/multiplication) and reports
+   both the optimistic `graph.replay()` ceiling and the realistic replay after
+   copying changed `s/z` inputs into graph-owned buffers.  Job `110083`, run
+   `runs/pairformer_cudagraph_75761ba_20260704_214831_prod_cache`, used the
+   production H100 CUEQ cache overlay (`CUEQ_TRITON_CACHE_DIR` unset) and the
+   same two sorted Sam-style v2 buckets:
+
+   | bucket / blocks | eager `s/z` copy | graph `s/z` copy | speedup | decision |
+   | --- | ---: | ---: | ---: | --- |
+   | short `B16/N124`, 1 block | `10.034 ms` | `9.749 ms` | `1.029x` | too small |
+   | long `B16/N220`, 1 block | `25.884 ms` | `25.716 ms` | `1.007x` | reject |
+   | short `B16/N124`, 48 blocks | `482.163 ms` | `465.799 ms` | `1.035x` | too small |
+   | long `B16/N220`, 48 blocks | `1236.806 ms` | `1238.131 ms` | `0.999x` | reject |
+
+   Replay was exact for the reset-input rows (`s/z` max abs `0.0`), and graph
+   memory was lower because the graph pool reuses static addresses.  Throughput
+   is the blocker: launch overhead is visible only in the short bucket and
+   disappears on the long full-stack bucket that dominates the useful wide-v2
+   work.  Do not spend engineering time on Pairformer graph plumbing as the next
+   main lever; it can be revisited only if a future fixed-shape deployment needs
+   lower allocator pressure rather than higher samples/sec.
+
    Triton segmented scheduler follow-up: commits `d2cda3e` and `4125803` added
    `scripts/perf/triangle_contraction_triton_segmented_probe.py`.  This was the
    non-library version of the same question: one Triton launch, direct
@@ -4865,6 +4891,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Inference DataLoader workers for exact-shape batches | B8 had a small screen win, but B32 hit tensor-sharing failures unless switched to slower file-system sharing; clean B32 no-worker batching was better | do not add host-pipeline complexity unless it survives the actual many-input gate |
 | Parallel or async CIF/JSON dumping | per-batch parallel dumping improved one B32 dump section only `5.35s -> 5.09s` and total predict+dump only `47.75s -> 47.47s`; a stronger async writer pipeline on a 256-record/8-batch gate was also flat (`413.65s -> 412.36s` seed wall, all outputs present) | dumping looks idle from the GPU view, but writer threads contend with the same host/filesystem path that prepares later batches; do not carry default-off writer pools unless an end-to-end campaign gate moves |
 | CUDA graph replay of the diffusion-token transformer | exact and mildly faster in isolation (`1.07x` at `N=124`, `1.02x` at `N=220`), but the long-shape ceiling is under 2% e2e | launch overhead is not the meat of the remaining transformer bottleneck; revisit only as part of a larger full-denoising graph |
+| CUDA graph replay of the v2 Pairformer stack | exact and lower-memory, but throughput was too small/flat: short 48-block bucket `482.16 -> 465.80 ms` (`1.035x`), long 48-block bucket `1236.81 -> 1238.13 ms` (`0.999x`) | graph plumbing is not the main wide-`z` v2 lever; target the native segmented triangle-update/fused producer boundary instead |
 | Reusing the base-checkpoint B4/16 MPS recipe for Protenix-v2 | v2 B4/16 hit CUDA OOM in the diffusion transformer after the long-token warmup filled the GPU, and the narrower v2 width screen found B8/8 (`4.621` samples/s) slightly ahead of B4/10 (`4.576` samples/s) | Protenix-v2's wider `z` representation changes the concurrency knee; use v2-specific gates and do not quote base-model MPS numbers for Sam-style v2 predictions |
 | Merging campaign JSONs before preprocessing | 64-file directory gate moved only from 197.54 s to 195.70 s (`1.009x`) and worsened preprocessing failure granularity | the remaining e2e gap is not mainly per-file JSON preprocessing |
 | Naive padded mixed-shape pairformer batching | valid-region differences accumulated over 48 blocks: FP32 `s/z` mean abs `0.012/0.006`, BF16 `0.236/0.168` for 245 -> 384 tokens | do not claim bitwise parity; the promoted path masks all token readers, sorts by length to reduce physical-shape drift/waste, and keeps exact mode available |
@@ -4993,6 +5020,11 @@ Profiling and reproducibility helpers:
   downstream consumers, and answers whether an isolated update-boundary win
   survives attention/transition/token dilution.  Current result: rejected
   (`0.37-0.38x` short bucket, `0.21x` long bucket).
+- `scripts/perf/pairformer_cudagraph_probe.py`: CUDA graph replay screen for
+  v2-width Pairformer blocks/stacks.  It separates pure replay from realistic
+  changed-input copies so graph launch-overhead wins are not confused with
+  deployable throughput gains.  Current result: rejected for throughput; the
+  full long v2 stack is flat.
 - `scripts/perf/triangle_contraction_cutlass_probe.py` and
   `scripts/perf/triangle_contraction_cutlass_probe_sm90.cu`: first native
   CUTLASS/CuTe screen for the triangle-multiplication contraction core.  This is

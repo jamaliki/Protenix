@@ -420,6 +420,11 @@ pack/scatter staging.  The latest stock-CUTLASS contraction wrapper, one
 rank-4 feature-batched GEMM launch per record, also failed to clear that bar:
 it regressed the short bucket and only reached `1.06x` on long outgoing while
 remaining slower on long incoming.
+Whole-Pairformer CUDA graph replay was also screened as a lower-risk
+launch-overhead fix.  It was exact and helped the short v2 bucket by about
+`3%`, but the full 48-block long bucket was flat (`~1.00x`) once changed
+`s/z` inputs were copied into graph-owned buffers.  That rules out graph
+plumbing as the main v2 throughput lever.
 Triangle-attention varlen wrappers have now been tested at the full-block level
 and were slower once both orientations were wired fairly.  Small queue buckets,
 pair-transition-only compaction, residual-only triangle-multiplication
