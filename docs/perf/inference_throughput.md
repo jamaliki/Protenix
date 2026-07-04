@@ -4344,6 +4344,41 @@ short-term implementation ladder is:
    unless its design specifically preserves a CUEQ/cuBLAS/CUTLASS-class
    tensor-core mainloop while eliminating padded work.
 
+   Triangle-attention ragged lower-bound: commits `10c7210` and `dbbbfb4`
+   added `scripts/perf/triangle_attention_ragged_hotspot.py`.  This screen asks
+   the corresponding attention question without replacing CUEQ/cuDNN: how much
+   headroom is visible if the current padded CUEQ triangle-attention module is
+   split into a few large exact-length islands?  The script includes the
+   residual add, preserves input order for valid-region comparisons, and reports
+   median per-iteration timings because the first run exposed one CUEQ/JIT
+   outlier in an averaged short-bucket measurement.  The authoritative repeat
+   was job `109889`, run
+   `runs/triangle_attention_ragged_median_20260704_183731_dbbbfb4`, one H100,
+   BF16, `c_z=256`, `c_hidden_pair_att=32`, `no_heads_pair=8`, CUEQ bool masks,
+   and the contiguous ending-node producer enabled:
+
+   | v2 bucket / split | direction | padded CUEQ+residual | split islands | exact-length islands | valid drift | decision |
+   | --- | --- | ---: | ---: | ---: | --- | --- |
+   | short `40-124`, split at `76` | start | 1.862 ms | 2.575 ms (`0.72x`) | 5.317 ms (`0.35x`) | max `0.03125`, mean `5.3e-5` | reject Python islands |
+   | short `40-124`, split at `76` | end | 1.972 ms | 2.703 ms (`0.73x`) | 5.594 ms (`0.35x`) | max `0.03125`, mean `5.4e-5` | reject Python islands |
+   | short `40-124`, split at `88` | start | 1.870 ms | 2.926 ms (`0.64x`) | 5.627 ms (`0.33x`) | max `0.03125`, mean `8.0e-5` | reject Python islands |
+   | short `40-124`, split at `88` | end | 1.968 ms | 3.105 ms (`0.63x`) | 5.824 ms (`0.34x`) | max `0.03125`, mean `8.2e-5` | reject Python islands |
+   | long `136-220`, split at `172` | start | 6.778 ms | 5.972 ms (`1.13x`) | 6.434 ms (`1.05x`) | exact zero | useful headroom |
+   | long `136-220`, split at `172` | end | 7.153 ms | 6.252 ms (`1.14x`) | 6.692 ms (`1.07x`) | exact zero | useful headroom |
+   | long `136-220`, split at `184` | start | 6.778 ms | 5.854 ms (`1.16x`) | 6.232 ms (`1.09x`) | exact zero | best split |
+   | long `136-220`, split at `184` | end | 7.113 ms | 6.156 ms (`1.16x`) | 6.470 ms (`1.10x`) | exact zero | best split |
+
+   Interpretation: the long v2 triangle-attention boundary has real padding
+   headroom, but the shape of the win matters.  Two large islands beat the
+   padded long bucket by about `1.14-1.16x`, while exact-length islands are
+   slower than the coarse split because launch fragmentation overwhelms the
+   saved work.  The short bucket is already fast enough that even a two-way
+   split loses.  This rejects Python-level attention islanding as a production
+   path, but it keeps a one-launch segmented/vendor-quality long-bucket
+   triangle-attention kernel on the credible list.  That kernel would need
+   shape guards or an internal scheduler that leaves short buckets on the
+   current CUEQ path.
+
    Fused producer follow-up: commits `9b238f1`, `9ba65f4`, `4660f23`,
    `9b58fc6`, and `a22eec7` tested the next larger triangle-multiplication
    boundary: fuse input LayerNorm with the dual input gated GEMM and write
@@ -4616,6 +4651,11 @@ Profiling and reproducibility helpers:
   dense-pair-bias token-attention screen for the pairformer `D=24` head shape.
 - `scripts/perf/triangle_attention_breakdown.py`: per-launch/subrange screen
   for CUEQ triangle attention and its layout/epilogue boundaries.
+- `scripts/perf/triangle_attention_ragged_hotspot.py`: v2 BF16 CUEQ
+  triangle-attention lower-bound screen for padded versus smaller ragged
+  islands.  It preserves CUEQ/cuDNN attention and only changes the physical
+  grouping, so use it to decide whether a true segmented triangle-attention
+  kernel has enough headroom before writing one.
 - `scripts/perf/triangle_multiplication_ragged_hotspot.py`: v2 BF16
   CUEQ triangle-multiplication screen for padded versus smaller ragged islands;
   use it to filter segmented-kernel ideas before touching production code.
