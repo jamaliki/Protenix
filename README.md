@@ -467,6 +467,8 @@ the stock SM90 grouped scheduler.
 The detailed CUEQ reverse-engineering notes, rejected cuBLAS/CUTLASS grouped
 screens, and the proposed first fused CuTe boundary are in
 [docs/perf/inference_throughput.md](docs/perf/inference_throughput.md#cueq-reverse-engineering-the-native-boundary-worth-targeting).
+The implementation handoff for the next native Protenix-v2 triangle-update
+kernel is [docs/perf/v2_native_triangle_update_design.md](docs/perf/v2_native_triangle_update_design.md).
 
 #### Optional: fill one H100 with multiple campaign workers
 

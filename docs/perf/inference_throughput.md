@@ -5135,6 +5135,8 @@ This is the "go for the meat" path for Protenix-v2.  It attacks the wider-z
 pairformer work Sam's workload actually pays for, while preserving the lesson
 from CUEQ: do not replace vendor-quality dense kernels with a slower custom
 kernel merely because the custom kernel fuses more source-level operations.
+The native-kernel handoff note is
+[v2_native_triangle_update_design.md](v2_native_triangle_update_design.md).
 
 ## Negative results worth remembering
 
@@ -5416,6 +5418,10 @@ Profiling and reproducibility helpers:
   descriptor-scheduled variant of the Triton segmented contraction screen.  It
   removes invalid tile launches, but still loses to dense `einsum`, proving the
   remaining failure is mainloop quality rather than only rectangular-grid waste.
+- `docs/perf/v2_native_triangle_update_design.md`: implementation handoff for
+  the next Protenix-v2 native triangle-update kernel.  It summarizes the
+  rejected wrappers, defines the producer-owned layout and acceptance gates, and
+  states the first executable native-kernel slice.
 - `scripts/perf/triangle_multiplication_compact_rows_probe.py`: compact
   valid-row triangle-multiplication bridge.  It proves that gathering valid
   rows and scattering dense `a/b` tensors around the existing contraction is
