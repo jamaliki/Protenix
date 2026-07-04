@@ -2727,6 +2727,29 @@ output-boundary tensors, times the baseline `linear_b(b)` plus promoted
 `fused_sigmoid_mul_add`, and optionally imports a candidate op with signature
 `fn(b, weight, gate, residual) -> out`.  Use it before touching model code:
 
+The pairformer transition has a different output boundary: no sigmoid gate,
+just the `Transition(c_in=128, n=4)` output GEMM followed by the enclosing
+PairformerBlock residual add.  Commit `def0567` extends the same CUTLASS
+mainloop probe with `forward_flat_residual`, a flattened SM90 EVT kernel that
+computes `D = residual + accumulator`.  Two H100 screens clarify both the
+mainloop and epilogue economics for the actual many-sequence pairformer shape:
+
+| job/run | shape | cuBLAS GEMM | CUTLASS flat GEMM | cuBLAS GEMM + residual add | CUTLASS fused residual | decision |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| `100447`, `runs/pair_transition_cutlass_mainloop_screen_20260704_040703_2ad1cad` | `B32, N251`, `M=2,016,032`, `N=128`, `K=512` | 0.895 ms | 0.978 ms (`0.92x`) | - | - | flat mainloop is close but still slower |
+| `100447` | `B16, N220`, `M=774,400`, `N=128`, `K=512` | 0.347 ms | 0.384 ms (`0.90x`) | - | - | same |
+| `100482`, `runs/pair_transition_cutlass_residual_screen_20260704_041336_def0567` | `B32, N251` | 0.895 ms | 0.975 ms (`0.92x`) | 1.399 ms | 1.322 ms (`1.058x`) | correct but too small |
+| `100482` | `B16, N220` | 0.347 ms | 0.382 ms (`0.91x`) | 0.543 ms | 0.514 ms (`1.057x`) | correct but too small |
+
+The residual epilogue has acceptable BF16 parity (`max_abs=0.03125`,
+`nan_count=0`) and proves the CuTe/CUTLASS visitor tree is wired correctly.
+However, the absolute saving is only `0.076 ms` per `B32/N251` transition
+output boundary and `0.029 ms` per `B16/N220` boundary.  That is much smaller
+than the already rejected pair-transition input-fusion signal and too small to
+justify a production extension, build dependency, and model integration.  The
+next transition attempt must remove a larger activation boundary, not just the
+final residual add.
+
 ```bash
 PROTENIX_REPO=/mnt/lustre/users/kiarash-eitgbi/code/protenix_src_main_profile \
 PROTENIX_RUN_NAME=transition_epilogue_baseline_$(date -u +%Y%m%d_%H%M%S) \
@@ -3330,6 +3353,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Unguarded pairformer transition input fusion at B96 | failed before producing model output | the concatenated pair-transition activation is too large; keep the shape guard |
 | Scoped pairformer transition elementwise fusion | isolated pair-transition subrange improved 18-19%, but the full representative gate showed pairformer flat/slower | subrange wins must be rejected when the measured full-workload subtotal does not move |
 | Pairformer transition residual via `torch.addmm(beta=1)` | exact parity, but actual-shape blocks were neutral/slower (`0.997-0.999x`) and sometimes used more memory | preserving the library GEMM is necessary but not sufficient; the epilogue path still has to beat `F.linear` plus a simple add |
+| CUTLASS pair-transition output GEMM + residual epilogue | correct BF16 probe and `~1.057x` over cuBLAS GEMM plus residual add, but only saves `0.076 ms` at `B32, N251` and `0.029 ms` at `B16, N220` | a working native epilogue is still too small; transition work must remove a larger activation boundary before model integration is worthwhile |
 | Triangle-attention output projection epilogue | isolated boundary improved about `1.29x` and block screens about `1.02x`, but the full B16 mixed-token gate was noisy and did not cleanly move pairformer or beat the promoted main gate | do not carry default-off fused GEMM paths unless the representative subtotal moves for the intended mechanism |
 | Custom Triton transition output GEMM+gate/residual | best tile 2.00 ms versus 1.51 ms for cuBLAS plus fused gate/residual | the output epilogue is still attractive, but only if implemented as a vendor-quality CuTe/CUTLASS epilogue |
 | Naive fused Triton triangle attention | correct at N64, but B16/N245 slowed from 4.24-4.26 ms to 6.22-7.78 ms | the right boundary still needs a vendor-quality CUEQ/CuTe schedule |
