@@ -51,6 +51,8 @@ _V2_BLOCK_N = 256
 _V2_NUM_WARPS = 8
 _NUM_WARPS = 4
 _NUM_STAGES = 3
+_BASE_DEFAULT_MIN_ROWS = 1_000_000
+_V2_DEFAULT_MIN_ROWS = 200_000
 
 
 def _env_flag_enabled(name: str, default: bool) -> bool:
@@ -71,20 +73,30 @@ def triton_transition_dual_gemm_available() -> bool:
 def _min_rows() -> int:
     raw = os.getenv("PROTENIX_TRITON_TRANSITION_DUAL_GEMM_MIN_ROWS")
     if raw is None:
-        # The direct dual-GEMM kernel is a clear win for large same-token
-        # variable-atom batches (B32/N251: ~2M rows), but the B16 mixed-token
-        # N_sample=5 gate was flat/slower once diffusion variance was included.
-        # Keep the default high enough to leave that recommended mixed path on
-        # cuBLAS while still accelerating the large pairformer trunk endpoint.
-        return 1_000_000
+        return _BASE_DEFAULT_MIN_ROWS
     try:
         return max(0, int(raw))
     except ValueError:
-        return 1_000_000
+        return _BASE_DEFAULT_MIN_ROWS
 
 
 def triton_transition_dual_gemm_min_rows() -> int:
     return _min_rows()
+
+
+def _effective_min_rows(*, k_input: int, n_hidden: int) -> int:
+    raw = os.getenv("PROTENIX_TRITON_TRANSITION_DUAL_GEMM_MIN_ROWS")
+    if raw is not None:
+        return _min_rows()
+    if k_input >= 256 and n_hidden >= 1024:
+        # Protenix-v2 widens pair features to c_z=256 and transition hidden
+        # width 1024.  The Sam-style mixed buckets (B16/N124 and B16/N220) have
+        # only 246k and 774k physical rows, so the older million-row default
+        # kept them on cuBLAS even though the v2 tile is a measured H100 win.
+        # Keep the lower threshold v2-specific; base-width mixed gates were
+        # previously flat/noisy, so they retain the conservative default.
+        return _V2_DEFAULT_MIN_ROWS
+    return _BASE_DEFAULT_MIN_ROWS
 
 
 def _max_output_elements() -> int:
@@ -213,7 +225,9 @@ def triton_dual_gemm_silu_product(
         return None
     m_rows, k_input = y.shape
     n_hidden, weight_k = weight_a.shape
-    if weight_k != k_input or m_rows < _min_rows():
+    if weight_k != k_input:
+        return None
+    if m_rows < _effective_min_rows(k_input=k_input, n_hidden=n_hidden):
         return None
     if m_rows * n_hidden > _max_output_elements():
         return None
