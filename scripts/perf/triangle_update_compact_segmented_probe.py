@@ -490,6 +490,36 @@ def exact_group_matmul_view_contract(
     return update
 
 
+def compact_finish_from_update(
+    module: torch.nn.Module,
+    z: torch.Tensor,
+    x_norm: torch.Tensor,
+    update: torch.Tensor,
+    dense_offsets: torch.Tensor,
+    weights: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    update_norm = layer_norm_transpose(
+        update,
+        module.layer_norm_out.weight,
+        module.layer_norm_out.bias,
+        eps=1e-5,
+        layout="nd->nd",
+    )
+    compact_delta = fused_sigmoid_gated_dual_gemm_dual_x(
+        x_norm,
+        update_norm,
+        weights["g_out"],
+        weights["p_out"],
+    )
+    out = torch.empty_like(z)
+    rows = dense_offsets.numel()
+    scatter_grid = (triton.cdiv(rows, 16), triton.cdiv(C_Z, 64))
+    _scatter_residual_kernel[scatter_grid](
+        compact_delta, z, dense_offsets, out, rows, C_Z, 16, 64, num_warps=4
+    )
+    return out
+
+
 def segmented_finish(
     module: torch.nn.Module,
     z: torch.Tensor,
@@ -519,25 +549,7 @@ def segmented_finish(
         num_warps=config.num_warps,
         num_stages=config.num_stages,
     )
-    update_norm = layer_norm_transpose(
-        update,
-        module.layer_norm_out.weight,
-        module.layer_norm_out.bias,
-        eps=1e-5,
-        layout="nd->nd",
-    )
-    compact_delta = fused_sigmoid_gated_dual_gemm_dual_x(
-        x_norm,
-        update_norm,
-        weights["g_out"],
-        weights["p_out"],
-    )
-    out = torch.empty_like(z)
-    scatter_grid = (triton.cdiv(rows, 16), triton.cdiv(C_Z, 64))
-    _scatter_residual_kernel[scatter_grid](
-        compact_delta, z, dense_offsets, out, rows, C_Z, 16, 64, num_warps=4
-    )
-    return out
+    return compact_finish_from_update(module, z, x_norm, update, dense_offsets, weights)
 
 
 def segmented_finish_exact_group_bmm(
@@ -551,26 +563,7 @@ def segmented_finish_exact_group_bmm(
     weights: dict[str, torch.Tensor],
 ) -> torch.Tensor:
     update = exact_group_bmm_contract(ab, lengths, direction)
-    update_norm = layer_norm_transpose(
-        update,
-        module.layer_norm_out.weight,
-        module.layer_norm_out.bias,
-        eps=1e-5,
-        layout="nd->nd",
-    )
-    compact_delta = fused_sigmoid_gated_dual_gemm_dual_x(
-        x_norm,
-        update_norm,
-        weights["g_out"],
-        weights["p_out"],
-    )
-    out = torch.empty_like(z)
-    rows = dense_offsets.numel()
-    scatter_grid = (triton.cdiv(rows, 16), triton.cdiv(C_Z, 64))
-    _scatter_residual_kernel[scatter_grid](
-        compact_delta, z, dense_offsets, out, rows, C_Z, 16, 64, num_warps=4
-    )
-    return out
+    return compact_finish_from_update(module, z, x_norm, update, dense_offsets, weights)
 
 
 def segmented_finish_exact_group_matmul_view(
@@ -584,39 +577,15 @@ def segmented_finish_exact_group_matmul_view(
     weights: dict[str, torch.Tensor],
 ) -> torch.Tensor:
     update = exact_group_matmul_view_contract(ab, lengths, direction)
-    update_norm = layer_norm_transpose(
-        update,
-        module.layer_norm_out.weight,
-        module.layer_norm_out.bias,
-        eps=1e-5,
-        layout="nd->nd",
-    )
-    compact_delta = fused_sigmoid_gated_dual_gemm_dual_x(
-        x_norm,
-        update_norm,
-        weights["g_out"],
-        weights["p_out"],
-    )
-    out = torch.empty_like(z)
-    rows = dense_offsets.numel()
-    scatter_grid = (triton.cdiv(rows, 16), triton.cdiv(C_Z, 64))
-    _scatter_residual_kernel[scatter_grid](
-        compact_delta, z, dense_offsets, out, rows, C_Z, 16, 64, num_warps=4
-    )
-    return out
+    return compact_finish_from_update(module, z, x_norm, update, dense_offsets, weights)
 
 
-def triton_producer_update(
+def triton_producer_intermediates(
     module: torch.nn.Module,
     z: torch.Tensor,
     dense_offsets: torch.Tensor,
-    descriptors: torch.Tensor,
-    config: ContractConfig,
-    direction: str,
     weights: dict[str, torch.Tensor],
-    contractor: str,
-    lengths: list[int],
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     rows = dense_offsets.numel()
     mean = torch.empty(rows, device=z.device, dtype=torch.float32)
     rstd = torch.empty_like(mean)
@@ -644,6 +613,21 @@ def triton_producer_update(
         num_warps=4,
         num_stages=3,
     )
+    return x_norm, ab
+
+
+def triton_producer_update(
+    module: torch.nn.Module,
+    z: torch.Tensor,
+    dense_offsets: torch.Tensor,
+    descriptors: torch.Tensor,
+    config: ContractConfig,
+    direction: str,
+    weights: dict[str, torch.Tensor],
+    contractor: str,
+    lengths: list[int],
+) -> torch.Tensor:
+    x_norm, ab = triton_producer_intermediates(module, z, dense_offsets, weights)
     if contractor == "exact_group_bmm":
         return segmented_finish_exact_group_bmm(
             module, z, x_norm, ab, dense_offsets, lengths, direction, weights
