@@ -4160,6 +4160,32 @@ short-term implementation ladder is:
    remaining credible contraction path is a real grouped/segmented CuTe kernel
    that keeps the exact-length work reduction inside a small launch family with
    a schedule designed for the `(features=256, batch=16, N=136-220)` v2 shapes.
+
+   Old-style CUTLASS grouped follow-up: commits `dd3a9e1`, `b063e9a`, and
+   `2c284d1` added `scripts/perf/triangle_contraction_cutlass_grouped_probe.py`
+   and its CUDA extension.  Jobs `109390` and `109399` found the same alignment
+   constraint as the first dense CUTLASS screen: both the padded row stride and
+   each grouped GEMM's `M/N/K` extents have to be rounded to a multiple of 8 to
+   avoid misaligned BF16 tensor-core accesses.  With those guards, job `109401`
+   (`runs/triangle_contraction_cutlass_grouped_full_20260704_160304_2c284d1`)
+   ran the full v2 screen in one grouped CUTLASS launch over all
+   `(feature, record)` GEMMs:
+
+   | bucket / direction | dense `einsum` | aligned grouped CUTLASS | decision |
+   | --- | ---: | ---: | --- |
+   | short outgoing | 0.174 ms | 0.333 ms (`0.52x`) | reject |
+   | short incoming | 0.153 ms | 0.306 ms (`0.50x`) | reject |
+   | long outgoing | 0.819 ms | 0.932 ms (`0.88x`) | reject |
+   | long incoming | 0.748 ms | 0.833 ms (`0.90x`) | reject |
+
+   The kernel is correct on valid regions and writes zero invalid regions, but
+   it is still slower than dense PyTorch/cuBLAS.  This rejects the old SM80-era
+   CUTLASS grouped API as a production boundary for Protenix-v2.  The next
+   kernel attempt should not be another library wrapper.  It should either
+   use CUTLASS 3/CuTe Hopper grouped scheduling directly, or fuse a larger
+   triangle-multiplication boundary so the custom kernel amortizes the scheduler
+   and metadata cost over LayerNorm, gated projections, contraction, output
+   normalization, and residual store.
 2. **Full segmented triangle-mul update:** fuse or internally schedule the
    LayerNorm, gated input projection, segmented contraction, output LayerNorm,
    output projection/gate, and residual store for valid rows.  This is the first
@@ -4328,6 +4354,11 @@ Profiling and reproducibility helpers:
   cuBLAS contraction screen.  This tests whether wrapper-level cuBLAS calls can
   exploit per-record lengths before investing in a custom grouped/segmented
   CuTe mainloop.
+- `scripts/perf/triangle_contraction_cutlass_grouped_probe.py` and
+  `scripts/perf/triangle_contraction_cutlass_grouped_probe.cu`: old-style
+  CUTLASS grouped-GEMM contraction screen.  It tests whether one grouped launch
+  over all `(feature, record)` valid rectangles beats dense `einsum`; this
+  rejected the library-wrapper path after alignment fixes.
 - `scripts/perf/submit_tokyo_triangle_attention_ncu.sh` and
   `scripts/perf/tokyo_triangle_attention_ncu.sbatch`: Tokyo one-H100 Nsight
   Compute capture for one starting or ending CUEQ triangle-attention module.
