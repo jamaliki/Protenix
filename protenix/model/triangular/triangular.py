@@ -49,6 +49,10 @@ from protenix.model.triangular.triangle_output_gate_residual_triton import (
     triangle_update_with_residual,
     triton_triangle_output_gate_residual_enabled,
 )
+from protenix.model.triangular.triangle_output_ln_dual_gemm_triton import (
+    triangle_update_with_output_ln_dual_gemm,
+    triton_triangle_output_ln_dual_gemm_enabled,
+)
 from protenix.model.utils import (
     chunk_layer,
     flatten_final_dims,
@@ -607,6 +611,35 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
                     device=z.device,
                 )
                 fused_update = triangle_update_with_ln_dual_gemm(
+                    z,
+                    direction="outgoing" if self._outgoing else "incoming",
+                    mask=(z.new_ones(z.shape[:-1]) if mask is None else mask),
+                    norm_in_weight=self.layer_norm_in.weight,
+                    norm_in_bias=self.layer_norm_in.bias,
+                    p_in_weight=weight_p,
+                    g_in_weight=weight_g,
+                    norm_out_weight=self.layer_norm_out.weight,
+                    norm_out_bias=self.layer_norm_out.bias,
+                    p_out_weight=weight_out_z,
+                    g_out_weight=weight_out_g,
+                    eps=1e-5,
+                )
+                if fused_update is not None:
+                    return fused_update
+            if (
+                _input_inplace_safe
+                and _add_with_inplace
+                and triton_triangle_output_ln_dual_gemm_enabled()
+            ):
+                weight_p, weight_g = self._triton_input_producer_weights(
+                    dtype=z.dtype,
+                    device=z.device,
+                )
+                weight_out_g, weight_out_z = self._triton_output_gate_weights(
+                    dtype=z.dtype,
+                    device=z.device,
+                )
+                fused_update = triangle_update_with_output_ln_dual_gemm(
                     z,
                     direction="outgoing" if self._outgoing else "incoming",
                     mask=(z.new_ones(z.shape[:-1]) if mask is None else mask),
