@@ -441,8 +441,10 @@ exact-group `bmm` output while reshaping it back to row-major compact rows.
 Replacing that assembly with a tiny Triton tiled copy makes the direct boundary
 positive: about `2.0x` faster than padded CUEQ on the short v2 bucket and
 `1.15-1.16x` faster on the long v2 bucket.  This is still a benchmark boundary,
-not yet a promoted model default; the next step is to integrate or fuse it
-inside the full v2 `PairformerBlock` and prove the end-to-end Sam-style gate.
+not a promoted model default.  The first fair full-`PairformerBlock` gate kept
+the short-bucket win (`1.24x`) but lost the long bucket (`0.96x`), so the
+Sam-style v2 path still needs a deeper fused boundary before this can become a
+real default.
 Whole-Pairformer CUDA graph replay was also screened as a lower-risk
 launch-overhead fix.  It was exact and helped the short v2 bucket by about
 `3%`, but the full 48-block long bucket was flat (`~1.00x`) once changed
