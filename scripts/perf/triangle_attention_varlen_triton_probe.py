@@ -287,6 +287,37 @@ def prepare_attention_tensors(
     }
 
 
+def prepare_varlen_tensors(
+    module: TriangleAttention,
+    z: torch.Tensor,
+    mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Prepare q/k/v in the layout consumed by the varlen Triton kernel.
+
+    The core-only screen uses CUEQ's heads-first q/k/v so CUEQ and Triton see
+    exactly the same producer outputs.  A production varlen path would not do
+    that: it needs ``[B, N, S, H, D]`` q/k/v.  Producing that layout directly
+    avoids a CUEQ-layout Triton copy followed by another transpose/contiguous
+    copy before the custom core.
+    """
+
+    x = module.layer_norm(z)
+    q, k, v = module.mha._prep_qkv(
+        x,
+        x,
+        apply_scale=False,
+        cueq_heads_first=False,
+    )
+    bias = permute_final_dims(module.linear(x), (2, 0, 1)).unsqueeze(-4)
+    return {
+        "x_norm": x,
+        "q_seq": q.transpose(-2, -3).contiguous(),
+        "k_seq": k.transpose(-2, -3).contiguous(),
+        "v_seq": v.transpose(-2, -3).contiguous(),
+        "bias": bias.float().contiguous(),
+    }
+
+
 def cueq_core(tensors: dict[str, torch.Tensor], scale: float) -> torch.Tensor:
     out = cuequivariance_triangular_attn(
         tensors["q_hf"],
@@ -364,7 +395,7 @@ def triton_varlen_module_forward(
     # This intentionally pays the surrounding producer/consumer costs.  The
     # core screen above answers whether the attention mainloop has promise; this
     # boundary asks whether that promise survives the real module plumbing.
-    tensors = prepare_attention_tensors(module, z, mask)
+    tensors = prepare_varlen_tensors(module, z, mask)
     heads_last = triton_varlen_core(
         tensors,
         lengths,
