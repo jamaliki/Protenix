@@ -4677,6 +4677,49 @@ short-term implementation ladder is:
    output projection/gate, and residual store for valid rows.  This is the first
    candidate that can attack most of the measured triangle-multiplication
    padding waste without fragmenting the block into many CUEQ calls.
+
+   Compact segmented full-update screen: commit `37032a3` added
+   `scripts/perf/triangle_update_compact_segmented_probe.py`, and commit
+   `033c670` added a CUEQ compact-producer variant.  This is the first benchmark
+   that keeps the schedule compact through the triangular contraction and output
+   gate instead of compacting rows and then scattering `a/b` back to dense
+   tensors.  It still keeps the Pairformer ABI dense: input is
+   `[B, Nmax, Nmax, 256]`, and valid output rows are scattered back to dense
+   storage while adding the residual.  Invalid output rows are intentionally not
+   materialized in the benchmark; parity is measured only on valid rows.
+
+   Jobs:
+
+   - `109956`,
+     `runs/triangle_update_compact_segmented_37032a3_20260704_210642_ccfix`:
+     Triton compact input producer plus compact segmented contraction/output
+     screen over three contraction tiles.
+   - `109957`,
+     `runs/triangle_update_compact_segmented_033c670_20260704_211003_cueqprod`:
+     reran the best tile with both the Triton producer and a CUEQ
+     `layer_norm_transpose + fused_sigmoid_gated_dual_gemm` producer to check
+     whether the long-bucket loss was only the custom rowwise producer.
+
+   | v2 bucket | producer | outgoing CUEQ -> compact | incoming CUEQ -> compact | parity on valid rows | decision |
+   | --- | --- | ---: | ---: | --- | --- |
+   | short `40-124` | Triton compact producer | `2.431 -> 1.946 ms` (`1.25x`) | `2.515 -> 1.858 ms` (`1.35x`) | max `0.015625-0.03125`, mean `~4e-6` | real short-bucket signal |
+   | short `40-124` | CUEQ compact producer | `2.431 -> 2.348 ms` (`1.04x`) | `2.515 -> 2.252 ms` (`1.12x`) | max `0.015625-0.03125`, mean `<1e-7` | short-only, less attractive |
+   | long `136-220` | Triton compact producer | `4.219 -> 13.663 ms` (`0.31x`) | `4.083 -> 13.494 ms` (`0.30x`) | max `0.03125`, mean `~7e-6` | reject for Sam long bucket |
+   | long `136-220` | CUEQ compact producer | `4.219 -> 14.408 ms` (`0.29x`) | `4.083 -> 14.220 ms` (`0.29x`) | max `0.015625-0.03125`, mean `<2e-7` | producer is not the long-bucket fix |
+
+   Interpretation: this is the first fused-boundary screen that actually beats
+   CUEQ on the heavily padded short v2 bucket, where pair efficiency is only
+   `48.6%` and cubic contraction efficiency is `38.7%`.  It does **not** solve
+   the real long-bucket wall: at `73.4%` pair efficiency and `64.8%` cubic
+   efficiency, CUEQ's dense vendor-quality schedule is far better than the
+   compact Triton contraction/output schedule even after valid-work skipping.
+   The CUEQ-producer rerun is important because it rules out the simple
+   explanation "the hand-written input producer is the only problem"; the long
+   bucket remains about `0.3x` with either producer.  Do not promote this path as
+   a general v2 default.  The remaining long-bucket path needs a vendor-class
+   SM90/CuTe compact contraction/update mainloop, or a narrow shape-guarded
+   short-bucket integration whose full-block and end-to-end dilution is measured
+   honestly.
 3. **Segmented triangle attention:** only after the multiplication schedule is
    credible, attempt grouped/segmented attention that preserves cuDNN/CUEQ-class
    softmax throughput.  This is harder because the current fast path's native
@@ -4866,6 +4909,12 @@ Profiling and reproducibility helpers:
 - `scripts/perf/triangle_multiplication_ragged_hotspot.py`: v2 BF16
   CUEQ triangle-multiplication screen for padded versus smaller ragged islands;
   use it to filter segmented-kernel ideas before touching production code.
+- `scripts/perf/triangle_update_compact_segmented_probe.py`: benchmark-only
+  compact segmented triangle-multiplication update boundary.  It packs valid
+  pair rows, runs input producer variants, contracts in compact per-record
+  storage, applies the output gate, and scatters valid rows back to dense output
+  with the residual.  Current result: real short-bucket signal, long-bucket
+  rejection unless the compact contraction/update mainloop becomes vendor-class.
 - `scripts/perf/triangle_contraction_cutlass_probe.py` and
   `scripts/perf/triangle_contraction_cutlass_probe_sm90.cu`: first native
   CUTLASS/CuTe screen for the triangle-multiplication contraction core.  This is
