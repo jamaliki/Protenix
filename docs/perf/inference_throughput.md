@@ -4021,6 +4021,33 @@ replaces cuDNN SDPA or cuBLAS GEMMs is unlikely to win; the measured bottleneck
 is doing too much padded pair work plus several already-specialized
 memory-bound boundaries, not a single obviously bad PyTorch matmul.
 
+Triangle-multiplication ragged screen: commit `84001ab` added
+`scripts/perf/triangle_multiplication_ragged_hotspot.py` and ran it on one H100
+in `runs/v2_triangle_mul_ragged_20260704_145620_84001ab`.  This isolates only
+the CUEQ triangle-multiplication boundary, with residual add included, for the
+same v2 BF16 `c_z=256` short and long sorted buckets.  A follow-up bucket
+hill-climb is in
+`runs/v2_triangle_mul_bucket_hillclimb_20260704_145743_84001ab`.
+
+| shape | split | direction | padded ms | split ms | speedup | valid drift |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| short `B16/N124` | best two-way split at `64` | outgoing | 2.640 | 2.505 | 1.054x | mean abs `1.1e-4`, max `0.03125` |
+| short `B16/N124` | best two-way split at `64` | incoming | 2.624 | 2.496 | 1.052x | mean abs `1.1e-4`, max `0.03125` |
+| long `B16/N220` | best two-way split at `184` | outgoing | 4.751 | 4.559 | 1.042x | mean abs `3.6e-8`, max `0.015625` |
+| long `B16/N220` | best two-way split at `184` | incoming | 4.681 | 4.554 | 1.028x | mean abs `2.8e-8`, max `0.015625` |
+
+Exact-length groups were much slower despite perfect pair efficiency:
+`~0.67x` for the short bucket and `~0.71x` for the long bucket.  Three-way
+splits also lost.  Interpretation: CUEQ's triangle-multiplication mainloop is
+already strong enough that Python-level launch fragmentation eats most of the
+padding savings.  A coarse production split of triangle multiplication alone
+would be at best a percent-scale full-block candidate (`triangle_mul` is about
+29% of the long block and 47% of the short block), and it would still require
+scatter/gather integration with the padded attention and transition stages.
+Decision: do not add a production triangle-mul bucket path.  Keep the hotspot
+as a reusable filter, and only pursue ragged triangle work if the next prototype
+is a real one-launch segmented/CuTe boundary rather than multiple CUEQ calls.
+
 ## Negative results worth remembering
 
 These failed because the real workload, not the isolated kernel, is the gate:
@@ -4147,6 +4174,9 @@ Profiling and reproducibility helpers:
   dense-pair-bias token-attention screen for the pairformer `D=24` head shape.
 - `scripts/perf/triangle_attention_breakdown.py`: per-launch/subrange screen
   for CUEQ triangle attention and its layout/epilogue boundaries.
+- `scripts/perf/triangle_multiplication_ragged_hotspot.py`: v2 BF16
+  CUEQ triangle-multiplication screen for padded versus smaller ragged islands;
+  use it to filter segmented-kernel ideas before touching production code.
 - `scripts/perf/submit_tokyo_triangle_attention_ncu.sh` and
   `scripts/perf/tokyo_triangle_attention_ncu.sbatch`: Tokyo one-H100 Nsight
   Compute capture for one starting or ending CUEQ triangle-attention module.
@@ -4176,14 +4206,17 @@ Profiling and reproducibility helpers:
 
 ## If continuing from here
 
-Do not expect another large gain from config changes.  The next proper
-same-output campaign should be one of:
+Do not expect another large gain from config changes.  For the current
+Sam-style Protenix-v2 target, the next proper same-output campaign should be
+one of:
 
-1. a deliberate atom/trunk kernel-layout rewrite, especially around producers
-   feeding attention kernels;
-2. a confidence-pairformer precision/tiling campaign with explicit numerical
-   acceptance criteria;
-3. vendor-quality fused epilogues for specific matmul-adjacent patterns.
+1. a true one-launch segmented/CuTe boundary for pairformer triangle attention
+   or triangle multiplication that avoids padded pair work without fragmenting
+   the block into many CUEQ calls;
+2. a vendor-quality fused LayerNorm/projection producer around CUEQ triangle
+   attention that preserves the cuDNN SDPA mainloop;
+3. only after those, a deliberate atom/diffusion kernel-layout rewrite for the
+   `N_sample=5` denoising half of the workload.
 
 The larger kernel-engineering projects should start with a
 fresh profile, an isolated hotspot screen, and a full same-output N1280/N2560
