@@ -4117,6 +4117,22 @@ short-term implementation ladder is:
    compile showed that raw `N=124/220` BF16 row strides are not TMA-friendly, so
    the probe pads CUTLASS operands to a multiple of 8 and compares only the
    valid region.
+
+   Target screen: commit `064b112`, job `109239`, run
+   `runs/triangle_contraction_cutlass_tile128_20260704_152809_064b112`.
+   The 128x128x64 SM90 tile improved the first 64x64 attempt, but it is still
+   not a production kernel:
+
+   | bucket | dense `einsum` | dense CUTLASS | exact groups `einsum` | exact groups CUTLASS | decision |
+   | --- | ---: | ---: | ---: | ---: | --- |
+   | short `B16/N124`, `c_z=256` | 0.176 ms | 0.263 ms (`0.67x`) | 0.198 ms (`0.89x`) | 0.275 ms (`0.64x`) | reject CUTLASS schedule for short bucket |
+   | long `B16/N220`, `c_z=256` | 0.827 ms | 0.677 ms (`1.22x`) | 0.367 ms (`2.25x`) | 0.700 ms (`1.18x`) | long-bucket contraction has a real ragged ceiling, but this CUTLASS grouped schedule is not the best mainloop |
+
+   Interpretation: the contraction subproblem is real, especially for the long
+   mixed-token bucket, but a basic CUTLASS `GemmUniversal` wrapper is not enough.
+   The next contraction-level attempt should use a cuBLASLt/grouped-GEMM style
+   dispatch or a more carefully scheduled CuTe grouped kernel before trying to
+   fuse LayerNorm/projection/output-gate around it.
 2. **Full segmented triangle-mul update:** fuse or internally schedule the
    LayerNorm, gated input projection, segmented contraction, output LayerNorm,
    output projection/gate, and residual store for valid rows.  This is the first
