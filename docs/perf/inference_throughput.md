@@ -4387,11 +4387,34 @@ short-term implementation ladder is:
    cooperative kernel accepts rank-3 problem shapes for grouped GEMM, while
    rank-4 problem shapes are accepted only for non-grouped array mode.  Therefore
    the desired boundary, "B grouped records, L feature contractions per record",
-   is not expressible through the stock CUTLASS 3 grouped builder.  This rejects
-   the last plausible library-wrapper contraction path.  A real implementation
-   now has to drop below the grouped GEMM adapter into a custom CuTe/CUDA
-   scheduler, or widen the fusion boundary enough that a custom triangle update
-   kernel amortizes its own scheduling and epilogue work.
+   is not expressible through the stock CUTLASS 3 grouped builder.  This rejected
+   the grouped wrapper form and left one narrower stock-CUTLASS question: is one
+   non-grouped rank-4 launch per record good enough?
+
+   CUTLASS 3 record-L-batched follow-up: commit `1331f6e` added
+   `scripts/perf/triangle_contraction_cutlass3_record_lbatched_probe.py` and its
+   CUDA extension.  Instead of one grouped problem per `(feature, record)` pair,
+   it runs one SM90 GEMM per sequence record and puts the `c_z=256` independent
+   feature contractions in GEMM's rank-4 `L` dimension.  Job `110028`, run
+   `runs/triangle_cutlass3_record_lbatched_1331f6e_20260704_213429_cudahome`,
+   compiled with `CUDA_HOME=/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/kaveh`
+   and ran the same v2 contraction buckets:
+
+   | bucket / direction | dense `einsum` | record-L CUTLASS 3 | decision |
+   | --- | ---: | ---: | --- |
+   | short outgoing | `0.176 ms` | `0.330 ms` (`0.53x`) | reject |
+   | short incoming | `0.156 ms` | `0.326 ms` (`0.48x`) | reject |
+   | long outgoing | `0.825 ms` | `0.778 ms` (`1.06x`) | too small/asymmetric |
+   | long incoming | `0.744 ms` | `0.772 ms` (`0.96x`) | reject |
+
+   Valid-region parity was BF16-level (`max_abs <= 0.25`, mean `<5e-7`).  This
+   is a useful final stock-CUTLASS check: carrying features in `L` removes the
+   previous `4096` grouped-problem metadata explosion, but sixteen separate
+   record launches plus the generic non-grouped schedule still do not beat dense
+   PyTorch robustly.  A real implementation now has to drop below the stock GEMM
+   adapters into a custom CuTe/CUDA scheduler, or widen the fusion boundary
+   enough that a custom triangle update amortizes its own scheduling and epilogue
+   work.
 
    Triton segmented scheduler follow-up: commits `d2cda3e` and `4125803` added
    `scripts/perf/triangle_contraction_triton_segmented_probe.py`.  This was the
@@ -4442,10 +4465,10 @@ short-term implementation ladder is:
    update, or a different boundary such as segmented triangle attention.
 
    Decision: reject all bare contraction replacements tried so far: cuBLAS
-   exact-length calls, old CUTLASS grouped, CUTLASS 3 grouped, and direct Triton
-   segmented scheduling, including compact tile descriptors.  The next kernel
-   attempt should fuse a larger triangle-multiplication boundary so custom
-   scheduling amortizes overhead over
+   exact-length calls, old CUTLASS grouped, CUTLASS 3 grouped, CUTLASS 3
+   record-L-batched, and direct Triton segmented scheduling, including compact
+   tile descriptors.  The next kernel attempt should fuse a larger
+   triangle-multiplication boundary so custom scheduling amortizes overhead over
    LayerNorm, gated projections, contraction, output normalization, and residual
    store.  Do not spend more effort on another standalone contraction wrapper
    unless its design specifically preserves a CUEQ/cuBLAS/CUTLASS-class
@@ -4808,6 +4831,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Full-block ragged pairformer islands | two split buckets improved the long `136-220` block `1.15x`, but slowed the short `40-124` block to `0.66x`; exact-length groups and singletons were much slower | launch count and lost batching eat the padding savings unless the ragged schedule is a real one-launch/vendor-quality kernel |
 | Bool masks for CUEQ triangle multiplication | block screen was flat at `N=124` and only +0.5% at `N=220` | mask dtype plumbing is not a meaningful bottleneck after triangle-attention bool-mask cleanup |
 | Raising CUEQ triangle-multiplication PyTorch fallback threshold for v2 | forcing the `N=124` bucket through the PyTorch fallback doubled triangle-mul time (`5.04 -> 10.04 ms`) and slowed the block (`10.67 -> 15.69 ms`); `N=220` was unchanged | the short physical bucket still needs CUEQ's fused LayerNorm/GatedGEMM path; fallback thresholds are not the ragged-v2 fix |
+| CUTLASS 3 record-L-batched triangle contraction | one SM90 rank-4 GEMM per record, with `c_z=256` in GEMM's `L` dimension, still regressed short buckets (`0.48-0.53x`), barely helped long outgoing (`1.06x`), and slowed long incoming (`0.96x`) | removing the `4096` grouped-problem overhead is not enough; another standalone stock-GEMM wrapper is not the v2 fix |
 | Compact valid-row triangle-multiplication bridge | valid-only compact row work was slower than padded CUEQ (`0.70x` short, `0.27x` long), and scattering back to padded layout was worse | do not bridge compact row-wise work through dense `a/b` tensors; a real segmented native update must stay segmented through contraction and output |
 | Compact segmented triangle-multiplication update inside a full v2 `PairformerBlock` | isolated short-bucket update improved, but the full block slowed badly: short `10.237 -> 27.144 ms` best (`0.38x`), long `25.791 -> 123.764 ms` best (`0.21x`) | the dense-ABI compact bridge pays too much pack/scatter, invalid-row zeroing, and custom-contraction cost; the next attempt needs a native vendor-quality CuTe/SM90 segmented update |
 | Unguarded fused triangle-multiplication input LayerNorm + dual-GEMM producer | short v2 blocks improved about `1.08x`, but long `B16/N220` blocks slowed to `0.94x`; the path is now default-off and guarded to <=300k physical pair rows | local producer fusion can be shape-specific; do not enable it globally for Sam-style v2 campaigns unless the long bucket is protected by fallback |
@@ -4999,6 +5023,12 @@ Profiling and reproducibility helpers:
   viable: CUTLASS pointer-array grouped GEMM hard-codes zero `L` stride for the
   convenience layout tags, and even explicit CuTe stride pointers are rejected
   because the SM90 grouped scheduler only supports rank-3 grouped shapes.
+- `scripts/perf/triangle_contraction_cutlass3_record_lbatched_probe.py` and
+  `scripts/perf/triangle_contraction_cutlass3_record_lbatched_probe.cu`: final
+  stock-CUTLASS contraction screen before a custom scheduler.  It launches one
+  non-grouped rank-4 SM90 GEMM per sequence record with the 256 pair channels in
+  GEMM's `L` dimension.  Current result: rejected; short buckets regress and the
+  long-bucket movement is too small/asymmetric for production.
 - `scripts/perf/triangle_contraction_triton_segmented_probe.py`: direct Triton
   segmented contraction screen.  It removes host-built grouped-GEMM metadata and
   writes zero invalid regions in one launch, but is still much slower than dense

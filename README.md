@@ -416,7 +416,10 @@ buckets are only about 67% pair-token efficient overall, so the next large
 kernel opportunity is still a true ragged/segmented triangle-multiplication
 update, but the latest compact-bridge screen shows the bar: it must avoid padded
 pair work while keeping CUEQ/cuDNN-class mainloops and avoiding extra
-pack/scatter staging.
+pack/scatter staging.  The latest stock-CUTLASS contraction wrapper, one
+rank-4 feature-batched GEMM launch per record, also failed to clear that bar:
+it regressed the short bucket and only reached `1.06x` on long outgoing while
+remaining slower on long incoming.
 Triangle-attention varlen wrappers have now been tested at the full-block level
 and were slower once both orientations were wired fairly.  Small queue buckets,
 pair-transition-only compaction, residual-only triangle-multiplication
