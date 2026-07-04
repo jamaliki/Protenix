@@ -106,6 +106,20 @@ protenix pred \
   --batch_size 32
 ```
 
+For large one-process campaigns, add:
+
+```bash
+export PROTENIX_PREFETCH_DATALOADER=1
+# Optional; defaults to the CLI batch size.
+export PROTENIX_DATALOADER_PREFETCH_ITEMS=32
+```
+
+This prefetches one CPU batch of featurized records in a background thread while
+the GPU predicts the current batch.  It does not change model math or output
+serialization; it only overlaps host featurization with GPU work.  Keep it off
+for tiny jobs, debugging runs where exact error timing matters, or host-memory
+constrained runs because it holds one extra batch of CPU tensors/AtomArrays.
+
 The default `--batch_mode auto` chooses the fastest safe boundary for each
 bucket:
 
@@ -186,6 +200,27 @@ repeated-`7r6r` wrapper/runner gate.  If an older build reports roughly
 `78s` model-forward per 32 records on this shape, rebuild from a newer commit
 before interpreting the gap as a missing flag; current optimized code measured
 `42.57s` model-forward on the comparable base-checkpoint gate.
+
+Host-prefetch gate: job `99731`, run directory
+`runs/prefetch_gate_20260704_013822_0e4d701`, commit `0e4d701`, one H100,
+base checkpoint, synthetic 256-record campaign made by repeating the same 32
+same-token/variable-atom records with unique names, `B32`, `N_sample=1`,
+`N_step=200`, confidence and normal CIF/JSON dumping enabled:
+
+| run | seed wall sec | batch predict sum | batch dump sum | outputs | decision |
+| --- | ---: | ---: | ---: | --- | --- |
+| no prefetch A | 411.94 | 310.82 | 42.19 | 256 CIF + 256 summary JSON + 256 full JSON | control |
+| prefetch A | 371.75 | 314.84 | 42.43 | same | promote |
+| no prefetch B | 413.80 | 311.40 | 42.58 | same | control |
+| prefetch B | 371.29 | 314.86 | 42.19 | same | promote |
+
+Average seed wall moved from `412.87s` to `371.52s`, a `1.11x` end-to-end
+throughput gain for this one-process campaign.  Batch compute and dump totals
+were essentially unchanged; the win came from removing the consistent
+`~6.7s` host gap between dumped B32 batches by featurizing the next records in
+parallel with current GPU work.  A prior writer-thread attempt was rejected
+because filesystem dumping contended with that same host path, whereas
+dataloader prefetch overlaps only CPU featurization and holds bounded memory.
 
 Follow-up profiling should now inspect the one-block pairformer kernel mix at
 this exact endpoint before writing another fused kernel.  The block-level CUDA
@@ -3268,6 +3303,9 @@ Production code touched by the throughput stack:
   featurization, the runner uses full-model batches for identical feature tensor
   trees, and the trunk path supports both same-token variable-atom records and
   masked padded-token/padded-atom records before writing one output per input.
+  `runner/inference.py` also contains the opt-in
+  `PROTENIX_PREFETCH_DATALOADER=1` background prefetch queue that overlaps
+  featurization of the next CPU batch with current GPU prediction.
 
 Profiling and reproducibility helpers:
 

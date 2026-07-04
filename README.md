@@ -126,6 +126,22 @@ For tightly bucketed or same-shape 245-token `7r6r`-like inputs, `32-64` is the
 practical knee: larger batches consume much more memory but add little
 throughput.  If you hit OOM, try `--batch_size 8`.
 
+For large one-process campaigns, also enable host-side dataloader prefetch:
+
+```bash
+export PROTENIX_PREFETCH_DATALOADER=1
+# Optional; defaults to the CLI batch size.
+export PROTENIX_DATALOADER_PREFETCH_ITEMS=32
+```
+
+This lets a background thread featurize the next batch while the GPU predicts
+the current batch.  On a 256-record same-token, variable-atom H100 gate
+(`B32`, `N_sample=1`, `N_step=200`, confidence and normal dumping enabled), it
+improved seed wall time from `412.9s` to `371.5s` (`1.11x`) with all CIF and
+confidence outputs present.  Leave it off for tiny jobs or memory/debug runs:
+it holds one extra CPU batch of tensors/AtomArrays, and input errors can surface
+from the prefetch thread rather than exactly at the consuming record.
+
 The `5-6x` public CLI speedup below is the exact-shape case: every feature
 tensor, including atom-shaped tensors, has the same shape.  Real design
 campaigns often have equal token counts but different atom counts.  Those still
@@ -296,6 +312,7 @@ Minimal Slurm-job sketch after acquiring one H100:
 export PROTENIX_ATTENTION_FORCE_FP32=0
 export PROTENIX_GPU_RANDOM_AUGMENT=1
 export PROTENIX_BROADCAST_DIFFUSION_S=1
+export PROTENIX_PREFETCH_DATALOADER=1
 
 export CUDA_MPS_PIPE_DIRECTORY="/tmp/protenix_mps_${SLURM_JOB_ID}/pipe"
 export CUDA_MPS_LOG_DIRECTORY="/tmp/protenix_mps_${SLURM_JOB_ID}/log"
