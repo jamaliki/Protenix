@@ -54,10 +54,20 @@ def run_direct_scoped(
     lengths: list[int],
     config: ContractConfig,
     plan: TriangleUpdatePlan,
+    *,
+    sync_scopes: bool = False,
 ) -> TensorPair:
+    def maybe_sync() -> None:
+        # The profiler version uses barriers so CUDA kernels are attributed to
+        # the record_function that launched them.  The timing version leaves
+        # normal asynchronous scheduling intact.
+        if sync_scopes:
+            torch.cuda.synchronize()
+
     with record_function("direct/clone_inputs"):
         s = clone_optional(s)
         z = z.clone()
+        maybe_sync()
     with record_function("direct/triangle_mul_out"):
         z = compact_triangle_update(
             block.tri_mul_out,
@@ -72,6 +82,7 @@ def run_direct_scoped(
             plan.descriptors,
             plan.invalid_offsets,
         )
+        maybe_sync()
     with record_function("direct/triangle_mul_in"):
         z = compact_triangle_update(
             block.tri_mul_in,
@@ -86,6 +97,7 @@ def run_direct_scoped(
             plan.descriptors,
             plan.invalid_offsets,
         )
+        maybe_sync()
     with record_function("direct/triangle_attention_start"):
         z += block.tri_att_start(
             z,
@@ -94,21 +106,26 @@ def run_direct_scoped(
             inplace_safe=True,
             chunk_size=None,
         )
+        maybe_sync()
     with record_function("direct/triangle_attention_end"):
         z += block.tri_att_end._cueq_ending_contiguous_forward(z, mask)
+        maybe_sync()
     with record_function("direct/finish_block"):
-        return finish_block(block, s, z, mask)
+        out = finish_block(block, s, z, mask)
+        maybe_sync()
+        return out
 
 
 def profile_case(
     name: str,
-    fn: Callable[[], TensorPair],
+    timing_fn: Callable[[], TensorPair],
+    profile_fn: Callable[[], TensorPair],
     out_dir: Path,
     warmup: int,
     iters: int,
     top_rows: int,
 ) -> dict[str, str | float]:
-    _out, timing = cuda_time(fn, warmup, iters)
+    _out, timing = cuda_time(timing_fn, warmup, iters)
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         record_shapes=False,
@@ -116,7 +133,7 @@ def profile_case(
         with_stack=False,
     ) as prof:
         for _ in range(iters):
-            fn()
+            profile_fn()
             torch.cuda.synchronize()
             prof.step()
 
@@ -173,6 +190,7 @@ def main() -> None:
         baseline = profile_case(
             "baseline_cueq_block",
             lambda: run_baseline(block, s, z, mask),
+            lambda: run_baseline(block, s, z, mask),
             out_dir,
             args.warmup,
             args.iters,
@@ -181,6 +199,16 @@ def main() -> None:
         direct = profile_case(
             "direct_block",
             lambda: run_direct_scoped(block, s, z, mask, args.lengths, args.config, plan),
+            lambda: run_direct_scoped(
+                block,
+                s,
+                z,
+                mask,
+                args.lengths,
+                args.config,
+                plan,
+                sync_scopes=True,
+            ),
             out_dir,
             args.warmup,
             args.iters,
