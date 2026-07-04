@@ -4499,6 +4499,34 @@ short-term implementation ladder is:
    wrapper on this ABI; it should own the fused segmented update layout
    natively.
 
+   No-stack exact-group view follow-up: commit `ebe230c` added an
+   `exact_group_matmul_view` contractor to the same screen.  Instead of building
+   contiguous `[records * D, N, N]` inputs with `torch.stack`, it exposes each
+   sorted exact-length run as a non-contiguous `[D, records, N, N]` view and lets
+   `torch.matmul` consume the strided batch.  This tests whether the remaining
+   long-bucket regression is just explicit stack/cat materialization.  Job
+   `110543`, run
+   `runs/triangle_update_matmul_view_ebe230c_20260704_222319`, compared it with
+   the tiled-scatter exact-group `bmm` contractor:
+
+   | bucket / direction | padded CUEQ update | exact-group `bmm` | no-stack `matmul` view | decision |
+   | --- | ---: | ---: | ---: | --- |
+   | short incoming | `2.504 ms` | `1.585 ms` (`1.58x`) | `1.558 ms` (`1.61x`) | useful only short |
+   | short outgoing | `2.426 ms` | `1.616 ms` (`1.50x`) | `1.570 ms` (`1.55x`) | useful only short |
+   | long incoming | `4.131 ms` | `5.366 ms` (`0.77x`) | `5.742 ms` (`0.72x`) | reject |
+   | long outgoing | `4.222 ms` | `5.373 ms` (`0.79x`) | `5.736 ms` (`0.74x`) | reject |
+
+   Profile job `110563`, run
+   `runs/triangle_update_matmul_view_profile_ebe230c_20260704_222509`, explains
+   the failure: the `aten::cat` launches disappear, but `aten::copy_` rises to
+   about `2.33 ms` across 24 calls.  PyTorch is still materializing around the
+   strided batch/output layout, so the view trick is not the native grouped
+   layout we need.  This rejects the last cheap PyTorch wrapper around the
+   compact ABI.  The next kernel has to make the input producer write the
+   exact-group layout directly, and either make the contraction write
+   row-major `[valid_rows, D]` output directly or fuse the output LayerNorm,
+   gate/projection, and residual store while still in grouped layout.
+
    Pairformer CUDA graph follow-up: commit `75761ba` added
    `scripts/perf/pairformer_cudagraph_probe.py` to check whether launch/Python
    overhead is a large enough target before committing to native CuTe kernels.
@@ -4577,14 +4605,15 @@ short-term implementation ladder is:
    exact-length calls, old CUTLASS grouped, CUTLASS 3 grouped, CUTLASS 3
    record-L-batched, producer-owned exact-group CUTLASS, and direct Triton
    segmented scheduling, including compact tile descriptors.  Also reject the
-   compact exact-group `bmm` full-update bridge for Sam-style v2 because its
-   short-bucket win flips into a long-bucket regression.  The next kernel
-   attempt should fuse a larger triangle-multiplication boundary so custom
-   scheduling amortizes overhead over LayerNorm, gated projections, contraction,
-   output normalization, and residual store.  Do not spend more effort on
-   another standalone contraction wrapper unless its design specifically
-   preserves a CUEQ/cuBLAS/CUTLASS-class tensor-core mainloop while eliminating
-   padded work and the pack/scatter boundary.
+   compact exact-group `bmm` full-update bridge and the no-stack strided
+   `matmul` view for Sam-style v2 because their short-bucket wins flip into
+   long-bucket regressions.  The next kernel attempt should fuse a larger
+   triangle-multiplication boundary so custom scheduling amortizes overhead over
+   LayerNorm, gated projections, contraction, output normalization, and residual
+   store.  Do not spend more effort on another standalone contraction wrapper
+   unless its design specifically preserves a CUEQ/cuBLAS/CUTLASS-class
+   tensor-core mainloop while eliminating padded work and the pack/scatter
+   boundary.
 
    Triangle-attention ragged lower-bound: commits `10c7210` and `dbbbfb4`
    added `scripts/perf/triangle_attention_ragged_hotspot.py`.  This screen asks
@@ -4946,6 +4975,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | CUTLASS 3 record-L-batched triangle contraction | one SM90 rank-4 GEMM per record, with `c_z=256` in GEMM's `L` dimension, still regressed short buckets (`0.48-0.53x`), barely helped long outgoing (`1.06x`), and slowed long incoming (`0.96x`) | removing the `4096` grouped-problem overhead is not enough; another standalone stock-GEMM wrapper is not the v2 fix |
 | Producer-owned exact-group CUTLASS 3 triangle contraction | assuming a future producer writes exact-length groups directly, cuBLAS-backed `torch.bmm` was strong (`1.35-2.25x` contraction-only), but the stock CUTLASS rank-4 kernel still regressed short buckets and only reached `1.09-1.17x` on long buckets | the layout idea is useful, but the stock CUTLASS adapter is not the native fused v2 update |
 | Exact-group `bmm` contractor inside the compact triangle-update bridge | after fixing the benchmark's row-wise scatter, the short bucket improved (`1.21-1.59x`) with BF16-valid parity, but the long bucket still regressed to `0.68-0.79x`; profiling shows the remaining loss is mostly `torch.stack` copy/cat materialization plus compact producer/output boundary cost | exact-length work reduction is real only if the producer emits exact-group layout directly and the output/residual store is redesigned; do not promote a short-only compact bridge for Sam-style v2 |
+| No-stack strided `matmul` view for exact groups | removed explicit `torch.stack`/`cat` and slightly improved short buckets, but long buckets were worse than exact-group `bmm` (`0.72-0.74x`); profiler shows `aten::copy_` grew to about `2.33 ms` because PyTorch still materializes around the strided batch/output layout | the compact ABI cannot be rescued by PyTorch view tricks; the producer must write grouped layout directly |
 | Compact valid-row triangle-multiplication bridge | valid-only compact row work was slower than padded CUEQ (`0.70x` short, `0.27x` long), and scattering back to padded layout was worse | do not bridge compact row-wise work through dense `a/b` tensors; a real segmented native update must stay segmented through contraction and output |
 | Compact segmented triangle-multiplication update inside a full v2 `PairformerBlock` | isolated short-bucket update improved, but the full block slowed badly: short `10.237 -> 27.144 ms` best (`0.38x`), long `25.791 -> 123.764 ms` best (`0.21x`) | the dense-ABI compact bridge pays too much pack/scatter, invalid-row zeroing, and custom-contraction cost; the next attempt needs a native vendor-quality CuTe/SM90 segmented update |
 | Unguarded fused triangle-multiplication input LayerNorm + dual-GEMM producer | short v2 blocks improved about `1.08x`, but long `B16/N220` blocks slowed to `0.94x`; the path is now default-off and guarded to <=300k physical pair rows | local producer fusion can be shape-specific; do not enable it globally for Sam-style v2 campaigns unless the long bucket is protected by fallback |
@@ -5098,8 +5128,10 @@ Profiling and reproducibility helpers:
   storage, applies the output gate, and scatters valid rows back to dense output
   with the residual.  Current result: real short-bucket signal, including the
   exact-group `bmm` contractor and the row-tiled scatter fix, but long-bucket
-  rejection unless the producer writes exact-group layout directly and the
-  output/residual store is fused into the native boundary.
+  rejection.  The no-stack `exact_group_matmul_view` variant proves PyTorch view
+  tricks still materialize copies on the long bucket; the producer has to write
+  exact-group layout directly and the output/residual store has to be fused into
+  the native boundary.
 - `scripts/perf/triangle_update_compact_segmented_profile.py`: profiler companion
   for the compact segmented update screen.  Use it when a timing result needs
   launch-level attribution, especially to separate producer, contraction,

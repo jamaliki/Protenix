@@ -424,8 +424,10 @@ screen, where a future producer is assumed to emit record-major groups directly,
 only turned into a full-update win on the heavily padded short bucket.  After
 fixing a row-wise scatter launch in that benchmark, the exact-group bridge
 reached `1.21-1.59x` on the short bucket but still regressed the long bucket to
-`0.68-0.79x`.  That makes it a learning signal for a native segmented update,
-not a deployable v2 path.
+`0.68-0.79x`.  A no-stack strided-`matmul` variant removed explicit
+`torch.stack`/`cat`, but PyTorch still materialized the strided batch internally
+and the long bucket stayed slower (`0.72-0.74x`).  That makes these screens a
+learning signal for a native segmented update, not a deployable v2 path.
 Whole-Pairformer CUDA graph replay was also screened as a lower-risk
 launch-overhead fix.  It was exact and helped the short v2 bucket by about
 `3%`, but the full 48-block long bucket was flat (`~1.00x`) once changed
