@@ -170,7 +170,10 @@ is no reuse window.
 Do not set the experimental Triton elementwise/residual/transition flags for
 this mixed-campaign path unless you are running a new benchmark.  On the B16
 mixed-length gate they slowed the representative predict section from `41.6s`
-to `69.3s`; the default branch settings are the measured fast path.
+to `69.3s`.  A later B32 same-token, variable-atom gate showed that transition
+input fusion still speeds the isolated pairformer block, but the full predict
+path was slightly slower once diffusion/confidence variance was included.  The
+default branch settings are therefore the measured fast path.
 
 The default `--batch_mode auto` is deliberately conservative but usable for real
 sequence-design campaigns.  If all featurized tensor shapes match, the whole

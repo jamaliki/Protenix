@@ -2210,6 +2210,8 @@ Representative H100 screens after adding the in-place fallback:
 | B32 transition hotspot | 7.922 ms | 6.429 ms | 1.232x, wide input |
 | B64 transition hotspot | 15.835 ms | 12.851 ms | 1.232x, wide input |
 | B96 transition hotspot | 23.732 ms | 19.829 ms | 1.197x, in-place fallback |
+| B32/N251 PairformerBlock after ending-contiguous producer | 36.873 ms | 35.401 ms | 1.042x block, 1.243x pair transition, +1.9 GiB peak |
+| B32/N251 same-token variable-atom full gate | 41.99 s predict | 42.29 s predict | rejected, pairformer improved but full path regressed |
 | B64 full exact-shape gate | 0.47473 seq/s | 0.47468 seq/s | neutral, peak 46.5 GiB |
 | B96 full exact-shape gate | 0.50211 seq/s | 0.50818 seq/s | +1.21%, peak 57.8 GiB |
 
@@ -2224,6 +2226,32 @@ All full-gate coordinates were finite and confidence summaries were preserved.
 The BF16 transition output is not bitwise-identical because fusion changes
 rounding order; hotspot parity was `max_abs <= 0.03125` and mean abs about
 `0.0013` after the final projection.
+
+The more practical same-token, variable-atom campaign shape was re-tested after
+the contiguous ending-attention producer became default-on.  The paired block
+screen (`runs/transition_combo_block_screen_20260703_235608_9e427ed`) was
+mechanistically positive: the transition subrange moved from `7.931 ms` to
+`6.382 ms`, and the whole synthetic PairformerBlock moved from `36.873 ms` to
+`35.401 ms`.  The cost was extra temporary activation memory (`5475 MiB` peak
+allocated to `7448 MiB` in the block harness).  The representative full gate
+(`runs/transition_combo_full_gate_20260703_235816_9e427ed`) used 32 records,
+`N_token=251`, `N_atom=1834-1940`, `N_sample=1`, `N_step=200`, confidence
+enabled, and the current optimized environment.  It produced all 32 CIFs for
+both repeats, but the average predict path was slower:
+
+| metric | baseline | transition fusion | speedup |
+| --- | ---: | ---: | ---: |
+| predict | 41.990 s | 42.285 s | 0.993x |
+| model_forward | 40.152 s | 40.448 s | 0.993x |
+| pairformer | 28.026 s | 27.704 s | 1.012x |
+| diffusion | 11.368 s | 11.942 s | 0.952x |
+| confidence | 0.759 s | 0.804 s | 0.944x |
+
+Decision: keep the transition input fusion as an explicit experiment/CuTe
+design clue, but do not promote it as a default for the many-sequence
+variable-atom path.  The right next kernel boundary is not "use one wider GEMM"
+globally; it is to remove the transition intermediate write/read without
+increasing temporary memory or disturbing the diffusion/confidence tail.
 
 ### 3. Specialize atom local attention
 
