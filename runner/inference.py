@@ -18,8 +18,8 @@ import time
 import traceback
 import urllib.request
 from argparse import Namespace
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Mapping as MappingABC
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from numbers import Number
 from os.path import exists as opexists, join as opjoin
@@ -1055,15 +1055,85 @@ def _dump_worker_count(batch_size: int) -> int:
     return max(1, min(batch_size, requested))
 
 
+def _async_dump_enabled(batch_size: int, dump_workers: int) -> bool:
+    """Whether to pipeline file writing behind later GPU batches.
+
+    The async path is deliberately opt-in: it is useful for large campaigns
+    where each GPU batch is followed by seconds of CPU CIF/JSON serialization,
+    but it also keeps more host-side work alive and can stress shared
+    filesystems.  Single-batch jobs cannot hide the final dump wait, so they use
+    the simpler synchronous path.
+    """
+    if batch_size <= 1 or dump_workers <= 1:
+        return False
+    return os.getenv("PROTENIX_ASYNC_DUMP", "").strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
+
+
+def _detach_prediction_to_cpu(value: Any) -> Any:
+    """Recursively detach prediction tensors before async file writing.
+
+    Batched prediction slices are often CUDA views into one large batch output.
+    Passing those views directly to writer threads would keep the old GPU
+    allocation live while the next batch runs, and any later ``.cpu()`` call
+    from a writer thread could contend with model kernels.  Moving the small
+    per-record outputs to CPU at the hand-off boundary makes the async section
+    pure host/file-system work.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, MappingABC):
+        return {
+            key: _detach_prediction_to_cpu(sub_value)
+            for key, sub_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_detach_prediction_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_detach_prediction_to_cpu(item) for item in value)
+    return value
+
+
 def _dump_prediction_item(
     runner: InferenceRunner,
     data: Mapping[str, Any],
     atom_array: Any,
     seed: int,
     prediction: Mapping[str, Any],
-) -> str:
+) -> tuple[str, int, str]:
     _dump_prediction(runner, data, atom_array, seed, prediction)
-    return str(data["sample_name"])
+    return str(data["sample_name"]), seed, runner.dumper.base_dir
+
+
+def _log_dump_success(sample_name: str, seed: int, dump_dir: str) -> None:
+    logger.info(
+        "[Rank %s] %s [seed:%s] succeeded in batched forward. "
+        "Results saved to %s",
+        DIST_WRAPPER.rank,
+        sample_name,
+        seed,
+        dump_dir,
+    )
+
+
+def _drain_dump_futures(
+    futures: list[Future[tuple[str, int, str]]],
+    *,
+    wait: bool,
+) -> None:
+    """Log completed async dumps and surface writer exceptions."""
+    if wait:
+        completed = as_completed(list(futures))
+    else:
+        completed = (future for future in list(futures) if future.done())
+    for future in completed:
+        futures.remove(future)
+        _log_dump_success(*future.result())
+
 
 
 def _describe_batch(
@@ -1307,6 +1377,8 @@ def _predict_and_dump_items(
     seed: int,
     num_data: int,
     batch_mode: str,
+    dump_executor: ThreadPoolExecutor | None = None,
+    dump_futures: list[Future[tuple[str, int, str]]] | None = None,
 ) -> None:
     """Run one compatible batch, split outputs, and dump per input."""
     if not items:
@@ -1335,19 +1407,69 @@ def _predict_and_dump_items(
     split_start = time.perf_counter()
     predictions = _prediction_items(prediction, configs, batch_size)
     split_sec = time.perf_counter() - split_start
-    dump_start = time.perf_counter()
     dump_workers = _dump_worker_count(batch_size)
-    if dump_workers == 1:
+    async_dump = dump_executor is not None and dump_futures is not None
+    stage_sec = 0.0
+    if async_dump:
+        stage_start = time.perf_counter()
+        predictions = [
+            _detach_prediction_to_cpu(prediction_i) for prediction_i in predictions
+        ]
+        del prediction
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        stage_sec = time.perf_counter() - stage_start
+
+    dump_start = time.perf_counter()
+    if async_dump:
         for prediction_i, (data, atom_array) in zip(predictions, items):
-            _dump_prediction_item(runner, data, atom_array, seed, prediction_i)
-            logger.info(
-                "[Rank %s] %s [seed:%s] succeeded in batched forward. "
-                "Results saved to %s",
-                DIST_WRAPPER.rank,
-                data["sample_name"],
-                seed,
-                configs.dump_dir,
+            dump_futures.append(
+                dump_executor.submit(
+                    _dump_prediction_item,
+                    runner,
+                    data,
+                    atom_array,
+                    seed,
+                    prediction_i,
+                )
             )
+        _drain_dump_futures(dump_futures, wait=False)
+        dump_sec = time.perf_counter() - dump_start
+        logger.info(
+            "[Rank %s] Queued %d/%d input(s) [seed:%s] for async dump in %.2fs "
+            "(predict %.2fs, split %.2fs, cpu_stage %.2fs, enqueue %.2fs, "
+            "dump_workers %d, pending_dumps %d).",
+            DIST_WRAPPER.rank,
+            batch_size,
+            num_data,
+            seed,
+            time.perf_counter() - start,
+            predict_sec,
+            split_sec,
+            stage_sec,
+            dump_sec,
+            dump_workers,
+            len(dump_futures),
+        )
+    elif dump_workers == 1:
+        for prediction_i, (data, atom_array) in zip(predictions, items):
+            _log_dump_success(
+                *_dump_prediction_item(runner, data, atom_array, seed, prediction_i)
+            )
+        dump_sec = time.perf_counter() - dump_start
+        logger.info(
+            "[Rank %s] Finished %d/%d input(s) [seed:%s] in %.2fs "
+            "(predict %.2fs, split %.2fs, dump %.2fs, dump_workers %d).",
+            DIST_WRAPPER.rank,
+            batch_size,
+            num_data,
+            seed,
+            time.perf_counter() - start,
+            predict_sec,
+            split_sec,
+            dump_sec,
+            dump_workers,
+        )
     else:
         # Each record writes into a distinct output directory and owns a
         # separate prediction slice/AtomArray.  Parallelizing at record
@@ -1366,29 +1488,21 @@ def _predict_and_dump_items(
                 for prediction_i, (data, atom_array) in zip(predictions, items)
             ]
             for future in as_completed(futures):
-                sample_name = future.result()
-                logger.info(
-                    "[Rank %s] %s [seed:%s] succeeded in batched forward. "
-                    "Results saved to %s",
-                    DIST_WRAPPER.rank,
-                    sample_name,
-                    seed,
-                    configs.dump_dir,
-                )
-    dump_sec = time.perf_counter() - dump_start
-    logger.info(
-        "[Rank %s] Finished %d/%d input(s) [seed:%s] in %.2fs "
-        "(predict %.2fs, split %.2fs, dump %.2fs, dump_workers %d).",
-        DIST_WRAPPER.rank,
-        batch_size,
-        num_data,
-        seed,
-        time.perf_counter() - start,
-        predict_sec,
-        split_sec,
-        dump_sec,
-        dump_workers,
-    )
+                _log_dump_success(*future.result())
+        dump_sec = time.perf_counter() - dump_start
+        logger.info(
+            "[Rank %s] Finished %d/%d input(s) [seed:%s] in %.2fs "
+            "(predict %.2fs, split %.2fs, dump %.2fs, dump_workers %d).",
+            DIST_WRAPPER.rank,
+            batch_size,
+            num_data,
+            seed,
+            time.perf_counter() - start,
+            predict_sec,
+            split_sec,
+            dump_sec,
+            dump_workers,
+        )
     torch.cuda.empty_cache()
 
 
@@ -1598,10 +1712,25 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
         batch_size = _inference_batch_size(configs)
         batch_mode = _inference_batch_mode(configs)
         token_bucket_size = _inference_token_bucket_size(configs)
+        dump_workers = _dump_worker_count(batch_size)
+        async_dump = (
+            _async_dump_enabled(batch_size, dump_workers) and num_data > batch_size
+        )
         pending: dict[Any, list[tuple[dict[str, Any], Any]]] = {}
+        dump_executor: ThreadPoolExecutor | None = None
+        dump_futures: list[Future[tuple[str, int, str]]] = []
+        if async_dump:
+            dump_executor = ThreadPoolExecutor(max_workers=dump_workers)
+            logger.info(
+                "[Rank %s] Async prediction dumping enabled with %d worker(s).",
+                DIST_WRAPPER.rank,
+                dump_workers,
+            )
 
         def flush_signature(signature: Any) -> None:
             items = pending.pop(signature, [])
+            if dump_executor is not None:
+                _drain_dump_futures(dump_futures, wait=False)
             _predict_and_dump_items(
                 runner=runner,
                 configs=configs,
@@ -1609,44 +1738,59 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                 seed=seed,
                 num_data=num_data,
                 batch_mode=batch_mode,
+                dump_executor=dump_executor,
+                dump_futures=dump_futures if dump_executor is not None else None,
             )
 
-        for batch in dataloader:
-            for data, atom_array, data_error_message in batch:
-                sample_name = data.get("sample_name", "unknown")
-                try:
-                    if len(data_error_message) > 0:
-                        _write_inference_error(
-                            runner,
-                            sample_name,
-                            f"Data error for {sample_name}: {data_error_message}",
+        try:
+            for batch in dataloader:
+                for data, atom_array, data_error_message in batch:
+                    sample_name = data.get("sample_name", "unknown")
+                    try:
+                        if len(data_error_message) > 0:
+                            _write_inference_error(
+                                runner,
+                                sample_name,
+                                f"Data error for {sample_name}: {data_error_message}",
+                            )
+                            continue
+
+                        logger.info(
+                            f"[Rank {DIST_WRAPPER.rank} ({data['sample_index'] + 1}/{num_data})] "
+                            f"{sample_name} [seed:{seed}]: "
+                            f"N_asym {data['N_asym'].item()}, N_token {data['N_token'].item()}, "
+                            f"N_atom {data['N_atom'].item()}, N_msa {data['N_msa'].item()}"
                         )
-                        continue
+                        signature = _queue_batch_signature(
+                            data, batch_mode, token_bucket_size
+                        )
+                        pending.setdefault(signature, []).append((data, atom_array))
+                        if len(pending[signature]) >= batch_size:
+                            flush_signature(signature)
+                    except Exception as e:
+                        if _raise_on_batch_fallback_enabled():
+                            raise
+                        error_message = (
+                            f"[Rank {DIST_WRAPPER.rank}] {sample_name} failed: {e}\n"
+                            f"{traceback.format_exc()}"
+                        )
+                        _write_inference_error(runner, sample_name, error_message)
+                        torch.cuda.empty_cache()
 
-                    logger.info(
-                        f"[Rank {DIST_WRAPPER.rank} ({data['sample_index'] + 1}/{num_data})] "
-                        f"{sample_name} [seed:{seed}]: "
-                        f"N_asym {data['N_asym'].item()}, N_token {data['N_token'].item()}, "
-                        f"N_atom {data['N_atom'].item()}, N_msa {data['N_msa'].item()}"
-                    )
-                    signature = _queue_batch_signature(
-                        data, batch_mode, token_bucket_size
-                    )
-                    pending.setdefault(signature, []).append((data, atom_array))
-                    if len(pending[signature]) >= batch_size:
-                        flush_signature(signature)
-                except Exception as e:
-                    if _raise_on_batch_fallback_enabled():
-                        raise
-                    error_message = (
-                        f"[Rank {DIST_WRAPPER.rank}] {sample_name} failed: {e}\n"
-                        f"{traceback.format_exc()}"
-                    )
-                    _write_inference_error(runner, sample_name, error_message)
-                    torch.cuda.empty_cache()
-
-        for signature in list(pending):
-            flush_signature(signature)
+            for signature in list(pending):
+                flush_signature(signature)
+        finally:
+            if dump_executor is not None:
+                wait_start = time.perf_counter()
+                try:
+                    _drain_dump_futures(dump_futures, wait=True)
+                finally:
+                    dump_executor.shutdown(wait=True)
+                logger.info(
+                    "[Rank %s] Async prediction dumping drained in %.2fs.",
+                    DIST_WRAPPER.rank,
+                    time.perf_counter() - wait_start,
+                )
         t1_end = time.time()
         logger.info(
             f"[Rank {DIST_WRAPPER.rank}] Seed {seed} completed in {t1_end - t1_start:.2f}s."
