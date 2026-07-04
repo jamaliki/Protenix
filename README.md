@@ -231,6 +231,16 @@ predict section improved by about `1.02x` for `N_sample=5` and `1.05x` for
 bisects, or override `PROTENIX_TRITON_TRANSITION_DUAL_GEMM_MIN_ROWS` only when
 benchmarking a new campaign shape.
 
+There is also an experimental short-bucket Protenix-v2 triangle-multiplication
+producer behind `PROTENIX_TRITON_TRIANGLE_LN_DUAL_GEMM=1`.  It fuses the input
+LayerNorm into CUEQ's dual gated GEMM for BF16 `c_z=256` blocks, but it is
+deliberately default-off and guarded to short physical pair buckets
+(`PROTENIX_TRITON_TRIANGLE_LN_DUAL_GEMM_MAX_ROWS=300000` by default).  The
+guarded H100 block screen improved the sorted 40-124 token v2 bucket by about
+`1.08x`, while the 136-220 token bucket falls back to the normal CUEQ path
+because the unguarded fused producer was slower there.  Treat this as a
+kernel-learning/benchmarking knob, not a normal Sam-style v2 speed preset.
+
 For normal multi-step inference, the diffusion transformer also caches the
 step-invariant token pair-attention bias once per block.  This spends a few GiB
 on long mixed batches, but removes repeated pair-bias projection and sample-lane

@@ -4317,6 +4317,41 @@ short-term implementation ladder is:
    store.  Do not spend more effort on another standalone contraction wrapper
    unless its design specifically preserves a CUEQ/cuBLAS/CUTLASS-class
    tensor-core mainloop while eliminating padded work.
+
+   Fused producer follow-up: commits `9b238f1`, `9ba65f4`, `4660f23`,
+   `9b58fc6`, and `a22eec7` tested the next larger triangle-multiplication
+   boundary: fuse input LayerNorm with the dual input gated GEMM and write
+   CUEQ's `[2D, B, N, N]` projection layout directly.  The output gate still
+   needs normalized `z`, so the production candidate also writes that tensor
+   once; it is not a full "mega-kernel".  The isolated producer/full-boundary
+   screens advanced the idea, but the PairformerBlock gate is the authoritative
+   result:
+
+   | v2 bucket | baseline block | unguarded fused block | triangle-mul movement | decision |
+   | --- | ---: | ---: | --- | --- |
+   | short variable `B16/N124` | 10.153 ms | 9.420 ms (`1.078x`) | outgoing `2.596 -> 2.151 ms`, incoming `2.417 -> 2.115 ms` | useful short-shape opt-in |
+   | long variable `B16/N220` | 25.571 ms | 27.075 ms (`0.944x`) | outgoing `3.969 -> 4.762 ms`, incoming `3.901 -> 4.691 ms` | reject unguarded |
+   | uniform `B16/N124` | 10.128 ms | 9.370 ms (`1.081x`) | outgoing `2.585 -> 2.153 ms`, incoming `2.412 -> 2.103 ms` | confirms short shape |
+   | uniform `B16/N220` | 25.578 ms | 27.180 ms (`0.941x`) | outgoing `3.969 -> 4.780 ms`, incoming `3.906 -> 4.708 ms` | reject unguarded |
+
+   Run: job `109725`,
+   `runs/v2_triangle_ln_dualgemm_block_20260704_172854_9b58fc6`, one H100,
+   BF16, `c_z=256`, `hidden_scale_up=True`, transition dual-GEMM enabled,
+   output-gate residual fusion disabled to isolate this boundary.
+
+   Decision: keep the implementation default-off and shape guarded.  Commit
+   `a22eec7` added a default physical-row cap of `300000` via
+   `PROTENIX_TRITON_TRIANGLE_LN_DUAL_GEMM_MAX_ROWS`; with
+   `PROTENIX_TRITON_TRIANGLE_LN_DUAL_GEMM=1`, short `B16/N124` buckets use the
+   fused producer, while long `B16/N220` buckets fall back to the current CUEQ
+   path.  Guard verification job `109727`,
+   `runs/v2_triangle_ln_dualgemm_guard_20260704_173149_a22eec7`, measured
+   short variable block `10.131 -> 9.395 ms` (`1.078x`) and long variable block
+   `25.410 -> 25.458 ms` (`0.998x`, fallback/noise).  This is a useful
+   short-bucket learning resource and optional knob, not a promoted global v2
+   speedup.  The long-bucket loss also explains why the earlier isolated
+   screen was insufficient: the full block, not the hand-picked producer
+   boundary, is the gate.
 2. **Full segmented triangle-mul update:** fuse or internally schedule the
    LayerNorm, gated input projection, segmented contraction, output LayerNorm,
    output projection/gate, and residual store for valid rows.  This is the first
@@ -4368,6 +4403,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Bool masks for CUEQ triangle multiplication | block screen was flat at `N=124` and only +0.5% at `N=220` | mask dtype plumbing is not a meaningful bottleneck after triangle-attention bool-mask cleanup |
 | Raising CUEQ triangle-multiplication PyTorch fallback threshold for v2 | forcing the `N=124` bucket through the PyTorch fallback doubled triangle-mul time (`5.04 -> 10.04 ms`) and slowed the block (`10.67 -> 15.69 ms`); `N=220` was unchanged | the short physical bucket still needs CUEQ's fused LayerNorm/GatedGEMM path; fallback thresholds are not the ragged-v2 fix |
 | Compact valid-row triangle-multiplication bridge | valid-only compact row work was slower than padded CUEQ (`0.70x` short, `0.27x` long), and scattering back to padded layout was worse | do not bridge compact row-wise work through dense `a/b` tensors; a real segmented native update must stay segmented through contraction and output |
+| Unguarded fused triangle-multiplication input LayerNorm + dual-GEMM producer | short v2 blocks improved about `1.08x`, but long `B16/N220` blocks slowed to `0.94x`; the path is now default-off and guarded to <=300k physical pair rows | local producer fusion can be shape-specific; do not enable it globally for Sam-style v2 campaigns unless the long bucket is protected by fallback |
 | Materializing pairformer token-attention bias as contiguous `[B, H, Q, K]` | traced pairformer SDPA shape `[16, 16, 124, 24]` moved from math-dispatch attempt to a cuDNN frontend "no valid execution plans" error; fallback timing then segfaulted in the isolated screen | the non-contiguous bias layout is not the only blocker; head_dim 24 plus dense additive bias lacks a safe cuDNN plan in this runtime, so do not pay a bias copy hoping for a backend flip |
 | CUEQ `attention_pair_bias` for diffusion token attention | native pair-bias projection needed an explicit zero LayerNorm bias, then CUEQ's internal SDPA failed with `No valid execution plans built`; forced PyTorch fallback was slower than the current full conv2d+SDPA baseline | CUEQ's wrapper is not a drop-in win here; use it only if we can call a narrower fused pair-bias producer while keeping Protenix's SDPA fallback policy |
 | Compact rank-5 diffusion pair-bias cache | stored `5x` less cached bias, but the hybrid flattened-GEMM/rank-5-SDPA screen was slower than the current expanded rank-4 cache (`29.82 -> 35.05 ms` at `N=124`, `64.06 -> 69.85 ms` at `N=220`) | memory footprint is not the active limiter; preserve the faster cuDNN rank-4 SDPA schedule unless a future workload becomes memory-bound |
@@ -4442,6 +4478,11 @@ Production code touched by the throughput stack:
 - `protenix/model/triangular/qkv_layout_triton.py`: inference-only CUEQ q/k/v
   layout producer for triangle attention; keeps the fused projection GEMM and
   CUEQ attention kernel unchanged while removing hidden contiguous-copy traffic.
+- `protenix/model/triangular/triangle_ln_dual_gemm_triton.py`: default-off
+  BF16 v2 triangle-multiplication input producer that fuses LayerNorm into the
+  dual gated GEMM for short physical pair buckets.  It is guarded by dtype,
+  no-grad CUDA, `c_z=256`, and a default <=300k physical-row cap because the
+  same boundary loses on the long Sam-style bucket.
 - `protenix/model/modules/confidence.py` and `protenix/model/protenix.py`:
   confidence-logit chunk iteration, streaming summary consumption, and the
   mixed-token diffusion sampler that pads/masks conditioning, token-transformer,
@@ -4509,6 +4550,11 @@ Profiling and reproducibility helpers:
   rows and scattering dense `a/b` tensors around the existing contraction is
   slower than padded CUEQ; a real segmented update has to keep the native
   schedule segmented through contraction and epilogue.
+- `scripts/perf/triangle_input_ln_dual_gemm_probe.py` and
+  `scripts/perf/triangle_multiplication_ln_dualgemm_full_probe.py`: fused
+  triangle-multiplication input LayerNorm + dual-GEMM screens.  Use the
+  PairformerBlock `--lengths` gate before promotion; the production path is
+  deliberately default-off and row-guarded because long v2 buckets regressed.
 - `scripts/perf/submit_tokyo_triangle_attention_ncu.sh` and
   `scripts/perf/tokyo_triangle_attention_ncu.sbatch`: Tokyo one-H100 Nsight
   Compute capture for one starting or ending CUEQ triangle-attention module.
