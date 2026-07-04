@@ -3621,24 +3621,41 @@ Follow-up job `101137`, run directory
 
 | mode | workers | active thread % | batch size | generated samples | wall s | wall samples/s | decision |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| CUDA MPS, `/tmp` socket | 9 | 11 | 8 | 1440 | 224.57 | 6.412 | best measured `N_sample=5` throughput mode |
+| CUDA MPS, `/tmp` socket | 9 | 11 | 8 | 1440 | 224.57 | 6.412 | former best; useful lower-latency MPS point |
 | CUDA MPS, `/tmp` socket | 10 | 10 | 8 | 1600 | 254.54 | 6.286 | regressed; too much contention |
 
-Interpretation: `--batch_size 8` is still the wrong single-process default, but
-with enough independent MPS workers it reduces padded work per shard while MPS
-recovers GPU occupancy.  This is a throughput-only mode: each worker's own
-campaign latency is worse (`~224s` for B8/9 versus `~142s` for B16/5), but
+Follow-up job `102476`, run directory
+`runs/mps_b4_width_nsample5_20260704_080213_ad25306`, then tested whether even
+smaller B4 workers could trade per-shard latency for more aggregate H100
+occupancy:
+
+| mode | workers | active thread % | batch size | generated samples | wall s | wall samples/s | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| CUDA MPS, `/tmp` socket | 12 | 8 | 4 | 1920 | 304.99 | 6.295 | below B8/9 |
+| CUDA MPS, `/tmp` socket | 14 | 7 | 4 | 2240 | 364.19 | 6.151 | over-contended |
+| CUDA MPS, `/tmp` socket | 16 | 6 | 4 | 2560 | 387.79 | 6.601 | new best, but still short of 10x |
+
+Interpretation: `--batch_size 8` and `--batch_size 4` are both wrong
+single-process defaults, but with enough independent MPS workers they reduce
+padded work per shard while MPS recovers GPU occupancy.  This is a
+throughput-only mode: each worker's own campaign latency is much worse
+(`~388s` for B4/16 and `~225s` for B8/9 versus `~142s` for B16/5), but
 aggregate per-GPU generated samples/s improves.  The current best `N_sample=5`
-operational speedup is `6.412 / 0.753 = 8.5x` over the original low-sample
-boundary, still short of the `10x` target.
+operational speedup is `6.601 / 0.753 = 8.8x` over the original low-sample
+boundary, still short of the `10x` target.  Closing that final `~14%`
+throughput gap needs either a real model/kernel win or one more carefully
+bounded width probe; it is not a reason to raise batch size in the ordinary
+single-process path.
 
 Timed-only component logs make the mechanism clear.  In the same-node B16/5
 control, model-forward time was `4.23s` per input, split mainly into
-`1.85s` pairformer and `2.31s` diffusion.  In the winning B8/9 MPS run,
+`1.85s` pairformer and `2.31s` diffusion.  In the earlier B8/9 MPS run,
 model-forward time slowed to `6.75s` per input (`2.96s` pairformer,
-`3.70s` diffusion).  The aggregate win comes from filling otherwise idle GPU
-slots across independent workers, not from making the model path itself faster.
-That is why this operational mode does not remove the need for a true
+`3.70s` diffusion).  In the B4/16 run, middle and long four-record batches
+were slower still, with per-input model-forward around `11.7-14.0s` in sampled
+worker logs.  The aggregate win comes from filling otherwise idle GPU slots
+across independent workers, not from making the model path itself faster.  That
+is why this operational mode does not remove the need for a true
 diffusion/pairformer kernel win.
 
 Interpretation:
@@ -3649,11 +3666,11 @@ Interpretation:
   `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` helps once there are enough workers.  For
   `N_sample=1`, treat **five MPS workers per H100 at 20% each** as the
   practical knee.  For maximum `N_sample=5` aggregate throughput, the best
-  measured operational mode is **nine B8 workers at 11% each**.
+  measured operational mode is **sixteen B4 workers at 6% each**.
 - Compared with the prior promoted single-process low-sample rate (`3.85`
-  generated samples/s), the B8/nine-worker `6.412` generated samples/s result
-  is a `1.67x` operational gain.  Compared with the original low-sample branch
-  boundary (`0.753` generated samples/s), it is about `8.5x` per-GPU
+  generated samples/s), the B4/sixteen-worker `6.601` generated samples/s
+  result is a `1.71x` operational gain.  Compared with the original low-sample
+  branch boundary (`0.753` generated samples/s), it is about `8.8x` per-GPU
   throughput.
 - For `N_sample=1`, current single-process throughput is `0.968` records/s
   versus the original `0.166` records/s default (`5.83x`).  Five MPS workers at
@@ -3662,7 +3679,7 @@ Interpretation:
 - This is not a substitute for kernel work: each worker individually slows down
   as width increases, and the aggregate curve is already flattening.  The
   `N_sample=1` endpoint now clears the requested `10x` per-GPU target
-  operationally, but the `N_sample=5` endpoint remains at about `8.5x`.  Closing
+  operationally, but the `N_sample=5` endpoint remains at about `8.8x`.  Closing
   that gap still needs a larger true kernel/layout win, not just more same-GPU
   processes.
 
