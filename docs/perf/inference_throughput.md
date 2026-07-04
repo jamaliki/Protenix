@@ -297,20 +297,31 @@ The input was 32 protein-only records with lengths
 sides.  Throughput below reports generated structures per second, so
 `N_sample=5` has 160 generated samples.
 
+Follow-up job `109924`
+(`runs/v2_skip_init_gate_40e6b4c_20260704_195807`) then isolated the remaining
+fixed startup gap at current commit `40e6b4c`.  With
+`PROTENIX_SKIP_INFERENCE_WEIGHT_INIT=0`, model construction still spent about
+`42.5s` after environment initialization before checkpoint load; with the new
+default strict-checkpoint init skip, that gap fell to about `0.8s`.  Strict
+checkpoint load completed in both cases, and model/predict timings were
+unchanged within normal noise (`0.99-1.00x`).  The wall-time rows below use the
+new default-on strict init skip because it is now part of the promoted
+inference path; set `PROTENIX_SKIP_INFERENCE_WEIGHT_INIT=0` only when debugging
+initialization itself.
+
 | case | baseline wall | current wall | wall speedup | baseline model/predict | current predict | model speedup | current pairformer | current diffusion | current confidence |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `N_sample=1` | `290s` (`0.110`/s) | `144s` (`0.222`/s) | `2.01x` | `231.24s` (`0.138`/s) | `81.89s` (`0.391`/s) | `2.82x` | `26.39s` | `16.76s` | `3.67s` |
-| `N_sample=5` | `327s` (`0.489`/s) | `163s` (`0.982`/s) | `2.01x` | `267.03s` (`0.599`/s) | `98.75s` (`1.620`/s) | `2.70x` | `26.22s` | `31.58s` | `5.87s` |
+| `N_sample=1` | `290s` (`0.110`/s) | `103s` (`0.311`/s) | `2.82x` | `231.24s` (`0.138`/s) | `82.37s` (`0.388`/s) | `2.81x` | `28.07s` | `18.46s` | `4.10s` |
+| `N_sample=5` | `327s` (`0.489`/s) | `122s` (`1.311`/s) | `2.68x` | `267.03s` (`0.599`/s) | `99.13s` (`1.614`/s) | `2.69x` | `27.87s` | `33.32s` | `6.61s` |
 
 Interpretation: for the actual wide-`z` v2 workload, the current branch is
-closer to a `2x` end-to-end improvement over an executable default baseline
-than to the base-checkpoint `5-6x` headline.  The model-side batching/fusion
-work is stronger (`2.7-2.8x`), but full wall time still includes Python
-orchestration, feature/output work, and per-batch setup.  Confidence is
-retained and is no longer the main target (`3-6s` across the two current
-batches); the remaining material v2 compute is the wider pairformer plus
-diffusion.  Further large gains need a real ragged/segmented pairformer kernel
-boundary, not more configuration-only tuning.
+now a `2.7-2.8x` end-to-end improvement over an executable default baseline.
+The startup skip mostly aligns wall speedup with model/predict speedup by
+removing wasted CPU initialization; it does not change the GPU bottleneck.
+Confidence is retained and is no longer the main target (`4-7s` across the two
+current batches); the remaining material v2 compute is the wider pairformer
+plus diffusion.  Further large gains need a real ragged/segmented pairformer
+kernel boundary, not more configuration-only tuning.
 
 The obvious v2 token-bucket heuristic was rejected.  Job `103806`
 (`runs/v2_mixed_bucket88_gate_20260704_121455_0ecd10c`) split the same
@@ -4672,13 +4683,17 @@ Production code touched by the throughput stack:
 
 - `protenix/model/generator.py`: precomputes scalar diffusion schedules once
   outside the sampling loop.
+- `protenix/model/init_control.py`: process-local context manager used by
+  strict inference checkpoint loading to skip construction-time random weight
+  initialization that would be immediately overwritten by checkpoint tensors.
 - `protenix/model/utils.py`: optional GPU-side random augmentation, avoiding
   CPU SciPy rotation generation for inference batches.
 - `protenix/model/modules/diffusion.py`: BF16/autocast controls, component
   timing, and sample-broadcast diffusion conditioning.
 - `protenix/model/modules/primitives.py`: SDPA fallback policy, optional
-  Triton local attention, fused elementwise gate calls, and shape-guarded
-  pairformer `Transition` input-projection fusion.
+  Triton local attention, fused elementwise gate calls, skip-init-aware Linear
+  construction for strict inference, and shape-guarded pairformer `Transition`
+  input-projection fusion.
 - `protenix/model/modules/transformer.py`: token/atom key-mask plumbing for
   padded mixed-length batching, masked atom-to-token aggregation, local-attention
   bias fusion, cached step-invariant diffusion pair-bias projection, and
@@ -4699,6 +4714,10 @@ Production code touched by the throughput stack:
   automatic for FP16/BF16 no-grad CUDA tensors, opt-in for FP32 with
   `PROTENIX_TRITON_LAYER_NORM=1`, and disabled with
   `PROTENIX_TRITON_LAYER_NORM=0`.
+- `protenix/model/triangular/layers.py`: OpenFold-style Linear initializers and
+  triangle-attention helpers; the Linear initializers honor the strict
+  inference skip-init context so SciPy truncated-normal sampling is not paid
+  before checkpoint load.
 - `protenix/model/triangular/qkv_layout_triton.py`: inference-only CUEQ q/k/v
   layout producer for triangle attention; keeps the fused projection GEMM and
   CUEQ attention kernel unchanged while removing hidden contiguous-copy traffic.
