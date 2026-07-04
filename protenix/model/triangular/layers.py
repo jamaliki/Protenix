@@ -361,6 +361,25 @@ class Attention(nn.Module):
             )
 
         self.sigmoid = nn.Sigmoid()
+        self._triton_ln_qkv_weight_cache_key = None
+        self._triton_ln_qkv_weight = None
+
+    def _qkv_weight_for_dtype(
+        self,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return a cached dtype-matched packed q/k/v projection weight."""
+
+        weights = (self.linear_q.weight, self.linear_k.weight, self.linear_v.weight)
+        cache_key = tuple((w.data_ptr(), w._version, dtype, device) for w in weights)
+        if cache_key != self._triton_ln_qkv_weight_cache_key:
+            self._triton_ln_qkv_weight = torch.cat(
+                [w.to(device=device, dtype=dtype) for w in weights],
+                dim=0,
+            ).contiguous()
+            self._triton_ln_qkv_weight_cache_key = cache_key
+        return self._triton_ln_qkv_weight
 
     def _prep_qkv(
         self,

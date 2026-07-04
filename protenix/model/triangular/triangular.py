@@ -38,6 +38,9 @@ from protenix.model.triangular.layers import (
     OpenfoldLinear,
     cuequivariance_triangular_attn,
 )
+from protenix.model.triangular.ln_qkv_triton import (
+    triton_ln_qkv_to_cueq_heads_first,
+)
 from protenix.model.triangular.triangle_output_gate_residual_triton import (
     triangle_update_with_residual,
     triton_triangle_output_gate_residual_enabled,
@@ -765,7 +768,23 @@ class TriangleAttention(nn.Module):
         if mask is None:
             mask = x.new_ones(x.shape[:-1])
 
-        x = self.layer_norm(x)
+        ln_qkv = triton_ln_qkv_to_cueq_heads_first(
+            x,
+            self.layer_norm,
+            self.mha,
+            swap_pair_axes=True,
+        )
+        if ln_qkv is None:
+            x = self.layer_norm(x)
+            q, k, v = self.mha._prep_qkv(
+                x,
+                x,
+                apply_scale=False,
+                cueq_heads_first=True,
+                cueq_swap_pair_axes=True,
+            )
+        else:
+            x, q, k, v = ln_qkv
 
         if cueq_bool_mask_enabled():
             mask_bias_or_bool = (mask.transpose(-1, -2) == 1)[..., :, None, None, :]
@@ -777,14 +796,6 @@ class TriangleAttention(nn.Module):
         # Project bias on contiguous [I, J], then present it as [H, J, I] for
         # the logical transposed problem consumed by ending-node attention.
         triangle_bias = permute_final_dims(self.linear(x), (2, 1, 0)).unsqueeze(-4)
-
-        q, k, v = self.mha._prep_qkv(
-            x,
-            x,
-            apply_scale=False,
-            cueq_heads_first=True,
-            cueq_swap_pair_axes=True,
-        )
 
         if cueq_bool_mask_enabled():
             mask_for_attention = mask_bias_or_bool
@@ -863,7 +874,17 @@ class TriangleAttention(nn.Module):
             mask = mask.transpose(-1, -2)
 
         # [*, I, J, C_in]
-        x = self.layer_norm(x)
+        ln_qkv = None
+        if triangle_attention == "cuequivariance" and chunk_size is None:
+            ln_qkv = triton_ln_qkv_to_cueq_heads_first(
+                x,
+                self.layer_norm,
+                self.mha,
+            )
+        if ln_qkv is None:
+            x = self.layer_norm(x)
+        else:
+            x, q, k, v = ln_qkv
 
         # CUEQ consumes a boolean mask, while the PyTorch/DeepSpeed paths
         # consume an additive attention bias.  The old CUEQ path built the
@@ -894,6 +915,22 @@ class TriangleAttention(nn.Module):
                 triangle_attention=triangle_attention,
                 inplace_safe=inplace_safe,
             )
+        elif ln_qkv is not None:
+            if mask_bias_or_bool.dtype == torch.bool:
+                mask_for_attention = mask_bias_or_bool
+            else:
+                mask_for_attention = (mask_bias_or_bool == 0).bool()
+            o = cuequivariance_triangular_attn(
+                q,
+                k,
+                v,
+                triangle_bias.float(),
+                mask_for_attention,
+                1.0 / math.sqrt(self.c_hidden),
+            )
+            if isinstance(o, tuple):
+                o = o[0]
+            x = self.mha._wrap_up_heads_first(o, x)
         else:
             x = self.mha(
                 q_x=x,
