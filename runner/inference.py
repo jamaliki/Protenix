@@ -1415,7 +1415,18 @@ def download_from_url(
     tos_url: str, checkpoint_path: str, check_weight: bool = True
 ) -> None:
     """Internal helper to download from URL and verify weight files."""
-    urllib.request.urlretrieve(tos_url, checkpoint_path, reporthook=progress_callback)
+    try:
+        urllib.request.urlretrieve(
+            tos_url, checkpoint_path, reporthook=progress_callback
+        )
+    except Exception as e:
+        if opexists(checkpoint_path):
+            os.remove(checkpoint_path)
+        raise RuntimeError(
+            f"Download failed for {tos_url}: {e}. Please stage the file manually "
+            f"at {checkpoint_path}, or set PROTENIX_ROOT_DIR so "
+            f"{checkpoint_path} resolves to an existing cache."
+        ) from e
     if check_weight:
         try:
             ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)

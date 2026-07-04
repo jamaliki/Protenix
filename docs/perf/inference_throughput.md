@@ -346,6 +346,42 @@ spend more time hill-climbing this one-dimensional layout tile; the remaining
 q/k/v/layout win requires removing a broader producer/consumer boundary, not
 another block-size tweak.
 
+Current v2 one-block Nsight Compute baseline: job `102083`
+(`runs/pairformer_block_ncu_20260704_071536_000836b`) captured the promoted
+stack at commit `000836b` after the CUEQ overlay, transition tile, and q/k/v
+tile retune.  Shape was `B32`, `N=251`, `c_z=256`,
+`hidden_scale_up=True`, BF16, one H100.  Total captured kernel time was
+`66.88 ms`.
+
+| family | launches | total ms | roofline signal | interpretation |
+| --- | ---: | ---: | --- | --- |
+| cuDNN SDPA inside CUEQ triangle attention | 2 | 12.63 | ~82% memory pipeline, ~56% SM, low tensor | still the largest mainloop, but already vendor FMHA |
+| CUEQ `fused_sigmoid_gated_dual_gemm` | 4 | 10.10 | large calls ~55% memory, ~31% tensor; small calls ~90% memory | cache overlay fixed the worst v2 fallback, remaining work is not obviously weak |
+| Pair-transition `_dual_gemm_silu_product_kernel` | 1 | 6.49 | ~52% memory, ~33% SM/tensor | Protenix-owned kernel, but local tile hill-climb is already closed |
+| CUTLASS/cuBLAS GEMMs | 3 | 5.28 | library tensor-core mainloops | preserve unless a fused epilogue keeps library-class GEMM speed |
+| CUEQ `layer_norm_transpose_forward_kernel` | 4 | 5.25 | ~55% memory, ~38% SM | CUEQ wrapper/layout boundary; attractive only if fused with adjacent producer/consumer work |
+| PyTorch/Triton LayerNorm | 6 | 4.99 | ~80% memory, ~67% SM | material, but spread across block/single/transition boundaries |
+| PyTorch vectorized/elementwise | 59 | 6.53 | HBM-heavy and fragmented | launch cleanup alone is unlikely to be a large win |
+| CUEQ q/k/v layout helpers | 2 | 4.39 | ~79-89% DRAM | tile retune helped slightly; a further win needs to delete the boundary |
+| triangle-attention gate epilogues | 2 | 2.05 | ~89-91% DRAM | already fused to one streaming Triton launch each |
+
+Decision: the next kernel should not be a naive "mega-kernel" that replaces
+cuDNN/CUEQ attention.  The realistic remaining surfaces are (1) a vendor-class
+fused LayerNorm+projection producer for triangle attention, (2) a stronger
+transition rewrite that removes the hidden tensor without slowing the output
+GEMM, or (3) true ragged/segmented pairformer work to avoid padded token
+compute.  Smaller q/k/v tile and residual-add tweaks have been exhausted.
+
+Current-head Protenix-v2 end-to-end validation is still blocked by checkpoint
+availability in the Kiarash runtime, not by model code.  Job `102199`
+(`runs/v2_same_token_var_atom_current_gate_20260704_072851_000836b`) attempted
+the 32-record same-token/variable-atom v2 B32 gate at commit `000836b` with the
+H100 cache overlay enabled and `CUEQ_TRITON_CACHE_DIR` unset, but failed before
+model startup because `/mnt/lustre/users/kiarash-eitgbi/protenix_data/checkpoint/protenix-v2.pt`
+was absent and the public checkpoint URL returned HTTP 403.  Stage
+`protenix-v2.pt` under `$PROTENIX_ROOT_DIR/checkpoint/` before claiming an
+end-to-end v2 campaign speedup from the block-level profile.
+
 Host-prefetch gate: job `99731`, run directory
 `runs/prefetch_gate_20260704_013822_0e4d701`, commit `0e4d701`, one H100,
 base checkpoint, synthetic 256-record campaign made by repeating the same 32

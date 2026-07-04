@@ -192,6 +192,13 @@ from `88.4 ms` to `68.7 ms` by reducing each triangle-multiplication call from
 about `21.4 ms` to `11.5 ms`.  Set
 `PROTENIX_CUEQ_H100_TRITON_CACHE=0` for conservative bisects.
 
+If you use `protenix-v2`, make sure `PROTENIX_ROOT_DIR` points at a cache that
+already contains `checkpoint/protenix-v2.pt`.  The public checkpoint URL can
+return HTTP 403 in locked-down cluster jobs; in that case stage the file
+manually under `$PROTENIX_ROOT_DIR/checkpoint/protenix-v2.pt` before comparing
+speedups.  The branch now reports that path explicitly instead of surfacing a
+raw `urllib` traceback.
+
 Large same-token pairformer batches also use a Triton dual-GEMM transition
 input kernel by default (`PROTENIX_TRITON_TRANSITION_DUAL_GEMM=1`).  Pairformer
 transition normally computes two projections from the same normalized pair rows
@@ -309,7 +316,11 @@ re-benchmarked.  Protenix-v2 is a wider pairformer model (`c_z=256` with
 `hidden_scale_up=True`) and should be read as a separate performance target:
 a user-rebuilt current-HEAD v2 SIF still measured about `77s` model-forward
 for a similar B32 251-token variable-atom gate, dominated by `62s` in
-pairformer.
+pairformer.  Block-level v2 profiling shows the H100 CUEQ cache overlay should
+reduce that dominant triangle-multiplication cost, but a current-HEAD
+same-checkpoint v2 end-to-end rerun still requires a staged `protenix-v2.pt`
+checkpoint; a Tokyo rerun attempt at commit `000836b` failed at checkpoint
+download with HTTP 403 before model startup.
 Seeing `token-trunk+diffusion-token-atom-batch` in the log means batching is
 working; it does not mean the run is using the exact-shape `7r6r` path.
 
