@@ -2574,6 +2574,29 @@ is a real but small reusable-cache win, likely useful only for very long
 campaigns that repeatedly hit the same pairformer shape.  It is below the
 full-gate threshold as a code optimization.
 
+A current-HEAD repeat on 2026-07-04 reached the same conclusion for the actual
+many-sequence target.  The first job (`100363`,
+`runs/cueq_trimul_ondemand_hotspot_20260704_035425_d2848c1`) intentionally
+used the production-like bool mask and exposed a CUEQ 0.10 autotuner bug:
+ONDEMAND benchmarking calls `torch.randn_like(mask)`, which is invalid for
+bool tensors.  Normal inference is not affected because it uses the packaged
+cache and does not enter the benchmark path.  The corrected job (`100383`,
+`runs/cueq_trimul_ondemand_hotspot_boolfix_20260704_035739_d2848c1`) tuned
+with a BF16 mask, whose CUEQ cache key is the same, then timed the real
+bool-mask path against the default cache:
+
+| shape | default block ms | tuned block ms | block speedup | default tri-mul ms | tuned tri-mul ms | tri-mul speedup | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `B32, N251` | 36.925 | 36.735 | 1.005x | 9.343 | 9.096 | 1.027x | reject for the target issue-shaped gate |
+| `B16, N220` | 14.471 | 14.284 | 1.013x | 3.506 | 3.321 | 1.056x | useful but too small for a branch default |
+
+The tuned H100 cache selected larger `TILE_N=128` shapes for both CUEQ gated
+GEMM keys, so the tuner did find a real local kernel improvement.  The full
+block barely moved because triangle attention and pair transition dominate
+alongside triangle multiplication.  Do not make users run CUEQ ONDEMAND tuning
+as part of normal inference; at most, treat it as an optional campaign-local
+cache experiment for extremely long repeated-shape runs.
+
 CuTe/CUTLASS extension toolchain status on Tokyo:
 
 | item | value |
@@ -3311,7 +3334,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Custom Triton transition output GEMM+gate/residual | best tile 2.00 ms versus 1.51 ms for cuBLAS plus fused gate/residual | the output epilogue is still attractive, but only if implemented as a vendor-quality CuTe/CUTLASS epilogue |
 | Naive fused Triton triangle attention | correct at N64, but B16/N245 slowed from 4.24-4.26 ms to 6.22-7.78 ms | the right boundary still needs a vendor-quality CUEQ/CuTe schedule |
 | Replacing CUEQ triangle attention with existing `triattention` or torch backends | actual-shape one-block screens were slower: TriAttention `1.11-1.15x` slower, torch about `1.9-2.3x` slower | keep CUEQ; target its layout/wrapper/epilogue boundaries instead |
-| CUEQ triangle-multiplication ONDEMAND tuning | total B64 block +0.34%, below noise | the shipped/default schedule is close enough for this shape |
+| CUEQ triangle-multiplication ONDEMAND tuning | total B64 block +0.34%; current-head repeat gave only +0.52% at `B32, N251` and +1.31% at `B16, N220` despite real 2.7-5.6% triangle-mul wins | the shipped/default schedule is close enough; do not require users to create per-shape CUEQ caches for normal inference |
 | CUEQ q/k/v layout block-size retuning | block `256` beat the current `1024` by 3.7-4.2% in isolation, but only saves `0.04-0.12` ms per layout launch | do not promote tiny tile retunes without a full-gate signal |
 | Logical ending-node triangle attention without explicit pair transposes | bitwise exact one-block screen but only `1.0076-1.0089x` at B32/B64/B96 | explicit pair-tensor orientation copies are measurable but not the dominant pairformer boundary |
 | Default BF16 full-token attention after the promoted stack | isolated trunk-attention hotspot improved, but full exact-shape gates moved only +0.16% at B64 and +0.27% at B96 | do not promote dtype-policy changes unless the representative throughput gate moves, not just the local kernel |
