@@ -4561,6 +4561,37 @@ short-term implementation ladder is:
    - the full v2 `PairformerBlock` gate must still pass before any model default
      changes.
 
+   Direct producer-owned screen: commit `4e72525` added
+   `scripts/perf/triangle_update_producer_owned_direct_probe.py` to include the
+   first missing timed step.  The Triton input producer computes row stats,
+   LayerNorm, and both gated projections, then writes exact-length grouped
+   contractor tensors directly.  The benchmark deliberately also runs shuffled
+   mixed-length lists; it builds a length-grouped compact row map and scatters
+   back to the original dense rows, so the result is not relying on the
+   convenient sorted presets.  Job `110580`, run
+   `runs/triangle_update_direct_owned_4e72525_20260704_223931`, produced:
+
+   | bucket / direction | padded CUEQ update | direct producer only | direct producer + current finish | finish only reusing direct producer | decision |
+   | --- | ---: | ---: | ---: | ---: | --- |
+   | short shuffled incoming | `2.438 ms` | `0.435 ms` | `1.398 ms` (`1.74x`) | `0.960 ms` (`2.54x`) | useful short signal |
+   | short shuffled outgoing | `2.454 ms` | `0.439 ms` | `1.412 ms` (`1.74x`) | `0.974 ms` (`2.52x`) | useful short signal |
+   | long shuffled incoming | `4.123 ms` | `1.805 ms` | `4.548 ms` (`0.91x`) | `2.747 ms` (`1.50x`) | reject wrapper |
+   | long shuffled outgoing | `4.236 ms` | `1.808 ms` | `4.588 ms` (`0.92x`) | `2.786 ms` (`1.52x`) | reject wrapper |
+
+   Sorted and shuffled buckets matched within noise, and BF16 valid-region
+   drift stayed acceptable (`max_abs <= 0.03125`, no NaNs).  Interpretation:
+   direct exact-length layout is enough to exploit the heavily padded short
+   bucket, but it is not enough for the long wide-v2 bucket that controls the
+   Sam-style throughput target.  The long-bucket budget is now explicit:
+   the current finish boundary alone costs about `2.75-2.79 ms`, leaving only
+   about `1.35-1.49 ms` for the whole input producer if it is to beat the
+   `4.1-4.2 ms` padded CUEQ update.  This per-length Triton producer costs
+   about `1.81 ms`, so simply owning the producer layout does not clear the bar.
+   The next real kernel must either keep the existing CUEQ-class producer while
+   consuming its layout without stack/copy materialization, or fuse producer,
+   contraction, output projection/gate, and residual deeply enough that the
+   row-major finish boundary disappears.
+
    Pairformer CUDA graph follow-up: commit `75761ba` added
    `scripts/perf/pairformer_cudagraph_probe.py` to check whether launch/Python
    overhead is a large enough target before committing to native CuTe kernels.
@@ -5010,6 +5041,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Producer-owned exact-group CUTLASS 3 triangle contraction | assuming a future producer writes exact-length groups directly, cuBLAS-backed `torch.bmm` was strong (`1.35-2.25x` contraction-only), but the stock CUTLASS rank-4 kernel still regressed short buckets and only reached `1.09-1.17x` on long buckets | the layout idea is useful, but the stock CUTLASS adapter is not the native fused v2 update |
 | Exact-group `bmm` contractor inside the compact triangle-update bridge | after fixing the benchmark's row-wise scatter, the short bucket improved (`1.21-1.59x`) with BF16-valid parity, but the long bucket still regressed to `0.68-0.79x`; profiling shows the remaining loss is mostly `torch.stack` copy/cat materialization plus compact producer/output boundary cost | exact-length work reduction is real only if the producer emits exact-group layout directly and the output/residual store is redesigned; do not promote a short-only compact bridge for Sam-style v2 |
 | No-stack strided `matmul` view for exact groups | removed explicit `torch.stack`/`cat` and slightly improved short buckets, but long buckets were worse than exact-group `bmm` (`0.72-0.74x`); profiler shows `aten::copy_` grew to about `2.33 ms` because PyTorch still materializes around the strided batch/output layout | the compact ABI cannot be rescued by PyTorch view tricks; the producer must write grouped layout directly |
+| Direct Triton producer-owned exact-group triangle update | correct for shuffled mixed-length batches and faster on the short v2 bucket (`1.72-1.74x`), but the long v2 bucket still loses to padded CUEQ (`0.91-0.92x`) because the direct producer costs about `1.81 ms` and the current finish boundary costs about `2.75-2.79 ms` | owning the layout is necessary but not sufficient; the next kernel has to keep a CUEQ/CuTe-class producer or fuse away the row-major finish boundary, not just write exact groups from a per-length Triton producer |
 | Compact valid-row triangle-multiplication bridge | valid-only compact row work was slower than padded CUEQ (`0.70x` short, `0.27x` long), and scattering back to padded layout was worse | do not bridge compact row-wise work through dense `a/b` tensors; a real segmented native update must stay segmented through contraction and output |
 | Compact segmented triangle-multiplication update inside a full v2 `PairformerBlock` | isolated short-bucket update improved, but the full block slowed badly: short `10.237 -> 27.144 ms` best (`0.38x`), long `25.791 -> 123.764 ms` best (`0.21x`) | the dense-ABI compact bridge pays too much pack/scatter, invalid-row zeroing, and custom-contraction cost; the next attempt needs a native vendor-quality CuTe/SM90 segmented update |
 | Unguarded fused triangle-multiplication input LayerNorm + dual-GEMM producer | short v2 blocks improved about `1.08x`, but long `B16/N220` blocks slowed to `0.94x`; the path is now default-off and guarded to <=300k physical pair rows | local producer fusion can be shape-specific; do not enable it globally for Sam-style v2 campaigns unless the long bucket is protected by fallback |
@@ -5177,6 +5209,13 @@ Profiling and reproducibility helpers:
   result: positive even on the long v2 bucket (`1.50-1.51x`), so a native
   producer-owned exact-group kernel is justified; not a production speedup by
   itself because producer materialization is excluded.
+- `scripts/perf/triangle_update_producer_owned_direct_probe.py`: direct
+  producer-owned follow-up.  It makes the input LayerNorm + dual-GEMM producer
+  write exact-length grouped contractor tensors itself, and validates both
+  sorted and shuffled mixed-length batches.  Current result: correct and useful
+  on the short v2 bucket (`~1.7x`), but rejected for the long v2 bucket
+  (`0.91-0.92x`) because producer plus current finish boundary is still more
+  expensive than padded CUEQ.
 - `scripts/perf/pairformer_compact_segmented_triangle_update_probe.py`: full
   v2 `PairformerBlock` gate for the compact segmented triangle-update idea.  It
   replaces both triangle-multiplication updates, zeroes invalid pair rows before

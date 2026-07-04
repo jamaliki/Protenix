@@ -434,6 +434,13 @@ current output/residual boundary is `1.50-1.51x` faster than padded CUEQ on the
 long v2 bucket and `2.52-2.57x` faster on the short bucket.  That justifies the
 next native kernel, but only if the producer writes that layout directly; adding
 today's compact producer cost would erase much of the long-bucket win.
+The first direct Triton producer-owned screen confirmed that warning rather
+than solving it: it is correct for shuffled mixed-length batches and wins the
+short bucket by about `1.7x`, but the long bucket is still slower than padded
+CUEQ (`0.91-0.92x`) because producer cost plus the current output boundary is
+too high.  The remaining v2 kernel target is therefore a fused native boundary
+that keeps a CUEQ/CuTe-class producer and avoids row-major materialization, not
+another Python/PyTorch exact-group wrapper.
 Whole-Pairformer CUDA graph replay was also screened as a lower-risk
 launch-overhead fix.  It was exact and helped the short v2 bucket by about
 `3%`, but the full 48-block long bucket was flat (`~1.00x`) once changed
