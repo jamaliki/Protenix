@@ -3635,6 +3635,14 @@ occupancy:
 | CUDA MPS, `/tmp` socket | 14 | 7 | 4 | 2240 | 364.19 | 6.151 | over-contended |
 | CUDA MPS, `/tmp` socket | 16 | 6 | 4 | 2560 | 387.79 | 6.601 | new best, but still short of 10x |
 
+The higher-width follow-up, job `102933`
+(`runs/mps_b4_highwidth_nsample5_20260704_083945_3a5215c`), tested
+`B4/18` at 5% and planned `B4/20` plus `B4/24`.  It was cancelled after
+`10:10` once the first `B4/18` case still had no summary.  That partial run had
+already spent more wall time on 2880 planned generated samples than would allow
+it to beat the B4/16 `6.601` samples/s rate, so continuing to wider B4 worker
+counts was not a legitimate route to the 10x target.
+
 Interpretation: `--batch_size 8` and `--batch_size 4` are both wrong
 single-process defaults, but with enough independent MPS workers they reduce
 padded work per shard while MPS recovers GPU occupancy.  This is a

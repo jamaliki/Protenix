@@ -360,8 +360,9 @@ Important details:
   `--batch_size 4` workers at 6% reached `6.60` generated samples/s, `1.71x`
   over the prior single-process promoted rate (`3.85` generated samples/s) and
   about `8.8x` over the original low-sample boundary (`0.753` generated
-  samples/s).  B4 with 12 or 14 workers and B8 with 10 workers were slower, so
-  do not keep adding workers blindly.
+  samples/s).  B4 with 12 or 14 workers and B8 with 10 workers were slower; a
+  B4/18 follow-up was already below the B4/16 rate before it finished, so do
+  not keep adding workers blindly.
 - Keep `PROTENIX_PREFETCH_DATALOADER=1` for long MPS campaigns if host memory
   allows it, but treat it as a modest host-overlap polish rather than the main
   speedup.  In paired five-worker MPS gates it added `1-2%` throughput while
