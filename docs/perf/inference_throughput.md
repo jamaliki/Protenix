@@ -4109,7 +4109,11 @@ short-term implementation ladder is:
    contraction after CUEQ's gated input projection.  This is the smallest way to
    test whether our tile schedule can beat the current dense tensor-core
    contraction while respecting per-record lengths.  It is not enough for a full
-   win because LayerNorm/projection still run over padded pair rows.
+   win because LayerNorm/projection still run over padded pair rows.  The
+   executable benchmark scaffold is
+   `scripts/perf/triangle_contraction_cutlass_probe.py`, with its SM90
+   CUTLASS/CuTe candidate in
+   `scripts/perf/triangle_contraction_cutlass_probe_sm90.cu`.
 2. **Full segmented triangle-mul update:** fuse or internally schedule the
    LayerNorm, gated input projection, segmented contraction, output LayerNorm,
    output projection/gate, and residual store for valid rows.  This is the first
@@ -4267,6 +4271,12 @@ Profiling and reproducibility helpers:
 - `scripts/perf/triangle_multiplication_ragged_hotspot.py`: v2 BF16
   CUEQ triangle-multiplication screen for padded versus smaller ragged islands;
   use it to filter segmented-kernel ideas before touching production code.
+- `scripts/perf/triangle_contraction_cutlass_probe.py` and
+  `scripts/perf/triangle_contraction_cutlass_probe_sm90.cu`: first native
+  CUTLASS/CuTe screen for the triangle-multiplication contraction core.  This is
+  an optimistic benchmark-only boundary: exact-length groups are materialized
+  before timing, so a win justifies a fuller segmented update kernel, while a
+  loss rejects the schedule early.
 - `scripts/perf/submit_tokyo_triangle_attention_ncu.sh` and
   `scripts/perf/tokyo_triangle_attention_ncu.sbatch`: Tokyo one-H100 Nsight
   Compute capture for one starting or ending CUEQ triangle-attention module.
