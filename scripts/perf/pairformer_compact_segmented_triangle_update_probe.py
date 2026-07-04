@@ -126,6 +126,7 @@ def compact_triangle_update(
     invalid_offsets: torch.Tensor | None,
     direct_row_stats: str,
     direct_row_stat_block_rows: int,
+    direct_finish: str,
 ) -> torch.Tensor:
     if producer == "direct":
         out = direct_owned_update(
@@ -137,6 +138,7 @@ def compact_triangle_update(
             weights,
             row_stats=direct_row_stats,
             row_stat_block_rows=direct_row_stat_block_rows,
+            finish=direct_finish,
         )
         return zero_invalid_offsets_(out, invalid_offsets)
 
@@ -166,6 +168,7 @@ def run_compact_triangles(
     plan: TriangleUpdatePlan,
     direct_row_stats: str,
     direct_row_stat_block_rows: int,
+    direct_finish: str,
 ) -> TensorPair:
     s = clone_optional(s)
     z = z.clone()
@@ -183,6 +186,7 @@ def run_compact_triangles(
         plan.invalid_offsets,
         direct_row_stats,
         direct_row_stat_block_rows,
+        direct_finish,
     )
     z = compact_triangle_update(
         block.tri_mul_in,
@@ -198,6 +202,7 @@ def run_compact_triangles(
         plan.invalid_offsets,
         direct_row_stats,
         direct_row_stat_block_rows,
+        direct_finish,
     )
     z += block.tri_att_start(
         z,
@@ -252,6 +257,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--randomize-zero-weights", type=str_bool, default=True)
     parser.add_argument("--direct-row-stats", choices=["scalar", "tiled"], default="tiled")
     parser.add_argument("--direct-row-stat-block-rows", type=int, default=8)
+    parser.add_argument("--direct-finish", choices=["current", "fused_output"], default="current")
     parser.add_argument("--output-json")
     return parser.parse_args()
 
@@ -286,6 +292,7 @@ def main() -> None:
                     plan,
                     args.direct_row_stats,
                     args.direct_row_stat_block_rows,
+                    args.direct_finish,
                 ),
                 args.warmup,
                 args.iters,
@@ -299,6 +306,7 @@ def main() -> None:
                     "direct_row_stat_block_rows": (
                         args.direct_row_stat_block_rows if producer == "direct" else None
                     ),
+                    "direct_finish": args.direct_finish if producer == "direct" else None,
                     "timing": timing,
                     "speedup_vs_baseline": baseline_timing["ms"] / timing["ms"],
                     "parity_vs_baseline_valid": compare_outputs(

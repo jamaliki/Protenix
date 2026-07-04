@@ -275,6 +275,7 @@ def direct_owned_update(
     *,
     row_stats: str = "tiled",
     row_stat_block_rows: int = 8,
+    finish: str = "current",
 ) -> torch.Tensor:
     x_norm, groups = direct_owned_groups(
         module,
@@ -285,7 +286,9 @@ def direct_owned_update(
         row_stats=row_stats,
         row_stat_block_rows=row_stat_block_rows,
     )
-    return producer_owned_finish(module, z, x_norm, groups, dense_offsets, direction, weights)
+    return producer_owned_finish(
+        module, z, x_norm, groups, dense_offsets, direction, weights, finish
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -303,6 +306,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--row-stats", choices=["scalar", "tiled"], default="tiled")
     parser.add_argument("--row-stat-block-rows", type=int, default=8)
+    parser.add_argument("--finish", choices=["current", "fused_output"], default="current")
     parser.add_argument("--output-json")
     return parser.parse_args()
 
@@ -336,6 +340,7 @@ def main() -> None:
                 weights,
                 row_stats=args.row_stats,
                 row_stat_block_rows=args.row_stat_block_rows,
+                finish=args.finish,
             ),
             args.warmup,
             args.iters,
@@ -356,7 +361,16 @@ def main() -> None:
             args.iters,
         )
         finish_only, finish_ms = cuda_time(
-            lambda: producer_owned_finish(module, z, x_norm, groups, dense_offsets, direction, weights),
+            lambda: producer_owned_finish(
+                module,
+                z,
+                x_norm,
+                groups,
+                dense_offsets,
+                direction,
+                weights,
+                args.finish,
+            ),
             args.warmup,
             args.iters,
         )
@@ -375,6 +389,7 @@ def main() -> None:
                 "parity_valid": compare(ref_valid, valid_from_dense(finish_only, dense_offsets)),
             },
             "group_count": len(groups),
+            "finish": args.finish,
         }
 
     n_max = max(lengths)

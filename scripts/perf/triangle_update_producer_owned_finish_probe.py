@@ -142,6 +142,162 @@ def assemble_update(groups: list[OwnedGroup], contracted: list[torch.Tensor], ro
     return update
 
 
+@triton.jit
+def _update_row_stats_tiled_kernel(
+    update,
+    mean,
+    rstd,
+    rows: tl.constexpr,
+    channels: tl.constexpr,
+    eps: tl.constexpr,
+    block_rows: tl.constexpr,
+    block_c: tl.constexpr,
+) -> None:
+    row = (tl.program_id(0) * block_rows + tl.arange(0, block_rows)).to(tl.int64)
+    c = tl.arange(0, block_c).to(tl.int64)
+    row_mask = row < rows
+    c_mask = c < channels
+    values = tl.load(
+        update + row[:, None] * channels + c[None, :],
+        mask=row_mask[:, None] & c_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    mu = tl.sum(values, axis=1) / channels
+    centered = tl.where(c_mask[None, :], values - mu[:, None], 0.0)
+    var = tl.sum(centered * centered, axis=1) / channels
+    tl.store(mean + row, mu, mask=row_mask)
+    tl.store(rstd + row, tl.rsqrt(var + eps), mask=row_mask)
+
+
+@triton.jit
+def _output_dual_gemm_scatter_kernel(
+    update,
+    x_norm,
+    z,
+    dense_offsets,
+    mean,
+    rstd,
+    norm_weight,
+    norm_bias,
+    gate_weight,
+    value_weight,
+    out,
+    rows: tl.constexpr,
+    channels: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+) -> None:
+    # This is the output-side analogue of the direct input producer.  It keeps
+    # the strong exact-group contraction unchanged, but removes two compact
+    # materializations after it: normalized update rows and compact deltas.  Each
+    # program computes a `[rows, output_channels]` tile and scatters the residual
+    # directly into the padded dense tensor.
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    row = (pid_m * block_m + tl.arange(0, block_m)).to(tl.int64)
+    out_c = (pid_n * block_n + tl.arange(0, block_n)).to(tl.int64)
+    k_offsets = tl.arange(0, block_k).to(tl.int64)
+    row_mask = row < rows
+    out_mask = out_c < channels
+    row_mean = tl.load(mean + row, mask=row_mask, other=0.0)[:, None]
+    row_rstd = tl.load(rstd + row, mask=row_mask, other=1.0)[:, None]
+    acc_gate = tl.zeros((block_m, block_n), dtype=tl.float32)
+    acc_value = tl.zeros((block_m, block_n), dtype=tl.float32)
+
+    for k0 in range(0, channels, block_k):
+        k = k0 + k_offsets
+        k_mask = k < channels
+        gate_x = tl.load(
+            x_norm + row[:, None] * channels + k[None, :],
+            mask=row_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        upd = tl.load(
+            update + row[:, None] * channels + k[None, :],
+            mask=row_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        norm_w = tl.load(norm_weight + k, mask=k_mask, other=0.0).to(tl.float32)
+        norm_b = tl.load(norm_bias + k, mask=k_mask, other=0.0).to(tl.float32)
+        upd = (upd - row_mean) * row_rstd * norm_w[None, :] + norm_b[None, :]
+        gate_w = tl.load(
+            gate_weight + out_c[:, None] * channels + k[None, :],
+            mask=out_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        value_w = tl.load(
+            value_weight + out_c[:, None] * channels + k[None, :],
+            mask=out_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        acc_gate += tl.dot(gate_x, tl.trans(gate_w))
+        acc_value += tl.dot(upd.to(tl.bfloat16), tl.trans(value_w))
+
+    dense_row = tl.load(dense_offsets + row, mask=row_mask, other=0).to(tl.int64)
+    ptr = dense_row[:, None] * channels + out_c[None, :]
+    residual = tl.load(z + ptr, mask=row_mask[:, None] & out_mask[None, :], other=0.0)
+    delta = (1.0 / (1.0 + tl.exp(-acc_gate))) * acc_value
+    tl.store(out + ptr, delta + residual, mask=row_mask[:, None] & out_mask[None, :])
+
+
+def compact_finish_from_update_fused_output(
+    module: torch.nn.Module,
+    z: torch.Tensor,
+    x_norm: torch.Tensor,
+    update: torch.Tensor,
+    dense_offsets: torch.Tensor,
+    weights: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Fuse output LayerNorm, output gate/value GEMMs, and dense scatter.
+
+    The current benchmark finish uses three post-contraction stages:
+    CUEQ LayerNorm writes normalized compact update rows, CUEQ's dual-GEMM
+    writes compact deltas, then a Triton kernel scatters the residual into the
+    padded dense tensor.  This screen keeps the contraction identical and tests
+    whether owning that whole output boundary is worthwhile.
+    """
+
+    rows = dense_offsets.numel()
+    mean = torch.empty(rows, device=z.device, dtype=torch.float32)
+    rstd = torch.empty_like(mean)
+    stats_grid = (triton.cdiv(rows, 8),)
+    _update_row_stats_tiled_kernel[stats_grid](
+        update,
+        mean,
+        rstd,
+        rows,
+        C_Z,
+        1e-5,
+        8,
+        C_Z,
+        num_warps=8,
+    )
+    out = torch.empty_like(z)
+    grid = (triton.cdiv(rows, 64), triton.cdiv(C_Z, 128))
+    _output_dual_gemm_scatter_kernel[grid](
+        update,
+        x_norm,
+        z,
+        dense_offsets,
+        mean,
+        rstd,
+        module.layer_norm_out.weight,
+        module.layer_norm_out.bias,
+        weights["g_out"],
+        weights["p_out"],
+        out,
+        rows,
+        C_Z,
+        64,
+        128,
+        64,
+        num_warps=4,
+        num_stages=3,
+    )
+    return out
+
+
 def producer_owned_finish(
     module: torch.nn.Module,
     z: torch.Tensor,
@@ -150,9 +306,16 @@ def producer_owned_finish(
     dense_offsets: torch.Tensor,
     direction: str,
     weights: dict[str, torch.Tensor],
+    finish: str = "current",
 ) -> torch.Tensor:
     contracted = contract_groups(groups, direction)
     update = assemble_update(groups, contracted, dense_offsets.numel())
+    if finish == "fused_output":
+        return compact_finish_from_update_fused_output(
+            module, z, x_norm, update, dense_offsets, weights
+        )
+    if finish != "current":
+        raise ValueError(f"unknown finish implementation: {finish!r}")
     return compact_finish_from_update(module, z, x_norm, update, dense_offsets, weights)
 
 
@@ -164,8 +327,15 @@ def producer_owned_output_only(
     contracted: list[torch.Tensor],
     dense_offsets: torch.Tensor,
     weights: dict[str, torch.Tensor],
+    finish: str = "current",
 ) -> torch.Tensor:
     update = assemble_update(groups, contracted, dense_offsets.numel())
+    if finish == "fused_output":
+        return compact_finish_from_update_fused_output(
+            module, z, x_norm, update, dense_offsets, weights
+        )
+    if finish != "current":
+        raise ValueError(f"unknown finish implementation: {finish!r}")
     return compact_finish_from_update(module, z, x_norm, update, dense_offsets, weights)
 
 
@@ -182,6 +352,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--finish", choices=["current", "fused_output"], default="current")
     parser.add_argument("--output-json")
     return parser.parse_args()
 
@@ -217,14 +388,14 @@ def main() -> None:
 
         finish_out, finish_ms = cuda_time(
             lambda: producer_owned_finish(
-                module, z, x_norm, groups, dense_offsets, direction, weights
+                module, z, x_norm, groups, dense_offsets, direction, weights, args.finish
             ),
             args.warmup,
             args.iters,
         )
         output_out, output_ms = cuda_time(
             lambda: producer_owned_output_only(
-                module, z, x_norm, groups, contracted, dense_offsets, weights
+                module, z, x_norm, groups, contracted, dense_offsets, weights, args.finish
             ),
             args.warmup,
             args.iters,
