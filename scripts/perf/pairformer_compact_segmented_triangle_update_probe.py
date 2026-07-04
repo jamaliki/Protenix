@@ -41,11 +41,15 @@ from scripts.perf.triangle_update_compact_segmented_probe import (
     make_metadata,
     triton_producer_update,
 )
+from scripts.perf.triangle_update_producer_owned_direct_probe import (
+    direct_owned_update,
+    grouped_dense_offsets,
+)
 
 
 def parse_producers(text: str) -> list[str]:
     producers = [item.strip() for item in text.split(",") if item.strip()]
-    bad = sorted(set(producers) - {"triton", "cueq"})
+    bad = sorted(set(producers) - {"triton", "cueq", "direct"})
     if bad:
         raise argparse.ArgumentTypeError(f"unknown producer(s): {', '.join(bad)}")
     return producers
@@ -69,8 +73,13 @@ def compact_triangle_update(
     direction: str,
     producer: str,
 ) -> torch.Tensor:
-    dense_offsets, descriptors = make_metadata(lengths, config)
     weights = cached_weights(module)
+    if producer == "direct":
+        dense_offsets = grouped_dense_offsets(lengths)
+        out = direct_owned_update(module, z, dense_offsets, lengths, direction, weights)
+        return zero_invalid_pairs(out, mask)
+
+    dense_offsets, descriptors = make_metadata(lengths, config)
     update_fn = triton_producer_update if producer == "triton" else cueq_producer_update
     out = update_fn(
         module,
