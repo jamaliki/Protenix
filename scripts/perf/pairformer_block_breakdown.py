@@ -36,6 +36,13 @@ def str_bool(value: str | bool) -> bool:
     raise argparse.ArgumentTypeError(f"expected boolean, got {value!r}")
 
 
+def parse_lengths(value: str) -> list[int]:
+    lengths = [int(item) for item in value.split(",") if item.strip()]
+    if not lengths or any(length <= 0 for length in lengths):
+        raise argparse.ArgumentTypeError("expected positive comma-separated lengths")
+    return lengths
+
+
 @contextmanager
 def cuda_autocast(dtype_name: str) -> Iterator[None]:
     if dtype_name == "bfloat16":
@@ -72,14 +79,43 @@ def make_inputs(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     dtype = getattr(torch, args.input_dtype)
     device = torch.device("cuda")
-    s = torch.randn(args.batch, args.tokens, args.c_s, device=device, dtype=dtype)
-    z = torch.randn(
+    mask_dtype = torch.bool if args.pair_mask_dtype == "bool" else dtype
+    if args.lengths is None:
+        s = torch.randn(args.batch, args.tokens, args.c_s, device=device, dtype=dtype)
+        z = torch.randn(
+            args.batch, args.tokens, args.tokens, args.c_z, device=device, dtype=dtype
+        )
+        pair_mask = torch.ones(
+            args.batch, args.tokens, args.tokens, device=device, dtype=mask_dtype
+        )
+        return s, z, pair_mask
+
+    # Sam's production-like throughput case batches different sequence lengths.
+    # Padding changes which pair rows are real work, so the block screen needs
+    # the same mask shape rather than only timing fully-dense BxNxN squares.
+    generator = torch.Generator(device=device).manual_seed(args.seed)
+    s = torch.zeros(args.batch, args.tokens, args.c_s, device=device, dtype=dtype)
+    z = torch.zeros(
         args.batch, args.tokens, args.tokens, args.c_z, device=device, dtype=dtype
     )
-    mask_dtype = torch.bool if args.pair_mask_dtype == "bool" else dtype
-    pair_mask = torch.ones(
+    pair_mask = torch.zeros(
         args.batch, args.tokens, args.tokens, device=device, dtype=mask_dtype
     )
+    for batch_index, length in enumerate(args.lengths):
+        s[batch_index, :length] = torch.randn(
+            length, args.c_s, device=device, dtype=dtype, generator=generator
+        )
+        z[batch_index, :length, :length] = torch.randn(
+            length,
+            length,
+            args.c_z,
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        )
+        pair_mask[batch_index, :length, :length] = (
+            True if mask_dtype == torch.bool else 1
+        )
     return s, z, pair_mask
 
 
@@ -224,6 +260,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", type=int, default=245)
     parser.add_argument("--batch", type=int, default=64)
+    parser.add_argument(
+        "--lengths",
+        type=parse_lengths,
+        help=(
+            "Comma-separated valid token counts for a padded variable-length "
+            "batch. When set, --batch and --tokens are derived from this list."
+        ),
+    )
     parser.add_argument("--c-s", type=int, default=384)
     parser.add_argument("--c-z", type=int, default=128)
     parser.add_argument("--n-heads", type=int, default=16)
@@ -260,6 +304,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.lengths is not None:
+        args.batch = len(args.lengths)
+        args.tokens = max(args.lengths)
     if not torch.cuda.is_available():
         raise RuntimeError("pairformer_block_breakdown requires CUDA")
     torch.backends.cuda.matmul.allow_tf32 = args.enable_tf32
