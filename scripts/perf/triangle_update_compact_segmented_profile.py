@@ -91,6 +91,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--direction", choices=["outgoing", "incoming"], default="outgoing")
     parser.add_argument("--producer", choices=["triton", "cueq"], default="triton")
     parser.add_argument(
+        "--contractor",
+        choices=["triton", "exact_group_bmm"],
+        default="triton",
+        help=(
+            "Contraction backend inside the compact update. Use "
+            "'exact_group_bmm' to profile the optimistic exact-length bmm "
+            "bridge from the full-update screen."
+        ),
+    )
+    parser.add_argument(
         "--config",
         type=ContractConfig.parse,
         default=ContractConfig.parse("32x32x64x1x4x3"),
@@ -129,6 +139,8 @@ def main() -> None:
             args.config,
             args.direction,
             weights,
+            args.contractor,
+            lengths,
         ),
         warmup=args.warmup,
         limit=args.limit,
