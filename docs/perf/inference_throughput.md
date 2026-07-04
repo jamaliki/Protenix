@@ -4416,6 +4416,61 @@ short-term implementation ladder is:
    enough that a custom triangle update amortizes its own scheduling and epilogue
    work.
 
+   Producer-owned exact-length L-batched follow-up: commit `e107477` added
+   `scripts/perf/triangle_contraction_cutlass3_exact_group_lbatched_probe.py`
+   and its CUDA extension.  This changes one important assumption from the
+   record-L screen: instead of timing a wrapper around Protenix's existing
+   `[D, B, N, N]` tensors, it assumes the preceding producer already wrote
+   exact-length record groups in the layout the contractor wants.  Packing is
+   deliberately outside the timed region, so this is an optimistic "would a
+   producer-owned layout make the contraction attractive?" screen, not a
+   deployable implementation.  Job `110144`, run
+   `runs/triangle_exact_group_lbatched_e107477_20260704_215843`, compiled the
+   SM90 rank-4 CUTLASS kernel and compared it with both dense `einsum` and
+   exact-group `torch.bmm`:
+
+   | bucket / direction | dense `einsum` | exact-group `torch.bmm` | exact-group CUTLASS 3 | decision |
+   | --- | ---: | ---: | ---: | --- |
+   | short outgoing | `0.176 ms` | `0.119 ms` (`1.48x`) | `0.275 ms` (`0.64x`) | reject CUTLASS |
+   | short incoming | `0.157 ms` | `0.116 ms` (`1.35x`) | `0.274 ms` (`0.57x`) | reject CUTLASS |
+   | long outgoing | `0.829 ms` | `0.369 ms` (`2.25x`) | `0.709 ms` (`1.17x`) | not enough |
+   | long incoming | `0.754 ms` | `0.368 ms` (`2.05x`) | `0.691 ms` (`1.09x`) | not enough |
+
+   Valid-region parity was BF16-level (`max_abs <= 0.25`, means near `1e-7`).
+   The useful signal is not the stock CUTLASS kernel, which still loses badly to
+   cuBLAS-backed `torch.bmm`; it is that an exact-length, producer-owned layout
+   can make the contraction itself much cheaper if no pack/scatter debt is paid
+   at the boundary.  That points toward a native fused update that keeps this
+   layout through producer, contraction, output gate, and residual, rather than
+   another standalone CUTLASS adapter.
+
+   Exact-group `bmm` full-update follow-up: commit `72b53e4` extended
+   `scripts/perf/triangle_update_compact_segmented_probe.py` with an
+   `exact_group_bmm` contractor.  This keeps the old compact producer/scatter
+   boundary, but replaces the custom compact-contraction kernel with
+   cuBLAS-backed `torch.bmm` over exact-length groups.  It answers whether the
+   strong contraction-only signal above is enough without changing the wider
+   update ABI.  Job `110153`, run
+   `runs/triangle_update_exact_group_bmm_72b53e4_20260704_220346`, ran the
+   short and long Sam-style v2 buckets:
+
+   | bucket / direction | padded CUEQ update | best exact-group `bmm` update | speedup | decision |
+   | --- | ---: | ---: | ---: | --- |
+   | short incoming | `2.515 ms` | `1.805 ms` | `1.39x` | useful signal |
+   | short outgoing | `2.434 ms` | `1.834 ms` | `1.33x` | useful signal |
+   | long incoming | `4.121 ms` | `6.356 ms` | `0.65x` | reject |
+   | long outgoing | `4.230 ms` | `6.423 ms` | `0.66x` | reject |
+
+   The CUEQ-producer variant was also exact but slower than the Triton producer
+   on this compact boundary: short `1.09-1.14x`, long `0.58-0.59x`.  Valid-row
+   drift stayed within BF16 tolerances (`max_abs <= 0.03125`).  Decision:
+   reject the compact exact-group bridge as a Sam-style v2 default.  It proves
+   the short heavily padded bucket has exploitable work reduction, but the long
+   bucket that dominates wide-v2 throughput loses once the old compact
+   producer, Python grouping, output normalization, and scatter boundary are in
+   the timed path.  The next implementation should not be another wrapper on
+   this ABI; it should own the fused segmented update layout natively.
+
    Pairformer CUDA graph follow-up: commit `75761ba` added
    `scripts/perf/pairformer_cudagraph_probe.py` to check whether launch/Python
    overhead is a large enough target before committing to native CuTe kernels.
@@ -4492,13 +4547,16 @@ short-term implementation ladder is:
 
    Decision: reject all bare contraction replacements tried so far: cuBLAS
    exact-length calls, old CUTLASS grouped, CUTLASS 3 grouped, CUTLASS 3
-   record-L-batched, and direct Triton segmented scheduling, including compact
-   tile descriptors.  The next kernel attempt should fuse a larger
-   triangle-multiplication boundary so custom scheduling amortizes overhead over
-   LayerNorm, gated projections, contraction, output normalization, and residual
-   store.  Do not spend more effort on another standalone contraction wrapper
-   unless its design specifically preserves a CUEQ/cuBLAS/CUTLASS-class
-   tensor-core mainloop while eliminating padded work.
+   record-L-batched, producer-owned exact-group CUTLASS, and direct Triton
+   segmented scheduling, including compact tile descriptors.  Also reject the
+   compact exact-group `bmm` full-update bridge for Sam-style v2 because its
+   short-bucket win flips into a long-bucket regression.  The next kernel
+   attempt should fuse a larger triangle-multiplication boundary so custom
+   scheduling amortizes overhead over LayerNorm, gated projections, contraction,
+   output normalization, and residual store.  Do not spend more effort on
+   another standalone contraction wrapper unless its design specifically
+   preserves a CUEQ/cuBLAS/CUTLASS-class tensor-core mainloop while eliminating
+   padded work and the pack/scatter boundary.
 
    Triangle-attention ragged lower-bound: commits `10c7210` and `dbbbfb4`
    added `scripts/perf/triangle_attention_ragged_hotspot.py`.  This screen asks
@@ -4858,6 +4916,8 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Bool masks for CUEQ triangle multiplication | block screen was flat at `N=124` and only +0.5% at `N=220` | mask dtype plumbing is not a meaningful bottleneck after triangle-attention bool-mask cleanup |
 | Raising CUEQ triangle-multiplication PyTorch fallback threshold for v2 | forcing the `N=124` bucket through the PyTorch fallback doubled triangle-mul time (`5.04 -> 10.04 ms`) and slowed the block (`10.67 -> 15.69 ms`); `N=220` was unchanged | the short physical bucket still needs CUEQ's fused LayerNorm/GatedGEMM path; fallback thresholds are not the ragged-v2 fix |
 | CUTLASS 3 record-L-batched triangle contraction | one SM90 rank-4 GEMM per record, with `c_z=256` in GEMM's `L` dimension, still regressed short buckets (`0.48-0.53x`), barely helped long outgoing (`1.06x`), and slowed long incoming (`0.96x`) | removing the `4096` grouped-problem overhead is not enough; another standalone stock-GEMM wrapper is not the v2 fix |
+| Producer-owned exact-group CUTLASS 3 triangle contraction | assuming a future producer writes exact-length groups directly, cuBLAS-backed `torch.bmm` was strong (`1.35-2.25x` contraction-only), but the stock CUTLASS rank-4 kernel still regressed short buckets and only reached `1.09-1.17x` on long buckets | the layout idea is useful, but the stock CUTLASS adapter is not the native fused v2 update |
+| Exact-group `bmm` contractor inside the compact triangle-update bridge | short bucket improved (`1.09-1.39x`) with BF16-valid parity, but the long bucket regressed to `0.58-0.66x` | exact-length work reduction is real only if the producer/output/scatter boundary is also redesigned; do not promote a short-only compact bridge for Sam-style v2 |
 | Compact valid-row triangle-multiplication bridge | valid-only compact row work was slower than padded CUEQ (`0.70x` short, `0.27x` long), and scattering back to padded layout was worse | do not bridge compact row-wise work through dense `a/b` tensors; a real segmented native update must stay segmented through contraction and output |
 | Compact segmented triangle-multiplication update inside a full v2 `PairformerBlock` | isolated short-bucket update improved, but the full block slowed badly: short `10.237 -> 27.144 ms` best (`0.38x`), long `25.791 -> 123.764 ms` best (`0.21x`) | the dense-ABI compact bridge pays too much pack/scatter, invalid-row zeroing, and custom-contraction cost; the next attempt needs a native vendor-quality CuTe/SM90 segmented update |
 | Unguarded fused triangle-multiplication input LayerNorm + dual-GEMM producer | short v2 blocks improved about `1.08x`, but long `B16/N220` blocks slowed to `0.94x`; the path is now default-off and guarded to <=300k physical pair rows | local producer fusion can be shape-specific; do not enable it globally for Sam-style v2 campaigns unless the long bucket is protected by fallback |
@@ -5008,8 +5068,10 @@ Profiling and reproducibility helpers:
   compact segmented triangle-multiplication update boundary.  It packs valid
   pair rows, runs input producer variants, contracts in compact per-record
   storage, applies the output gate, and scatters valid rows back to dense output
-  with the residual.  Current result: real short-bucket signal, long-bucket
-  rejection unless the compact contraction/update mainloop becomes vendor-class.
+  with the residual.  Current result: real short-bucket signal, including the
+  exact-group `bmm` contractor, but long-bucket rejection unless the compact
+  contraction/update mainloop becomes vendor-class and avoids Python grouping
+  plus scatter debt.
 - `scripts/perf/triangle_update_compact_segmented_profile.py`: profiler companion
   for the compact segmented update screen.  Use it when a timing result needs
   launch-level attribution, especially to separate producer, contraction,
@@ -5061,6 +5123,14 @@ Profiling and reproducibility helpers:
   non-grouped rank-4 SM90 GEMM per sequence record with the 256 pair channels in
   GEMM's `L` dimension.  Current result: rejected; short buckets regress and the
   long-bucket movement is too small/asymmetric for production.
+- `scripts/perf/triangle_contraction_cutlass3_exact_group_lbatched_probe.py`
+  and `scripts/perf/triangle_contraction_cutlass3_exact_group_lbatched_probe.cu`:
+  optimistic producer-owned exact-length contraction screen.  It assumes a
+  future fused producer emits record-major exact-length groups directly, so
+  packing is outside the timed region.  Current result: exact-group
+  `torch.bmm` shows strong contraction-only headroom, but the stock CUTLASS 3
+  kernel is still not good enough; use this as motivation for a native fused
+  segmented update rather than as a deployable contractor.
 - `scripts/perf/triangle_contraction_triton_segmented_probe.py`: direct Triton
   segmented contraction screen.  It removes host-built grouped-GEMM metadata and
   writes zero invalid regions in one launch, but is still much slower than dense
