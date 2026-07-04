@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from pairformer_varlen_triangle_attention_probe import (
     TensorPair,
@@ -52,6 +54,7 @@ from scripts.perf.triangle_update_producer_owned_direct_probe import (
 class TriangleUpdatePlan:
     dense_offsets: torch.Tensor
     descriptors: torch.Tensor | None
+    invalid_offsets: torch.Tensor | None
     weights_out: dict[str, torch.Tensor]
     weights_in: dict[str, torch.Tensor]
 
@@ -73,6 +76,42 @@ def zero_invalid_pairs(z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return z.masked_fill(~mask.bool().unsqueeze(-1), 0.0)
 
 
+@triton.jit
+def _zero_dense_offsets_kernel(
+    z,
+    dense_offsets,
+    rows,
+    channels: tl.constexpr,
+    block_rows: tl.constexpr,
+    block_c: tl.constexpr,
+) -> None:
+    row = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
+    c = tl.program_id(1) * block_c + tl.arange(0, block_c)
+    dense_row = tl.load(dense_offsets + row, mask=row < rows, other=0).to(tl.int64)
+    mask = (row[:, None] < rows) & (c[None, :] < channels)
+    tl.store(z + dense_row[:, None] * channels + c[None, :], 0.0, mask=mask)
+
+
+def make_invalid_dense_offsets(lengths: list[int]) -> torch.Tensor:
+    n_max = max(lengths)
+    offsets: list[int] = []
+    for batch_index, length in enumerate(lengths):
+        batch_base = batch_index * n_max * n_max
+        for i in range(n_max):
+            invalid_start = length if i < length else 0
+            offsets.extend(batch_base + i * n_max + j for j in range(invalid_start, n_max))
+    return torch.tensor(offsets, device="cuda", dtype=torch.int64)
+
+
+def zero_invalid_offsets_(z: torch.Tensor, dense_offsets: torch.Tensor | None) -> torch.Tensor:
+    if dense_offsets is None or dense_offsets.numel() == 0:
+        return z
+    rows = dense_offsets.numel()
+    grid = (triton.cdiv(rows, 16), triton.cdiv(z.shape[-1], 64))
+    _zero_dense_offsets_kernel[grid](z, dense_offsets, rows, z.shape[-1], 16, 64, num_warps=4)
+    return z
+
+
 def compact_triangle_update(
     module: torch.nn.Module,
     z: torch.Tensor,
@@ -84,10 +123,11 @@ def compact_triangle_update(
     weights: dict[str, torch.Tensor],
     dense_offsets: torch.Tensor,
     descriptors: torch.Tensor | None,
+    invalid_offsets: torch.Tensor | None,
 ) -> torch.Tensor:
     if producer == "direct":
         out = direct_owned_update(module, z, dense_offsets, lengths, direction, weights)
-        return zero_invalid_pairs(out, mask)
+        return zero_invalid_offsets_(out, invalid_offsets)
 
     if descriptors is None:
         raise RuntimeError("compact CUEQ/Triton producers require descriptors")
@@ -127,6 +167,7 @@ def run_compact_triangles(
         plan.weights_out,
         plan.dense_offsets,
         plan.descriptors,
+        plan.invalid_offsets,
     )
     z = compact_triangle_update(
         block.tri_mul_in,
@@ -139,6 +180,7 @@ def run_compact_triangles(
         plan.weights_in,
         plan.dense_offsets,
         plan.descriptors,
+        plan.invalid_offsets,
     )
     z += block.tri_att_start(
         z,
@@ -160,11 +202,14 @@ def make_triangle_update_plan(
     if producer == "direct":
         dense_offsets = grouped_dense_offsets(lengths)
         descriptors = None
+        invalid_offsets = make_invalid_dense_offsets(lengths)
     else:
         dense_offsets, descriptors = make_metadata(lengths, config)
+        invalid_offsets = None
     return TriangleUpdatePlan(
         dense_offsets=dense_offsets,
         descriptors=descriptors,
+        invalid_offsets=invalid_offsets,
         weights_out=cached_weights(block.tri_mul_out),
         weights_in=cached_weights(block.tri_mul_in),
     )
