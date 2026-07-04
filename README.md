@@ -197,6 +197,11 @@ input kernel by default (`PROTENIX_TRITON_TRANSITION_DUAL_GEMM=1`).  Pairformer
 transition normally computes two projections from the same normalized pair rows
 and immediately consumes them as `SiLU(a) * b`; the Triton path keeps both
 accumulators inside one tiled launch and writes only the consumed hidden tensor.
+On H100, Protenix-v2's wider transition shape (`c_z=256`, hidden width 1024)
+uses a larger measured tile than the base model while the base shape keeps the
+older tile.  This is intentionally shape-guarded: the wider tile improved the
+v2-shaped B32/N251 PairformerBlock by about `1.4%`, but was neutral for the
+base-model block.
 The default row-count guard is intentionally high
 (`PROTENIX_TRITON_TRANSITION_DUAL_GEMM_MIN_ROWS=1000000`): it speeds the
 important B32 same-token, variable-atom endpoint, but stays out of the

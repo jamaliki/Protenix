@@ -258,6 +258,56 @@ abs `0.09375`; job `101685`,
 CUEQ cache overlay is active, it adds only `68.70 ms -> 68.41 ms`; that is too
 small, and the full-model quality gate has not been run, so it is not a default.
 
+Post-overlay launch profile: job `101807`
+(`runs/v2_pairformer_block_ncu_post_overlay_20260704_064148_249c0ec`) captured
+the same v2-shaped block after the default cache overlay.  Total captured
+kernel time was `67.97 ms`, matching the CUDA-event screen.  The remaining
+kernel families were:
+
+| family | launches | total ms | signal | interpretation |
+| --- | ---: | ---: | --- | --- |
+| cuDNN SDPA inside CUEQ triangle attention | 2 | 12.70 | ~81% compute-memory throughput, ~56% SM | largest remaining mainloop, but already vendor FMHA |
+| CUEQ `fused_sigmoid_gated_dual_gemm` | 4 | 10.10 | main large calls ~55% memory, smaller calls ~90% memory | triangle multiplication is much healthier after the cache overlay |
+| Pair-transition `_dual_gemm_silu_product_kernel` | 1 | 7.25 | ~85% memory, ~29% tensor | Protenix-owned launch; next tile candidate |
+| CUTLASS/cuBLAS GEMMs | 3 | 5.31 | library tensor-core mainloops | preserve unless fusing a real epilogue |
+| CUEQ `layer_norm_transpose_forward_kernel` | 4 | 5.26 | ~78-79% memory | CUEQ wrapper/layout boundary |
+| PyTorch/Triton LayerNorm | 6 | 4.99 | memory-heavy | material but spread across several blocks |
+| PyTorch vectorized elementwise | 49 | 4.33 | mostly HBM traffic | residual/gate cleanup targets, individually small |
+| CUEQ q/k/v layout helpers | 2 | 4.62 | ~85% DRAM | visible, but prior tile-only retunes were too small |
+| triangle-attention gate epilogues | 2 | 2.05 | ~91% DRAM | already fused to one Triton launch each |
+
+Decision: do not replace the cuDNN/CUEQ attention mainloops.  The next
+promoted change should be a narrow boundary where Protenix owns the schedule or
+where a vendor epilogue can be used without losing the mainloop.
+
+Protenix-v2 transition tile: job `101951`
+(`runs/v2_transition_dual_gemm_tile_screen_20260704_065759_8ff1840`) screened
+the transition input dual-GEMM tile at the v2 shape (`B32`, `N=251`, `c_in=256`,
+hidden width 1024).  The existing production-like `64x64x64` tile took
+`7.385 ms` for the hidden boundary; the best H100 tile was `64x256x64` with
+8 warps at `6.411 ms`, a `1.15x` hidden-boundary speedup.  The corresponding
+input-to-output transition boundary was `8.555 ms` versus `12.289 ms` for the
+two-GEMM PyTorch baseline.
+
+The base-model guard, job `101957`
+(`runs/base_transition_dual_gemm_tile_guard_20260704_065841_8ff1840`), showed
+why this must be shape-guarded: at `c_in=128`, hidden width 512, the old
+`64x64x64` tile remained best (`2.448 ms`), while the wider `64x256x64` tile
+slowed to `2.667 ms`.
+
+Commit `e17c504` therefore selects the larger tile only on Hopper-or-newer GPUs
+when `k_input >= 256` and `n_hidden >= 1024`.  Paired full-block gates in one
+allocation:
+
+| gate | baseline | candidate | pair transition | total block | decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| v2 B32/N251 block, job `101973` | `8ff1840` | `e17c504` | `12.583 -> 11.798 ms` (`1.067x`) | `73.701 -> 72.670 ms` (`1.014x`) | promote |
+| base B32/N251 block, job `101982` | `8ff1840` | `e17c504` | `5.897 -> 5.895 ms` | `37.384 -> 37.382 ms` | neutral guard |
+
+This is not a headline speedup, but it is a clean promoted kernel improvement:
+the isolated bottleneck moved, the enclosing block moved in the same component,
+memory was unchanged, and the base path kept the old tile.
+
 Host-prefetch gate: job `99731`, run directory
 `runs/prefetch_gate_20260704_013822_0e4d701`, commit `0e4d701`, one H100,
 base checkpoint, synthetic 256-record campaign made by repeating the same 32
@@ -1590,12 +1640,12 @@ rewrite needs a larger contiguous win, probably by preserving cuBLAS-quality
 input/output GEMM mainloops while deleting more than the current activation
 product launch.
 
-Another narrow epilogue branch, `codex/transition-addmm-residual`, tried to
+Another narrow epilogue branch tried to
 fold the pairformer transition residual add into the final transition GEMM with
 `torch.addmm(beta=1)`.  This was the right kind of small boundary experiment:
 it kept the library GEMM mainloop and asked the GEMM epilogue to consume the
 caller residual, rather than replacing the matmul with a custom kernel.  The
-actual-shape one-block gate rejected it:
+first actual-shape one-block gate rejected it:
 
 | shape | baseline block ms | addmm-residual block ms | speedup | peak reserved | parity |
 | --- | ---: | ---: | ---: | --- | --- |
@@ -1608,6 +1658,21 @@ Job `95730`
 therefore rejects the branch.  The likely mechanism is that `torch.addmm` with
 nonzero beta does not beat the existing `F.linear` plus simple in-place residual
 add for these shapes, even though it is algebraically equivalent.
+
+The same boundary was rechecked after the v2 CUEQ cache overlay because the
+post-overlay NCU trace again made pair transition visible.  Job `101895`
+(`runs/pair_transition_residual_addmm_probe_20260704_065206_8ff1840`) tested
+both the target v2 shape and the base guard:
+
+| shape | baseline transition ms | addmm-residual ms | speedup | parity |
+| --- | ---: | ---: | ---: | --- |
+| v2 `B32, N=251, c_in=256` | 11.445 | 11.594 | 0.987x | exact |
+| base `B32, N=251, c_in=128` | 5.064 | 5.089 | 0.995x | exact |
+
+Decision: keep `pair_transition_residual_addmm_probe.py` as a negative-evidence
+harness, but do not add an addmm residual path.  The useful transition win was
+tile selection inside the existing dual-GEMM input kernel, not forcing the
+output residual through `torch.addmm(beta=1)`.
 
 A follow-up branch, `codex/triangle-output-epilogue-hotspot`, tried the same
 discipline on the triangle-attention output boundary.  CUEQ returns heads in a
