@@ -4180,12 +4180,43 @@ short-term implementation ladder is:
 
    The kernel is correct on valid regions and writes zero invalid regions, but
    it is still slower than dense PyTorch/cuBLAS.  This rejects the old SM80-era
-   CUTLASS grouped API as a production boundary for Protenix-v2.  The next
-   kernel attempt should not be another library wrapper.  It should either
-   use CUTLASS 3/CuTe Hopper grouped scheduling directly, or fuse a larger
-   triangle-multiplication boundary so the custom kernel amortizes the scheduler
-   and metadata cost over LayerNorm, gated projections, contraction, output
-   normalization, and residual store.
+   CUTLASS grouped API as a production boundary for Protenix-v2.
+
+   CUTLASS 3 Hopper grouped follow-up: commits `39aeae8`, `f530ce2`, and
+   `4d68bd4` added
+   `scripts/perf/triangle_contraction_cutlass3_grouped_probe.py` and its CUDA
+   extension.  This is the direct CUTLASS 3 path: pointer-backed
+   `RowMajor*`/`ColumnMajor*` layout tags, a
+   `GroupProblemShape<Shape<int,int,int>>`, and
+   `KernelPtrArrayTmaWarpSpecializedCooperative` for the SM90 grouped TMA
+   scheduler.  The first two compile attempts were useful ABI checks: one fixed
+   raw stride-pointer casts, and one replaced an anonymous namespace that
+   collided with CuTe's internal anonymous namespaces in nvcc-generated stubs.
+   Job `109432`, run
+   `runs/triangle_contraction_cutlass3_grouped_20260704_161653_4d68bd4`, then
+   compiled and ran the full v2 screen:
+
+   | bucket / direction | dense `einsum` | CUTLASS 3 grouped | decision |
+   | --- | ---: | ---: | --- |
+   | short outgoing | 0.175 ms | 0.359 ms (`0.49x`) | reject |
+   | short incoming | 0.155 ms | 0.365 ms (`0.42x`) | reject |
+   | long outgoing | 0.822 ms | 0.714 ms (`1.15x`) | too small alone |
+   | long incoming | 0.752 ms | 0.746 ms (`1.01x`) | flat |
+
+   The kernel has BF16-level valid-region parity and zero invalid-region output,
+   but it still launches one grouped problem per `(feature, record)` matrix
+   (`4096` groups for `c_z=256`, `B=16`).  The grouped scheduler and TMA
+   metadata overhead erase most of the theoretical ragged work reduction,
+   especially on the short bucket.  This is a better Hopper-native screen than
+   the old grouped wrapper, but it still does not justify production integration
+   as a standalone contraction replacement.
+
+   Decision: reject simple library-wrapper contraction paths for Protenix-v2.
+   The next kernel attempt should fuse a larger triangle-multiplication boundary
+   so custom scheduling amortizes metadata over LayerNorm, gated projections,
+   contraction, output normalization, and residual store.  Do not spend more
+   effort on another bare grouped-GEMM wrapper unless its design specifically
+   removes the `4096` tiny-problem scheduler cost.
 2. **Full segmented triangle-mul update:** fuse or internally schedule the
    LayerNorm, gated input projection, segmented contraction, output LayerNorm,
    output projection/gate, and residual store for valid rows.  This is the first
@@ -4359,6 +4390,13 @@ Profiling and reproducibility helpers:
   CUTLASS grouped-GEMM contraction screen.  It tests whether one grouped launch
   over all `(feature, record)` valid rectangles beats dense `einsum`; this
   rejected the library-wrapper path after alignment fixes.
+- `scripts/perf/triangle_contraction_cutlass3_grouped_probe.py` and
+  `scripts/perf/triangle_contraction_cutlass3_grouped_probe.cu`: CUTLASS 3
+  Hopper grouped-GEMM contraction screen using pointer-backed strides and the
+  SM90 grouped TMA scheduler.  It is correct and modestly helps the long
+  outgoing contraction, but regresses short buckets and is flat for long
+  incoming; use this as evidence that the next v2 kernel needs a wider fused
+  triangle-multiplication boundary, not another bare grouped-GEMM wrapper.
 - `scripts/perf/submit_tokyo_triangle_attention_ncu.sh` and
   `scripts/perf/tokyo_triangle_attention_ncu.sbatch`: Tokyo one-H100 Nsight
   Compute capture for one starting or ending CUEQ triangle-attention module.
