@@ -303,6 +303,14 @@ def parse_producers(text: str) -> list[str]:
     return producers
 
 
+def parse_contractors(text: str) -> list[str]:
+    contractors = [item.strip() for item in text.split(",") if item.strip()]
+    bad = sorted(set(contractors) - {"triton", "exact_group_bmm"})
+    if bad:
+        raise argparse.ArgumentTypeError(f"unknown contractor(s): {', '.join(bad)}")
+    return contractors
+
+
 def lengths_from_args(args: argparse.Namespace) -> list[int]:
     if args.lengths is not None:
         return args.lengths
@@ -359,6 +367,15 @@ def make_metadata(lengths: list[int], config: ContractConfig) -> tuple[torch.Ten
     )
 
 
+def make_record_spans(lengths: list[int]) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    offset = 0
+    for length in lengths:
+        spans.append((offset, length))
+        offset += length * length
+    return spans
+
+
 def cached_weights(module: torch.nn.Module) -> dict[str, torch.Tensor]:
     return {
         "p_in": torch.cat([module.linear_a_p.weight, module.linear_b_p.weight], 0)
@@ -370,6 +387,43 @@ def cached_weights(module: torch.nn.Module) -> dict[str, torch.Tensor]:
         "p_out": module.linear_z.weight.to(device="cuda", dtype=DTYPE).contiguous(),
         "g_out": module.linear_g.weight.to(device="cuda", dtype=DTYPE).contiguous(),
     }
+
+
+def exact_group_bmm_contract(
+    ab: torch.Tensor,
+    lengths: list[int],
+    direction: str,
+) -> torch.Tensor:
+    """Contract compact rows by exact-length groups using cuBLAS-backed bmm.
+
+    ``ab`` is the CUEQ-style compact producer output: ``[2 * D, valid_rows]``.
+    This contractor tests a larger fusion boundary than the earlier Triton
+    kernel.  It assumes a future producer can emit exact-length record groups
+    directly, then uses strong library batched GEMMs for the contraction.
+    """
+
+    spans = make_record_spans(lengths)
+    update = torch.empty((ab.shape[1], C_Z), device=ab.device, dtype=ab.dtype)
+    for length in sorted(set(lengths)):
+        selected = [(offset, item) for offset, item in spans if item == length]
+        lhs_records = []
+        rhs_records = []
+        for offset, _ in selected:
+            rows = length * length
+            lhs_records.append(ab[:C_Z, offset : offset + rows].reshape(C_Z, length, length))
+            rhs_records.append(ab[C_Z:, offset : offset + rows].reshape(C_Z, length, length))
+        lhs = torch.stack(lhs_records, dim=0).reshape(-1, length, length)
+        rhs = torch.stack(rhs_records, dim=0).reshape(-1, length, length)
+        if direction == "outgoing":
+            contracted = torch.bmm(lhs, rhs.transpose(1, 2))
+        else:
+            contracted = torch.bmm(lhs.transpose(1, 2), rhs)
+        records = contracted.reshape(len(selected), C_Z, length, length).permute(0, 2, 3, 1)
+        for record_index, (offset, _) in enumerate(selected):
+            update[offset : offset + length * length] = records[record_index].reshape(
+                length * length, C_Z
+            )
+    return update
 
 
 def segmented_finish(
@@ -420,6 +474,37 @@ def segmented_finish(
     return out
 
 
+def segmented_finish_exact_group_bmm(
+    module: torch.nn.Module,
+    z: torch.Tensor,
+    x_norm: torch.Tensor,
+    ab: torch.Tensor,
+    dense_offsets: torch.Tensor,
+    lengths: list[int],
+    direction: str,
+    weights: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    update = exact_group_bmm_contract(ab, lengths, direction)
+    update_norm = layer_norm_transpose(
+        update,
+        module.layer_norm_out.weight,
+        module.layer_norm_out.bias,
+        eps=1e-5,
+        layout="nd->nd",
+    )
+    compact_delta = fused_sigmoid_gated_dual_gemm_dual_x(
+        x_norm,
+        update_norm,
+        weights["g_out"],
+        weights["p_out"],
+    )
+    out = torch.empty_like(z)
+    rows = dense_offsets.numel()
+    scatter_grid = (rows, triton.cdiv(C_Z, 64))
+    _scatter_residual_kernel[scatter_grid](compact_delta, z, dense_offsets, out, rows, C_Z, 64)
+    return out
+
+
 def triton_producer_update(
     module: torch.nn.Module,
     z: torch.Tensor,
@@ -428,6 +513,8 @@ def triton_producer_update(
     config: ContractConfig,
     direction: str,
     weights: dict[str, torch.Tensor],
+    contractor: str,
+    lengths: list[int],
 ) -> torch.Tensor:
     rows = dense_offsets.numel()
     mean = torch.empty(rows, device=z.device, dtype=torch.float32)
@@ -456,6 +543,10 @@ def triton_producer_update(
         num_warps=4,
         num_stages=3,
     )
+    if contractor == "exact_group_bmm":
+        return segmented_finish_exact_group_bmm(
+            module, z, x_norm, ab, dense_offsets, lengths, direction, weights
+        )
     return segmented_finish(module, z, x_norm, ab, dense_offsets, descriptors, config, direction, weights)
 
 
@@ -467,6 +558,8 @@ def cueq_producer_update(
     config: ContractConfig,
     direction: str,
     weights: dict[str, torch.Tensor],
+    contractor: str,
+    lengths: list[int],
 ) -> torch.Tensor:
     rows = dense_offsets.numel()
     z_valid = torch.empty((rows, C_Z), device=z.device, dtype=z.dtype)
@@ -486,6 +579,10 @@ def cueq_producer_update(
         mask=None,
         transpose_out=True,
     )
+    if contractor == "exact_group_bmm":
+        return segmented_finish_exact_group_bmm(
+            module, z, x_norm, ab, dense_offsets, lengths, direction, weights
+        )
     return segmented_finish(module, z, x_norm, ab, dense_offsets, descriptors, config, direction, weights)
 
 
@@ -534,6 +631,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lengths", type=parse_ints)
     parser.add_argument("--direction", choices=["outgoing", "incoming", "both"], default="both")
     parser.add_argument("--producers", type=parse_producers, default=parse_producers("triton,cueq"))
+    parser.add_argument("--contractors", type=parse_contractors, default=parse_contractors("triton"))
     parser.add_argument(
         "--configs",
         type=parse_configs,
@@ -577,30 +675,39 @@ def main() -> None:
             dense_offsets, descriptors = make_metadata(lengths, config)
             for producer in args.producers:
                 update_fn = triton_producer_update if producer == "triton" else cueq_producer_update
-                candidate, ms = cuda_time(
-                    lambda update_fn=update_fn, config=config, dense_offsets=dense_offsets, descriptors=descriptors: update_fn(
-                        module,
-                        z,
-                        dense_offsets,
-                        descriptors,
-                        config,
-                        direction,
-                        weights,
-                    ),
-                    args.warmup,
-                    args.iters,
-                )
-                direction_results["compact_segmented"][producer][config.label()] = {
-                    "config": vars(config),
-                    "descriptor_count": int(descriptors.shape[0]),
-                    "valid_rows": int(dense_offsets.numel()),
-                    "ms": ms,
-                    "speedup_vs_baseline": base_ms / ms,
-                    "parity_valid": compare(
-                        valid_from_dense(base_out, dense_offsets),
-                        valid_from_dense(candidate, dense_offsets),
-                    ),
-                }
+                for contractor in args.contractors:
+                    label = (
+                        config.label()
+                        if contractor == "triton"
+                        else f"exact_group_bmm_from_{config.label()}_producer"
+                    )
+                    candidate, ms = cuda_time(
+                        lambda update_fn=update_fn, config=config, dense_offsets=dense_offsets, descriptors=descriptors, contractor=contractor: update_fn(
+                            module,
+                            z,
+                            dense_offsets,
+                            descriptors,
+                            config,
+                            direction,
+                            weights,
+                            contractor,
+                            lengths,
+                        ),
+                        args.warmup,
+                        args.iters,
+                    )
+                    direction_results["compact_segmented"][producer][label] = {
+                        "config": vars(config),
+                        "contractor": contractor,
+                        "descriptor_count": int(descriptors.shape[0]),
+                        "valid_rows": int(dense_offsets.numel()),
+                        "ms": ms,
+                        "speedup_vs_baseline": base_ms / ms,
+                        "parity_valid": compare(
+                            valid_from_dense(base_out, dense_offsets),
+                            valid_from_dense(candidate, dense_offsets),
+                        ),
+                    }
         results[direction] = direction_results
 
     n_max = max(lengths)
