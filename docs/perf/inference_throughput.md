@@ -372,6 +372,44 @@ transition rewrite that removes the hidden tensor without slowing the output
 GEMM, or (3) true ragged/segmented pairformer work to avoid padded token
 compute.  Smaller q/k/v tile and residual-add tweaks have been exhausted.
 
+LayerNorm+q/k/v producer screen: commit `11e3c52` added
+`scripts/perf/triangle_attention_ln_qkv_probe.py` to test the first of those
+surfaces without touching production code.  The probe compares three producer
+boundaries in one process:
+
+1. current production `LayerNorm -> qkv GEMM -> CUEQ qkv layout`,
+2. the same boundary with the packed qkv weight cached, to rule out `torch.cat`
+   as the source of any win,
+3. a single Triton kernel that computes FP32 row statistics, performs BF16
+   tensor-core q/k/v projection tiles, and writes CUEQ's physical heads-first
+   layout directly.
+
+The target Protenix-v2 result rejected this naive Triton replacement.  Job
+`103130` (`runs/ln_qkv_probe_20260704_090040_11e3c52`) screened small tiles;
+job `103137`
+(`runs/ln_qkv_probe_v2_tiles_20260704_090259_11e3c52`) screened wider v2 tiles.
+Both ran on one H100 with `B32`, `N=251`, BF16 input/compute, and
+`PROTENIX_DISABLE_FAST_LAYER_NORM=1` to match the Triton LayerNorm inference
+fallback:
+
+| shape | orientation | current producer | cached producer | best fused producer | best tile | decision |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| v2 `c_z=256`, `heads=8` | start | 4.823 ms | 4.802 ms | 5.070 ms | `64x128x4` | reject, `0.95x` vs current |
+| v2 `c_z=256`, `heads=8` | ending/swapped | 5.056 ms | 5.046 ms | 5.145 ms | `64x128x4` | reject, `0.98x` vs current |
+| base `c_z=128`, `heads=4` | start | 3.029 ms | 3.021 ms | 2.028 ms | `32x64x4` | isolated `1.49x`, not promoted here |
+| base `c_z=128`, `heads=4` | ending/swapped | 3.119 ms | 3.107 ms | 2.038 ms | `32x64x4` | isolated `1.53x`, not promoted here |
+
+Parity against the cached producer was within BF16 projection tolerance
+(`max_abs <= 0.03125`, mean absolute error about `1.5e-7`).  Mechanistically,
+the base shape is narrow enough that deleting the LayerNorm materialization and
+layout pass beats the less-polished Triton matmul.  At the actual v2 target
+shape (`C=256`, hidden q/k/v width `256`), the custom kernel cannot match the
+library qkv GEMM plus existing layout helper.  Do not integrate this fused
+producer for Protenix-v2 unless the mainloop is rewritten with a vendor-class
+CuTe/CUTLASS design; the simple Triton boundary is not the remaining v2 win.
+The base-shape signal is a possible future guardrail follow-up, but it does not
+solve the current v2 same-token campaign bottleneck.
+
 Current-head Protenix-v2 end-to-end validation is still blocked by checkpoint
 availability in the Kiarash runtime, not by model code.  Job `102199`
 (`runs/v2_same_token_var_atom_current_gate_20260704_072851_000836b`) attempted
