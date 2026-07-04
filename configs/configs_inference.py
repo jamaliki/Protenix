@@ -37,14 +37,18 @@ inference_configs = {
     # Atom-shaped diffusion/confidence work stays per record.  "trunk_exact"
     # loops the pairformer trunk at each record's true token length, then batches
     # the diffusion tail; use it when padded pairformer drift is unacceptable but
-    # some low-sample batching is still useful.  "exact", "token", and "padded"
-    # force one boundary for debugging or benchmarking.
+    # some low-sample batching is still useful.  "trunk_bucket" is the middle
+    # ground: split only the pairformer trunk by inference_token_bucket_size, then
+    # run one batched diffusion tail.  "exact", "token", and "padded" force one
+    # boundary for debugging or benchmarking.
     "inference_batch_mode": "auto",
     # Optional fallback for callers that feed unsorted records directly into
     # infer_predict.  The CLI sorts raw campaign records by length before
     # featurization, which packs batches better without holding feature tensors
     # in memory.  Set this >0 to additionally split the streaming queue into
-    # approximate N_token buckets.
+    # approximate N_token buckets.  In "trunk_bucket" mode the same value is
+    # applied inside the pairformer trunk instead, preserving the outer diffusion
+    # batch.
     "inference_token_bucket_size": 0,
     "use_msa": True,
     "enable_tf32": True,
