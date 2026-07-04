@@ -23,7 +23,9 @@ DTYPE=${DTYPE:-bf16}
 CAPTURE=${CAPTURE:-cached_bias_reuse}
 WARMUP=${WARMUP:-3}
 NCU_ITERS=${NCU_ITERS:-1}
-NCU_SET=${NCU_SET:-speedOfLight}
+NCU_SET=${NCU_SET:-full}
+DEFAULT_NCU_METRICS="gpu__time_duration.sum,gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed,TPC.TriageCompute.sm__pipe_tensor_cycles_active_realtime.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active"
+NCU_METRICS=${NCU_METRICS-$DEFAULT_NCU_METRICS}
 
 RUN_DIR=${RUN_DIR:-"$REPO/runs/diffusion_transformer_ncu_${CAPTURE}_B${BATCH}_S${SAMPLES}_N${TOKENS}_${STAMP}_${COMMIT}"}
 mkdir -p "$RUN_DIR/slurm_logs"
@@ -45,6 +47,7 @@ export CAPTURE=$CAPTURE
 export WARMUP=$WARMUP
 export NCU_ITERS=$NCU_ITERS
 export NCU_SET=$NCU_SET
+export NCU_METRICS=$NCU_METRICS
 EOF
 
 JOB_ID=$(

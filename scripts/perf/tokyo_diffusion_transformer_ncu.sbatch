@@ -47,7 +47,9 @@ DTYPE=${DTYPE:-bf16}
 CAPTURE=${CAPTURE:-cached_bias_reuse}
 WARMUP=${WARMUP:-3}
 NCU_ITERS=${NCU_ITERS:-1}
-NCU_SET=${NCU_SET:-speedOfLight}
+NCU_SET=${NCU_SET:-full}
+DEFAULT_NCU_METRICS="gpu__time_duration.sum,gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed,TPC.TriageCompute.sm__pipe_tensor_cycles_active_realtime.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active"
+NCU_METRICS=${NCU_METRICS-$DEFAULT_NCU_METRICS}
 
 cd "$PROTENIX_REPO"
 mkdir -p "$RUN_DIR" "$RUN_DIR/torchinductor_cache" "$RUN_DIR/triton_cache"
@@ -75,22 +77,34 @@ unset PROTENIX_TRITON_FUSED_ATTENTION_RESIDUAL
 unset PROTENIX_TRITON_FUSED_TRANSITION_RESIDUAL
 unset PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION
 
-REPORT="$RUN_DIR/diffusion_transformer_${CAPTURE}_B${BATCH}_S${SAMPLES}_N${TOKENS}_${NCU_SET}"
+REPORT_SUFFIX=$NCU_SET
+if [[ -n "$NCU_METRICS" ]]; then
+  REPORT_SUFFIX=${NCU_LABEL:-duration_sol}
+fi
+REPORT="$RUN_DIR/diffusion_transformer_${CAPTURE}_B${BATCH}_S${SAMPLES}_N${TOKENS}_${REPORT_SUFFIX}"
 
 echo "job_id=${SLURM_JOB_ID:-none} host=$(hostname) date_utc=$(date -u --iso-8601=seconds)"
 echo "repo=$(pwd) branch=$(git rev-parse --abbrev-ref HEAD) commit=$(git rev-parse HEAD)"
 echo "python=$("$PY" --version 2>&1)"
 echo "cc=$CC"
 echo "ncu=$("$NCU" --version | head -5 | tr '\n' '; ')"
-echo "capture=$CAPTURE batch=$BATCH samples=$SAMPLES tokens=$TOKENS ncu_set=$NCU_SET"
+echo "capture=$CAPTURE batch=$BATCH samples=$SAMPLES tokens=$TOKENS ncu_set=$NCU_SET ncu_metrics=${NCU_METRICS:-<set>}"
 nvidia-smi
 
-"$NCU" \
+NCU_ARGS=(
   --profile-from-start off \
-  --set "$NCU_SET" \
   --target-processes all \
   --force-overwrite \
-  --export "$REPORT" \
+  --export "$REPORT"
+)
+if [[ -n "$NCU_METRICS" ]]; then
+  NCU_ARGS+=(--metrics "$NCU_METRICS")
+else
+  NCU_ARGS+=(--set "$NCU_SET")
+fi
+
+"$NCU" \
+  "${NCU_ARGS[@]}" \
   "$PY" scripts/perf/diffusion_pair_bias_cache_probe.py \
     --batch "$BATCH" \
     --samples "$SAMPLES" \
