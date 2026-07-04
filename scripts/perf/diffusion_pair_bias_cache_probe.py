@@ -5,7 +5,10 @@ In low-sample campaign inference, the token diffusion transformer runs once per
 denoising step, but its pair tensor `z` is step-invariant.  The current block
 projects `z` to attention-head bias inside every block on every step.  This
 probe asks whether storing the final `[B * samples, heads, tokens, tokens]`
-bias for each block is fast enough to justify the extra memory.
+bias for each block is fast enough to justify the extra memory.  It also
+screens the next narrower boundary: keep the fast flattened GEMM/MLP path, but
+reshape only q/k/v around SDPA so a compact
+`[B, 1, heads, tokens, tokens]` cached bias can broadcast over samples.
 
 This is only a hotspot screen.  A production change must still prove that the
 one-time cache build plus higher live memory improves the full N_step=200 gate.
@@ -76,6 +79,44 @@ def _precompute_biases(
     return [_pair_bias_for_block(block, z, token_mask, samples) for block in model.blocks]
 
 
+def _compact_pair_bias_for_block(
+    block: DiffusionTransformerBlock,
+    z: torch.Tensor,
+    token_mask: torch.Tensor,
+    samples: int,
+) -> torch.Tensor:
+    """Project one record-level bias and keep a singleton sample axis.
+
+    The promoted cache stores one expanded row per `(record, sample)` because
+    PyTorch's fastest diffusion path flattens those axes before SDPA.  This
+    compact form is the thing a better attention boundary would consume: one
+    bias per record, broadcast over the small sample count.
+    """
+
+    apb = block.attention_pair_bias
+    weight = (apb.linear_nobias_z.weight * apb.layernorm_z.weight[None, :])[
+        :, :, None, None
+    ]
+    bias = F.conv2d(z, weight)[:, None]
+    if token_mask is not None:
+        record_mask = token_mask.reshape(z.shape[0], samples, -1)[:, 0, :]
+        key_bias = (record_mask.to(dtype=bias.dtype) - 1) * 1e4
+        bias = bias + key_bias[:, None, None, None, :]
+    return bias.contiguous()
+
+
+def _precompute_compact_biases(
+    model: DiffusionTransformer,
+    z: torch.Tensor,
+    token_mask: torch.Tensor,
+    samples: int,
+) -> list[torch.Tensor]:
+    return [
+        _compact_pair_bias_for_block(block, z, token_mask, samples)
+        for block in model.blocks
+    ]
+
+
 def _cached_attention_block(
     block: DiffusionTransformerBlock,
     a: torch.Tensor,
@@ -97,6 +138,48 @@ def _cached_attention_block(
     return block.conditioned_transition_block(a=attn_out, s=s) + attn_out
 
 
+def _cached_attention_block_compact_bias(
+    block: DiffusionTransformerBlock,
+    a: torch.Tensor,
+    s: torch.Tensor,
+    bias: torch.Tensor,
+    samples: int,
+) -> torch.Tensor:
+    """Use compact broadcast bias while preserving flat linear layers.
+
+    A full explicit sample-axis transformer was slower in model gates because it
+    changed every linear and transition shape.  This hybrid keeps `a` and `s`
+    flattened for AdaLN, q/k/v projection, output projection, and the transition
+    MLP.  Only q/k/v at the SDPA call are viewed as `[B, S, H, N, D]`, letting
+    the `[B, 1, H, N, N]` cached bias broadcast without materializing `S`
+    identical masks.
+    """
+
+    apb = block.attention_pair_bias
+    q_x = apb.layernorm_a(a=a, s=s)
+    q, k, v = apb.attention._prep_qkv(q_x=q_x, kv_x=q_x, apply_scale=True)
+    if q.shape[0] % samples != 0:
+        raise ValueError("flat batch must be divisible by samples")
+
+    batch = q.shape[0] // samples
+    q = q.view(batch, samples, *q.shape[1:])
+    k = k.view(batch, samples, *k.shape[1:])
+    v = v.view(batch, samples, *v.shape[1:])
+    attn = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+    attn = attn.reshape(batch * samples, *attn.shape[2:])
+    attn = apb.attention._wrap_up(attn.transpose(-2, -3), q_x)
+
+    gate = apb.linear_a_last(s)
+    if fused_attention_residual_enabled() and isinstance(block.drop_path, torch.nn.Identity):
+        attn_out = fused_sigmoid_mul_add(gate, attn, a)
+    else:
+        attn_out = fused_sigmoid_mul(gate, attn) + a
+
+    if fused_transition_residual_enabled() and isinstance(block.drop_path, torch.nn.Identity):
+        return block.conditioned_transition_block(a=attn_out, s=s, residual=attn_out)
+    return block.conditioned_transition_block(a=attn_out, s=s) + attn_out
+
+
 def _cached_transformer(
     model: DiffusionTransformer,
     a: torch.Tensor,
@@ -105,6 +188,18 @@ def _cached_transformer(
 ) -> torch.Tensor:
     for block, bias in zip(model.blocks, biases):
         a = _cached_attention_block(block, a, s, bias)
+    return a
+
+
+def _cached_transformer_compact_bias(
+    model: DiffusionTransformer,
+    a: torch.Tensor,
+    s: torch.Tensor,
+    biases: list[torch.Tensor],
+    samples: int,
+) -> torch.Tensor:
+    for block, bias in zip(model.blocks, biases):
+        a = _cached_attention_block_compact_bias(block, a, s, bias, samples)
     return a
 
 
@@ -237,8 +332,20 @@ def main() -> None:
         bias_end.record()
         bias_end.synchronize()
         bias_build_ms = bias_start.elapsed_time(bias_end)
+        compact_bias_start = torch.cuda.Event(enable_timing=True)
+        compact_bias_end = torch.cuda.Event(enable_timing=True)
+        compact_bias_start.record()
+        compact_biases = _precompute_compact_biases(
+            model, inputs["z"], inputs["token_mask"], args.samples
+        )
+        compact_bias_end.record()
+        compact_bias_end.synchronize()
+        compact_bias_build_ms = compact_bias_start.elapsed_time(compact_bias_end)
 
     cached_bytes = sum(bias.numel() * bias.element_size() for bias in cached_biases)
+    compact_cached_bytes = sum(
+        bias.numel() * bias.element_size() for bias in compact_biases
+    )
 
     eager_out, eager_ms, eager_peak = _time(eager, args.warmup, args.iters)
 
@@ -251,6 +358,12 @@ def main() -> None:
             biases = _precompute_biases(model, inputs["z"], inputs["token_mask"], args.samples)
             return _cached_transformer(model, inputs["a"], inputs["s"], biases)
 
+    def cached_compact_reuse() -> torch.Tensor:
+        with _autocast(dtype):
+            return _cached_transformer_compact_bias(
+                model, inputs["a"], inputs["s"], compact_biases, args.samples
+            )
+
     cases = [
         {
             "name": "eager_recompute_pair_bias",
@@ -261,6 +374,13 @@ def main() -> None:
             "output_dtype": str(eager_out.dtype),
         },
         _case("cached_bias_reuse", cached_reuse, args, eager_out, eager_ms),
+        _case(
+            "cached_compact_bias_rank5_sdpa_reuse",
+            cached_compact_reuse,
+            args,
+            eager_out,
+            eager_ms,
+        ),
         _case("cached_bias_rebuild_each_call", cached_rebuild, args, eager_out, eager_ms),
     ]
     if args.profile:
@@ -270,6 +390,9 @@ def main() -> None:
                 "eager": _profile_rows(eager, args.warmup, args.profile_top),
                 "cached_bias_reuse": _profile_rows(
                     cached_reuse, args.warmup, args.profile_top
+                ),
+                "cached_compact_bias_rank5_sdpa_reuse": _profile_rows(
+                    cached_compact_reuse, args.warmup, args.profile_top
                 ),
             }
         )
@@ -282,6 +405,8 @@ def main() -> None:
         "input_shapes": {key: list(value.shape) for key, value in inputs.items()},
         "cached_bias_build_ms": bias_build_ms,
         "cached_bias_mib": cached_bytes / 2**20,
+        "compact_cached_bias_build_ms": compact_bias_build_ms,
+        "compact_cached_bias_mib": compact_cached_bytes / 2**20,
         "cases": cases,
         "theoretical_e2e_note": (
             "Transformer-only screen. Full N_step gates must amortize the one-time "
