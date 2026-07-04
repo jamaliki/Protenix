@@ -238,7 +238,9 @@ deliberately default-off and guarded to short physical pair buckets
 (`PROTENIX_TRITON_TRIANGLE_LN_DUAL_GEMM_MAX_ROWS=300000` by default).  The
 guarded H100 block screen improved the sorted 40-124 token v2 bucket by about
 `1.08x`, while the 136-220 token bucket falls back to the normal CUEQ path
-because the unguarded fused producer was slower there.  Treat this as a
+because the unguarded fused producer was slower there.  A full Sam-style v2
+gate then moved `N_sample=5` predict time only `1.009x` and showed almost no
+mechanistic `N_sample=1` pairformer movement, so this remains a
 kernel-learning/benchmarking knob, not a normal Sam-style v2 speed preset.
 
 For normal multi-step inference, the diffusion transformer also caches the

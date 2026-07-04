@@ -4352,6 +4352,25 @@ short-term implementation ladder is:
    speedup.  The long-bucket loss also explains why the earlier isolated
    screen was insufficient: the full block, not the hand-picked producer
    boundary, is the gate.
+
+   Full Sam-style v2 gate: job `109729`,
+   `runs/v2_triangle_ln_dualgemm_full_gate_20260704_173649_eb3414b`, repeated
+   the guarded flag on the 32-record mixed 40-220-token v2 campaign with
+   confidence enabled, `N_step=200`, `batch_size=16`, BF16, CUEQ kernels, and
+   the promoted transition dual-GEMM path.  Warmup cases were excluded:
+
+   | case | baseline predict | guarded producer predict | pairformer movement | decision |
+   | --- | ---: | ---: | ---: | --- |
+   | `N_sample=5` | 51.29 s / 3.120 generated samples/s | 50.83 s / 3.148 generated samples/s (`1.009x`) | 19.898 -> 19.635 s (`1.013x`) | too small for default promotion |
+   | `N_sample=1` | 37.63 s / 0.851 records/s | 36.42 s / 0.879 records/s (`1.033x`) | 19.906 -> 19.836 s (`1.004x`) | apparent predict win is mostly outside the targeted pairformer mechanism |
+
+   Decision after the full gate: leave
+   `PROTENIX_TRITON_TRIANGLE_LN_DUAL_GEMM` default-off.  The pairformer subtotal
+   moved exactly where the block screen predicted for `N_sample=5`, but the
+   whole-campaign win is below the promotion bar.  The larger `N_sample=1`
+   predict delta is not enough to promote because pairformer barely moved and
+   diffusion timing drifted between repeats, which this flag should not
+   mechanistically affect.
 2. **Full segmented triangle-mul update:** fuse or internally schedule the
    LayerNorm, gated input projection, segmented contraction, output LayerNorm,
    output projection/gate, and residual store for valid rows.  This is the first
@@ -4596,6 +4615,6 @@ one of:
 3. only after those, a deliberate atom/diffusion kernel-layout rewrite for the
    `N_sample=5` denoising half of the workload.
 
-The larger kernel-engineering projects should start with a
-fresh profile, an isolated hotspot screen, and a full same-output N1280/N2560
-gate before promotion.
+The larger kernel-engineering projects should start with a fresh profile, an
+isolated hotspot screen, and full Sam-style Protenix-v2 gates at both
+`N_sample=1` and `N_sample=5` before promotion.
