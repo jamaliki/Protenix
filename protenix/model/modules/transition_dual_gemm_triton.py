@@ -47,6 +47,10 @@ _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _BLOCK_M = 64
 _BLOCK_N = 64
 _BLOCK_K = 64
+_V2_BLOCK_N = 256
+_V2_NUM_WARPS = 8
+_NUM_WARPS = 4
+_NUM_STAGES = 3
 
 
 def _env_flag_enabled(name: str, default: bool) -> bool:
@@ -91,6 +95,38 @@ def _max_output_elements() -> int:
         return max(0, int(raw))
     except ValueError:
         return 0
+
+
+def _is_hopper_or_newer(device: torch.device) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    major, _minor = torch.cuda.get_device_capability(index)
+    return major >= 9
+
+
+def _launch_config(
+    *,
+    device: torch.device,
+    k_input: int,
+    n_hidden: int,
+) -> tuple[int, int, int, int, int]:
+    """Choose the measured transition tile for the current endpoint.
+
+    This kernel is intentionally small and shape-specific: it only replaces the
+    two input GEMMs plus ``SiLU(a) * b`` in inference.  The original Protenix
+    path has ``c_in=128`` and hidden width 512; Protenix-v2 widens that to
+    ``c_in=256`` and hidden width 1024.  On H100, the wider v2 shape benefits
+    from computing 256 hidden columns per program with 8 warps because each
+    program reuses the same 64 pair rows across more output columns.  The base
+    shape did not benefit in the guard screen, so keep the old tile there.
+    """
+
+    if _is_hopper_or_newer(device) and k_input >= 256 and n_hidden >= 1024:
+        return _BLOCK_M, _V2_BLOCK_N, _BLOCK_K, _V2_NUM_WARPS, _NUM_STAGES
+    return _BLOCK_M, _BLOCK_N, _BLOCK_K, _NUM_WARPS, _NUM_STAGES
 
 
 if triton_transition_dual_gemm_available():
@@ -183,7 +219,12 @@ def triton_dual_gemm_silu_product(
         return None
 
     out = torch.empty((m_rows, n_hidden), dtype=y.dtype, device=y.device)
-    grid = (triton.cdiv(m_rows, _BLOCK_M), triton.cdiv(n_hidden, _BLOCK_N))
+    block_m, block_n, block_k, num_warps, num_stages = _launch_config(
+        device=y.device,
+        k_input=k_input,
+        n_hidden=n_hidden,
+    )
+    grid = (triton.cdiv(m_rows, block_m), triton.cdiv(n_hidden, block_n))
     _dual_gemm_silu_product_kernel[grid](
         y,
         weight_a,
@@ -196,10 +237,10 @@ def triton_dual_gemm_silu_product(
         out.stride(0),
         n_hidden,
         k_input,
-        _BLOCK_M,
-        _BLOCK_N,
-        _BLOCK_K,
-        num_warps=4,
-        num_stages=3,
+        block_m,
+        block_n,
+        block_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return out
