@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 from scipy.stats import truncnorm
 
+from protenix.model.init_control import skip_weight_init_enabled
 from protenix.model.modules.fused_elementwise_triton import (
     triton_sigmoid_mul_heads_first,
 )
@@ -66,6 +67,8 @@ def _calculate_fan(
 def trunc_normal_init_(
     weights: torch.Tensor, scale: float = 1.0, fan: str = "fan_in"
 ) -> None:
+    if skip_weight_init_enabled():
+        return
     shape = weights.shape
     f = _calculate_fan(shape, fan)
     scale = scale / max(1, f)
@@ -88,20 +91,28 @@ def he_normal_init_(weights: torch.Tensor) -> None:
 
 
 def glorot_uniform_init_(weights: torch.Tensor) -> None:
+    if skip_weight_init_enabled():
+        return
     nn.init.xavier_uniform_(weights, gain=1)
 
 
 def final_init_(weights: torch.Tensor) -> None:
+    if skip_weight_init_enabled():
+        return
     with torch.no_grad():
         weights.fill_(0.0)
 
 
 def gating_init_(weights: torch.Tensor) -> None:
+    if skip_weight_init_enabled():
+        return
     with torch.no_grad():
         weights.fill_(0.0)
 
 
 def normal_init_(weights: torch.Tensor) -> None:
+    if skip_weight_init_enabled():
+        return
     torch.nn.init.kaiming_normal_(weights, nonlinearity="linear")
 
 
@@ -150,6 +161,10 @@ class OpenfoldLinear(nn.Linear):
         precision: Optional[torch.dtype] = None,
     ):
         super(OpenfoldLinear, self).__init__(in_dim, out_dim, bias=bias)
+        self.precision = precision
+
+        if skip_weight_init_enabled():
+            return
 
         if bias:
             with torch.no_grad():
@@ -176,7 +191,10 @@ class OpenfoldLinear(nn.Linear):
                 else:
                     raise ValueError("Invalid init string.")
 
-        self.precision = precision
+    def reset_parameters(self) -> None:
+        if skip_weight_init_enabled():
+            return
+        super().reset_parameters()
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         d = input.dtype

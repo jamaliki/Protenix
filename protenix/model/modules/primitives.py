@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from protenix.model.init_control import skip_weight_init_enabled
 from protenix.model.triangular.layers import LayerNorm, trunc_normal_init_
 from protenix.model.utils import (
     chunk_layer,
@@ -225,8 +226,16 @@ class Linear(nn.Linear):
 
         self._init_params()
 
+    def reset_parameters(self) -> None:
+        if skip_weight_init_enabled():
+            return
+        super().reset_parameters()
+
     @torch.no_grad()
     def _init_params(self):
+        if skip_weight_init_enabled():
+            return
+
         if self.use_bias:
             nn.init.zeros_(self.bias)  # zero-init bias
 
@@ -317,6 +326,8 @@ class BiasInitLinear(Linear):
         super(BiasInitLinear, self).__init__(
             in_features=in_features, out_features=out_features, bias=bias, **kwargs
         )
+        if skip_weight_init_enabled():
+            return
         nn.init.zeros_(tensor=self.weight)
         if bias:
             nn.init.constant_(tensor=self.bias, val=biasinit)
@@ -1011,7 +1022,7 @@ class Attention(nn.Module):
             )
             self.sigmoid = nn.Sigmoid()
         self.zero_init = zero_init
-        if self.zero_init:
+        if self.zero_init and not skip_weight_init_enabled():
             # zero init the output layer
             nn.init.zeros_(self.linear_o.weight)
 

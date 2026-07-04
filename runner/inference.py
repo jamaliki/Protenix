@@ -35,6 +35,7 @@ from configs.configs_inference import inference_configs
 from configs.configs_model_type import model_configs
 from protenix.config.config import parse_configs, parse_sys_args
 from protenix.data.inference.infer_dataloader import get_inference_dataloader
+from protenix.model.init_control import skip_weight_init
 from protenix.model.protenix import Protenix, update_input_feature_dict
 from protenix.utils.distributed import DIST_WRAPPER
 from protenix.utils.seed import seed_everything
@@ -63,6 +64,13 @@ by manually adding argparse.Namespace to PyTorch's safe globals list.
 """
 
 torch.serialization.add_safe_globals([Namespace])
+
+
+def _skip_inference_weight_init_enabled(configs: Any) -> bool:
+    if not bool(configs.load_strict):
+        return False
+    value = os.getenv("PROTENIX_SKIP_INFERENCE_WEIGHT_INIT", "1").strip().lower()
+    return value not in {"0", "false", "off", "no"}
 
 
 class InferenceRunner(object):
@@ -145,7 +153,19 @@ class InferenceRunner(object):
         """
         Initialize the Protenix model and move it to the appropriate device.
         """
-        self.model = Protenix(self.configs).to(self.device)
+        # Strict inference checkpoints overwrite every parameter and buffer.
+        # Skipping random construction-time initializers avoids tens of seconds
+        # of CPU SciPy truncated-normal sampling in Protenix-v2; strict loading
+        # remains the guard that catches any unfilled tensor before prediction.
+        skip_init = _skip_inference_weight_init_enabled(self.configs)
+        init_context = skip_weight_init() if skip_init else nullcontext()
+        if skip_init:
+            self.print(
+                "Skipping construction-time weight initialization before strict "
+                "checkpoint load."
+            )
+        with init_context:
+            self.model = Protenix(self.configs).to(self.device)
 
     def load_checkpoint(self) -> None:
         """
