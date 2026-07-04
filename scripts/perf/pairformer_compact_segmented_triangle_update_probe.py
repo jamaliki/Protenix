@@ -18,6 +18,7 @@ import _repo_bootstrap  # noqa: F401
 
 import argparse
 import json
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -47,6 +48,14 @@ from scripts.perf.triangle_update_producer_owned_direct_probe import (
 )
 
 
+@dataclass(frozen=True)
+class TriangleUpdatePlan:
+    dense_offsets: torch.Tensor
+    descriptors: torch.Tensor | None
+    weights_out: dict[str, torch.Tensor]
+    weights_in: dict[str, torch.Tensor]
+
+
 def parse_producers(text: str) -> list[str]:
     producers = [item.strip() for item in text.split(",") if item.strip()]
     bad = sorted(set(producers) - {"triton", "cueq", "direct"})
@@ -72,14 +81,16 @@ def compact_triangle_update(
     config: ContractConfig,
     direction: str,
     producer: str,
+    weights: dict[str, torch.Tensor],
+    dense_offsets: torch.Tensor,
+    descriptors: torch.Tensor | None,
 ) -> torch.Tensor:
-    weights = cached_weights(module)
     if producer == "direct":
-        dense_offsets = grouped_dense_offsets(lengths)
         out = direct_owned_update(module, z, dense_offsets, lengths, direction, weights)
         return zero_invalid_pairs(out, mask)
 
-    dense_offsets, descriptors = make_metadata(lengths, config)
+    if descriptors is None:
+        raise RuntimeError("compact CUEQ/Triton producers require descriptors")
     update_fn = triton_producer_update if producer == "triton" else cueq_producer_update
     out = update_fn(
         module,
@@ -101,6 +112,7 @@ def run_compact_triangles(
     lengths: list[int],
     config: ContractConfig,
     producer: str,
+    plan: TriangleUpdatePlan,
 ) -> TensorPair:
     s = clone_optional(s)
     z = z.clone()
@@ -112,6 +124,9 @@ def run_compact_triangles(
         config,
         "outgoing",
         producer,
+        plan.weights_out,
+        plan.dense_offsets,
+        plan.descriptors,
     )
     z = compact_triangle_update(
         block.tri_mul_in,
@@ -121,6 +136,9 @@ def run_compact_triangles(
         config,
         "incoming",
         producer,
+        plan.weights_in,
+        plan.dense_offsets,
+        plan.descriptors,
     )
     z += block.tri_att_start(
         z,
@@ -131,6 +149,25 @@ def run_compact_triangles(
     )
     z += block.tri_att_end._cueq_ending_contiguous_forward(z, mask)
     return finish_block(block, s, z, mask)
+
+
+def make_triangle_update_plan(
+    block,
+    lengths: list[int],
+    config: ContractConfig,
+    producer: str,
+) -> TriangleUpdatePlan:
+    if producer == "direct":
+        dense_offsets = grouped_dense_offsets(lengths)
+        descriptors = None
+    else:
+        dense_offsets, descriptors = make_metadata(lengths, config)
+    return TriangleUpdatePlan(
+        dense_offsets=dense_offsets,
+        descriptors=descriptors,
+        weights_out=cached_weights(block.tri_mul_out),
+        weights_in=cached_weights(block.tri_mul_in),
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -172,8 +209,9 @@ def main() -> None:
         )
         candidates = []
         for producer in args.producer:
+            plan = make_triangle_update_plan(block, args.lengths, args.config, producer)
             candidate_out, timing = cuda_time(
-                lambda producer=producer: run_compact_triangles(
+                lambda producer=producer, plan=plan: run_compact_triangles(
                     block,
                     s,
                     z,
@@ -181,6 +219,7 @@ def main() -> None:
                     args.lengths,
                     args.config,
                     producer,
+                    plan,
                 ),
                 args.warmup,
                 args.iters,
