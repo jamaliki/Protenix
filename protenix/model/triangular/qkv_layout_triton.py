@@ -47,8 +47,9 @@ _SUPPORTED_DTYPES = {torch.bfloat16, torch.float16, torch.float32}
 # The q/k/v layout pass is a pure HBM streaming kernel.  H100 screens at both
 # base and Protenix-v2 pairformer shapes found that a smaller 256-element tile
 # gives the memory system a better schedule than the original 1024-element
-# tile.  Keep this as a single conservative default; the full PairformerBlock
-# gate must still move before this belongs in the promoted branch.
+# tile.  The full v2 PairformerBlock gate moved only a few tenths of a percent,
+# but repeated in the expected triangle-attention subranges; base-shape guards
+# were neutral, so a single conservative default is simpler than a shape knob.
 _BLOCK_SIZE = 256
 _FALSE_ENV_VALUES = {"0", "false", "off", "no"}
 

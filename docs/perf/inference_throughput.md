@@ -316,6 +316,36 @@ fewer warps, 2-stage or 4-stage variants, and larger `M` tiles either regressed
 or exceeded H100 shared-memory limits, so do not keep searching this local tile
 neighborhood without a new kernel design.
 
+Q/k/v layout tile retune: commit `dc6ad3c` added
+`scripts/perf/qkv_layout_tile_probe.py` to recheck the CUEQ q/k/v layout
+producer at the v2 shape rather than relying on earlier base-model screens.
+Job `102036`
+(`runs/v2_qkv_layout_tile_probe_20260704_070925_dc6ad3c`) found exact parity
+for all candidates.  The best tile was the same smaller block previously seen
+in the base screen: `256` elements with 4 warps.
+
+| layout | current `1024,w4` | best `256,w4` | isolated speedup |
+| --- | ---: | ---: | ---: |
+| normal starting-node layout | 2.169 ms | 2.096 ms | 1.035x |
+| swapped ending-node layout | 2.461 ms | 2.329 ms | 1.057x |
+
+Commit `e8fd24f` changes the production layout tile from `1024` to `256`.
+Because the expected full-block gain is tiny, this was repeated before
+promotion:
+
+| gate | baseline | candidate | total block | triangle-attention movement | decision |
+| --- | ---: | ---: | ---: | --- | --- |
+| v2 B32/N251, job `102055` | `dc6ad3c` | `e8fd24f` | `72.731 -> 72.553 ms` (`1.002x`) | start/end `16.542/17.612 -> 16.468/17.494 ms` | promote, small |
+| v2 B32/N251 repeat, job `102067` | `dc6ad3c` | `e8fd24f` | `72.728 -> 72.448 ms` (`1.004x`) | start/end `16.544/17.612 -> 16.452/17.484 ms` | repeat confirms |
+| base B32/N251, job `102055` | `dc6ad3c` | `e8fd24f` | `37.514 -> 37.326 ms` (`1.005x`) | start/end both moved slightly | guard positive/no issue |
+| base B32/N251 repeat, job `102067` | `dc6ad3c` | `e8fd24f` | `37.438 -> 37.459 ms` (`0.999x`) | start/end moved, other terms offset | neutral guard |
+
+Decision: promote as a tiny, exact, no-knob cleanup because the v2 target
+repeated in the predicted subranges and the base guard was neutral.  Do not
+spend more time hill-climbing this one-dimensional layout tile; the remaining
+q/k/v/layout win requires removing a broader producer/consumer boundary, not
+another block-size tweak.
+
 Host-prefetch gate: job `99731`, run directory
 `runs/prefetch_gate_20260704_013822_0e4d701`, commit `0e4d701`, one H100,
 base checkpoint, synthetic 256-record campaign made by repeating the same 32
@@ -3598,7 +3628,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Naive fused Triton triangle attention | correct at N64, but B16/N245 slowed from 4.24-4.26 ms to 6.22-7.78 ms | the right boundary still needs a vendor-quality CUEQ/CuTe schedule |
 | Replacing CUEQ triangle attention with existing `triattention` or torch backends | actual-shape one-block screens were slower: TriAttention `1.11-1.15x` slower, torch about `1.9-2.3x` slower | keep CUEQ; target its layout/wrapper/epilogue boundaries instead |
 | CUEQ triangle-multiplication ONDEMAND tuning | total B64 block +0.34%; current-head repeat gave only +0.52% at `B32, N251` and +1.31% at `B16, N220` despite real 2.7-5.6% triangle-mul wins | the shipped/default schedule is close enough; do not require users to create per-shape CUEQ caches for normal inference |
-| CUEQ q/k/v layout block-size retuning | block `256` beat the current `1024` by 3.7-4.2% in isolation, but only saves `0.04-0.12` ms per layout launch | do not promote tiny tile retunes without a full-gate signal |
+| Early CUEQ q/k/v layout block-size retuning | block `256` beat the old `1024` by 3.7-4.2% in isolation, but the first base-only screen did not justify a knob | later v2 B32/N251 gates repeated in the predicted subranges, so `256` is now the simple default; further tile-only hill-climbs are not worth pursuing |
 | Logical ending-node triangle attention without explicit pair transposes | bitwise exact one-block screen but only `1.0076-1.0089x` at B32/B64/B96 | explicit pair-tensor orientation copies are measurable but not the dominant pairformer boundary |
 | Default BF16 full-token attention after the promoted stack | isolated trunk-attention hotspot improved, but full exact-shape gates moved only +0.16% at B64 and +0.27% at B96 | do not promote dtype-policy changes unless the representative throughput gate moves, not just the local kernel |
 | Inference DataLoader workers for exact-shape batches | B8 had a small screen win, but B32 hit tensor-sharing failures unless switched to slower file-system sharing; clean B32 no-worker batching was better | do not add host-pipeline complexity unless it survives the actual many-input gate |
