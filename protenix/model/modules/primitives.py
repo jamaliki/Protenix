@@ -38,6 +38,10 @@ from protenix.model.modules.fused_elementwise_triton import (
     triton_silu_mul_inplace_y,
     triton_silu_mul_split,
 )
+from protenix.model.modules.transition_dual_gemm_triton import (
+    triton_dual_gemm_silu_product,
+    triton_transition_dual_gemm_enabled,
+)
 
 
 def _try_triton_local_attention(
@@ -342,30 +346,36 @@ class Transition(nn.Module):
         )
         self._input_projection_cache_key = None
         self._input_projection_weight = None
+        self._dual_gemm_weight_cache_key = None
+        self._dual_gemm_weight_a = None
+        self._dual_gemm_weight_b = None
 
     def _can_fuse_input_projection(self, x: torch.Tensor) -> bool:
-        if not transition_input_projection_fusion_enabled():
-            return False
-        if not triton_fused_elementwise_enabled():
-            return False
-        if not triton_fused_elementwise_available():
+        if not (
+            transition_input_projection_fusion_enabled()
+            or triton_transition_dual_gemm_enabled()
+        ):
             return False
         if torch.is_grad_enabled():
             return False
         if not x.is_cuda:
             return False
         hidden = self.n * self.c_in
-        # The fused producer writes a [rows, 2 * hidden] activation before the
-        # split-aware SiLU kernel consumes it.  That is worthwhile at B64/N245
-        # but too memory-heavy at larger batches, so large shapes stay on the
-        # original two-GEMM path instead of trading speed for a huge transient.
-        projected_elements = x.shape[0] * (2 * hidden)
-        if projected_elements > transition_input_projection_max_elements():
-            return False
         return (
             self.linear_no_bias_a.weight.shape == (hidden, self.c_in)
             and self.linear_no_bias_b.weight.shape == (hidden, self.c_in)
         )
+
+    def _can_use_wide_input_projection(self, x: torch.Tensor) -> bool:
+        if not transition_input_projection_fusion_enabled():
+            return False
+        if not triton_fused_elementwise_enabled():
+            return False
+        if not triton_fused_elementwise_available():
+            return False
+        hidden = self.n * self.c_in
+        projected_elements = x.shape[0] * (2 * hidden)
+        return projected_elements <= transition_input_projection_max_elements()
 
     def _input_projection_params(self) -> torch.Tensor:
         weights = (self.linear_no_bias_a.weight, self.linear_no_bias_b.weight)
@@ -380,8 +390,39 @@ class Transition(nn.Module):
             self._input_projection_cache_key = cache_key
         return self._input_projection_weight
 
+    def _dual_gemm_params(
+        self,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weights = (self.linear_no_bias_a.weight, self.linear_no_bias_b.weight)
+        cache_key = tuple(
+            (weight.data_ptr(), weight._version, dtype, device) for weight in weights
+        )
+        if cache_key != self._dual_gemm_weight_cache_key:
+            # The production parameters are stored in FP32, while the inference
+            # matmuls usually run under BF16 autocast.  Cache explicit
+            # dtype-matched contiguous views; otherwise every transition call
+            # would allocate/cast weights and hide the kernel win behind Python
+            # overhead.
+            self._dual_gemm_weight_a = weights[0].to(
+                device=device, dtype=dtype
+            ).contiguous()
+            self._dual_gemm_weight_b = weights[1].to(
+                device=device, dtype=dtype
+            ).contiguous()
+            self._dual_gemm_weight_cache_key = cache_key
+        return self._dual_gemm_weight_a, self._dual_gemm_weight_b
+
     def _fused_input_projection(self, x: torch.Tensor) -> Optional[torch.Tensor]:
         if not self._can_fuse_input_projection(x):
+            return None
+        if triton_transition_dual_gemm_enabled():
+            weight_a, weight_b = self._dual_gemm_params(dtype=x.dtype, device=x.device)
+            projected = triton_dual_gemm_silu_product(x, weight_a, weight_b)
+            if projected is not None:
+                return projected
+        if not self._can_use_wide_input_projection(x):
             return None
         projected = F.linear(x, self._input_projection_params())
         return triton_silu_mul_split(projected, self.n * self.c_in)
