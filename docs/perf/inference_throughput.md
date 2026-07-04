@@ -4686,6 +4686,33 @@ short-term implementation ladder is:
    triangle-update design, not enough to justify shipping the whole direct
    PyTorch-`bmm` benchmark path into normal inference.
 
+   Fused output-finish follow-up: commit `7cb53ab` added an opt-in
+   `--finish fused_output` path to the same direct producer-owned benchmarks.
+   It keeps the exact-group contraction unchanged, but replaces the
+   post-contraction `LayerNorm -> CUEQ gated dual-GEMM -> compact scatter/residual`
+   sequence with two Protenix-owned Triton launches: tiled update row
+   statistics, then output gate/value GEMMs that scatter the residual directly
+   into the padded dense tensor.  Direct-update job `110793`
+   (`runs/fused_output_direct_retry2_f7967df_20260704_233454`) showed the
+   intended isolated effect:
+
+   | direct update gate | current finish | fused output finish | valid-region drift |
+   | --- | ---: | ---: | --- |
+   | short incoming | `2.440 -> 1.155 ms` (`2.11x`) | `2.442 -> 0.809 ms` (`3.02x`) | fused max `0.03125`, mean `3.05e-4` |
+   | short outgoing | `2.454 -> 1.177 ms` (`2.08x`) | `2.455 -> 0.826 ms` (`2.97x`) | fused max `0.03125`, mean `3.07e-4` |
+   | long incoming | `4.125 -> 3.334 ms` (`1.24x`) | `4.119 -> 3.273 ms` (`1.26x`) | fused max `0.03125`, mean `3.06e-4` |
+   | long outgoing | `4.223 -> 3.385 ms` (`1.25x`) | `4.220 -> 3.327 ms` (`1.27x`) | fused max `0.03125`, mean `3.07e-4` |
+
+   But the full long-block repeat, job `110794`
+   (`runs/fused_output_pairformer_repeat_f7967df_20260704_233650`), diluted
+   that into a tiny enclosing-block movement: current finish was
+   `25.943 -> 24.987 ms` (`1.038x`), while fused output finish was
+   `26.001 -> 24.887 ms` (`1.045x`).  The fused path also raised valid-region
+   `z` mean drift from `0.00230` to `0.00349` and max drift from `0.0625` to
+   `0.078125`.  Decision: keep this only as an opt-in benchmark for learning
+   about the output fusion boundary; do not promote it to default or production
+   without a larger long-bucket/end-to-end win and a real numerical audit.
+
    Pairformer CUDA graph follow-up: commit `75761ba` added
    `scripts/perf/pairformer_cudagraph_probe.py` to check whether launch/Python
    overhead is a large enough target before committing to native CuTe kernels.
@@ -5138,6 +5165,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | PyTorch assembly inside the first direct producer-owned triangle-update screen | the direct producer was correct for shuffled mixed lengths, but the first long v2 bucket still lost (`0.91-0.92x`) because `permute(...).reshape(...)` materialized exact-group `bmm` outputs and spent about `1.0 ms` per update in `reshape`/`clone`/`copy_` | wrapper layout debt can erase the whole segmented-work win; replacing this with a Triton tiled copy made the same direct boundary positive (`1.15-1.16x`) on the long bucket |
 | Full dense `masked_fill` invalid-row zeroing in the direct producer-owned block probe | after caching setup outside timing, the short block improved (`1.24x`) but the long block still regressed (`0.96x`) because every compact update paid a dense padded-row materialization pass | precompute invalid row offsets and zero only padded rows; this turned the same direct block positive (`1.31x` short, repeated `1.019x` long before the later row-stat tiling), though still not enough for promotion |
 | One-row-per-program row statistics in the direct producer-owned probe | profiler-attributed scopes showed `_compact_row_stats_kernel` costing about `0.40 ms` per triangle update on the long v2 bucket; tiling eight compact rows per Triton program reduced repeated direct-update producer time from about `1.80 ms` to `1.55 ms` and moved the full long block from scalar-direct `25.39 ms` to tiled-direct `24.92 ms` | row-stat tiling is a real cleanup of the benchmark boundary and should be the default for future direct screens, but the long full-block win is still only `1.043x` versus padded CUEQ, so production promotion still needs a larger fused/native boundary |
+| Fusing direct output LayerNorm/gate/scatter in a benchmark kernel | direct short updates improved strongly (`~2.1x -> ~3.0x`) and long updates improved slightly (`~1.24x -> ~1.26x`), but the repeated long full-block gain over current direct was only `24.987 -> 24.887 ms`; valid-region mean drift was also higher (`z` mean `0.00230 -> 0.00349`) | useful evidence that the output boundary is fusible, but too small and numerically different to promote; keep it as an opt-in benchmark only |
 | Compact valid-row triangle-multiplication bridge | valid-only compact row work was slower than padded CUEQ (`0.70x` short, `0.27x` long), and scattering back to padded layout was worse | do not bridge compact row-wise work through dense `a/b` tensors; a real segmented native update must stay segmented through contraction and output |
 | Compact segmented triangle-multiplication update inside a full v2 `PairformerBlock` | isolated short-bucket update improved, but the full block slowed badly: short `10.237 -> 27.144 ms` best (`0.38x`), long `25.791 -> 123.764 ms` best (`0.21x`) | the dense-ABI compact bridge pays too much pack/scatter, invalid-row zeroing, and custom-contraction cost; the next attempt needs a native vendor-quality CuTe/SM90 segmented update |
 | Unguarded fused triangle-multiplication input LayerNorm + dual-GEMM producer | short v2 blocks improved about `1.08x`, but long `B16/N220` blocks slowed to `0.94x`; the path is now default-off and guarded to <=300k physical pair rows | local producer fusion can be shape-specific; do not enable it globally for Sam-style v2 campaigns unless the long bucket is protected by fallback |
@@ -5306,7 +5334,10 @@ Profiling and reproducibility helpers:
   `permute(...).reshape(...)` materialization.  Current result: finish-only is
   positive even on the long v2 bucket (`~2.32x`), so a native producer-owned
   exact-group kernel is justified; not a production speedup by itself because
-  producer materialization is excluded in this upper-bound script.
+  producer materialization is excluded in this upper-bound script.  The optional
+  `--finish fused_output` path tests a Protenix-owned output LayerNorm +
+  gate/value + scatter boundary; it is useful for design evidence but not
+  promoted because the long full-block movement is too small.
 - `scripts/perf/triangle_update_producer_owned_direct_probe.py`: direct
   producer-owned follow-up.  It makes the input LayerNorm + dual-GEMM producer
   write exact-length grouped contractor tensors itself, and validates both
