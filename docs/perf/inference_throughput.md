@@ -4659,6 +4659,33 @@ short-term implementation ladder is:
    residual into the block-native layout so the long-bucket win is large enough
    to survive 48 blocks and end-to-end inference.
 
+   Row-stat tiling follow-up: the synchronized profiler at commit `5008b3f`
+   showed a smaller but clean direct-producer bottleneck.  The direct path still
+   used `_compact_row_stats_kernel`, one Triton program per compact row, for
+   the input LayerNorm statistics.  On the long v2 block this cost about
+   `0.40 ms` per triangle update, so two updates paid about `0.8 ms` before the
+   producer GEMMs even started.  Commit `2f4c111` added a tiled variant that
+   computes FP32 statistics for several compact rows per program.  Job `110776`
+   (`runs/rowstats_tiled_2f4c111_20260704_231639`) screened scalar row stats
+   and tiled `block_rows={2,4,8}` on the Sam-style buckets; `block_rows=8` was
+   best.  Repeat job `110782`
+   (`runs/rowstats_tiled_repeat_2f4c111_20260704_232027`) used 30 timed
+   iterations on the long bucket:
+
+   | long v2 gate | scalar row stats | tiled row stats, 8 rows/program | interpretation |
+   | --- | ---: | ---: | --- |
+   | direct update, incoming | `4.134 -> 3.615 ms` (`1.144x`) | `4.131 -> 3.318 ms` (`1.245x`) | producer-only subrange `1.801 -> 1.546 ms` |
+   | direct update, outgoing | `4.217 -> 3.627 ms` (`1.163x`) | `4.207 -> 3.357 ms` (`1.253x`) | producer-only subrange `1.832 -> 1.564 ms` |
+   | full `PairformerBlock`, `B16/N220` | `25.969 -> 25.392 ms` (`1.023x`) | `25.987 -> 24.915 ms` (`1.043x`) | BF16-valid parity, `z max_abs 0.0625`, no NaNs |
+
+   Decision: make the tiled eight-row statistic pass the default for future
+   direct producer-owned screens.  This is a legitimate cleanup of the
+   benchmark boundary and proves that the remaining long-bucket tax is not only
+   in contraction/output assembly.  It is still not a production model default:
+   `1.043x` at one long v2 block is useful evidence for the native fused
+   triangle-update design, not enough to justify shipping the whole direct
+   PyTorch-`bmm` benchmark path into normal inference.
+
    Pairformer CUDA graph follow-up: commit `75761ba` added
    `scripts/perf/pairformer_cudagraph_probe.py` to check whether launch/Python
    overhead is a large enough target before committing to native CuTe kernels.
@@ -5109,7 +5136,8 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Exact-group `bmm` contractor inside the compact triangle-update bridge | after fixing the benchmark's row-wise scatter, the short bucket improved (`1.21-1.59x`) with BF16-valid parity, but the long bucket still regressed to `0.68-0.79x`; profiling shows the remaining loss is mostly `torch.stack` copy/cat materialization plus compact producer/output boundary cost | exact-length work reduction is real only if the producer emits exact-group layout directly and the output/residual store is redesigned; do not promote a short-only compact bridge for Sam-style v2 |
 | No-stack strided `matmul` view for exact groups | removed explicit `torch.stack`/`cat` and slightly improved short buckets, but long buckets were worse than exact-group `bmm` (`0.72-0.74x`); profiler shows `aten::copy_` grew to about `2.33 ms` because PyTorch still materializes around the strided batch/output layout | the compact ABI cannot be rescued by PyTorch view tricks; the producer must write grouped layout directly |
 | PyTorch assembly inside the first direct producer-owned triangle-update screen | the direct producer was correct for shuffled mixed lengths, but the first long v2 bucket still lost (`0.91-0.92x`) because `permute(...).reshape(...)` materialized exact-group `bmm` outputs and spent about `1.0 ms` per update in `reshape`/`clone`/`copy_` | wrapper layout debt can erase the whole segmented-work win; replacing this with a Triton tiled copy made the same direct boundary positive (`1.15-1.16x`) on the long bucket |
-| Full dense `masked_fill` invalid-row zeroing in the direct producer-owned block probe | after caching setup outside timing, the short block improved (`1.24x`) but the long block still regressed (`0.96x`) because every compact update paid a dense padded-row materialization pass | precompute invalid row offsets and zero only padded rows; this turned the same direct block positive (`1.31x` short, repeated `1.019x` long), though still not enough for promotion |
+| Full dense `masked_fill` invalid-row zeroing in the direct producer-owned block probe | after caching setup outside timing, the short block improved (`1.24x`) but the long block still regressed (`0.96x`) because every compact update paid a dense padded-row materialization pass | precompute invalid row offsets and zero only padded rows; this turned the same direct block positive (`1.31x` short, repeated `1.019x` long before the later row-stat tiling), though still not enough for promotion |
+| One-row-per-program row statistics in the direct producer-owned probe | profiler-attributed scopes showed `_compact_row_stats_kernel` costing about `0.40 ms` per triangle update on the long v2 bucket; tiling eight compact rows per Triton program reduced repeated direct-update producer time from about `1.80 ms` to `1.55 ms` and moved the full long block from scalar-direct `25.39 ms` to tiled-direct `24.92 ms` | row-stat tiling is a real cleanup of the benchmark boundary and should be the default for future direct screens, but the long full-block win is still only `1.043x` versus padded CUEQ, so production promotion still needs a larger fused/native boundary |
 | Compact valid-row triangle-multiplication bridge | valid-only compact row work was slower than padded CUEQ (`0.70x` short, `0.27x` long), and scattering back to padded layout was worse | do not bridge compact row-wise work through dense `a/b` tensors; a real segmented native update must stay segmented through contraction and output |
 | Compact segmented triangle-multiplication update inside a full v2 `PairformerBlock` | isolated short-bucket update improved, but the full block slowed badly: short `10.237 -> 27.144 ms` best (`0.38x`), long `25.791 -> 123.764 ms` best (`0.21x`) | the dense-ABI compact bridge pays too much pack/scatter, invalid-row zeroing, and custom-contraction cost; the next attempt needs a native vendor-quality CuTe/SM90 segmented update |
 | Unguarded fused triangle-multiplication input LayerNorm + dual-GEMM producer | short v2 blocks improved about `1.08x`, but long `B16/N220` blocks slowed to `0.94x`; the path is now default-off and guarded to <=300k physical pair rows | local producer fusion can be shape-specific; do not enable it globally for Sam-style v2 campaigns unless the long bucket is protected by fallback |
@@ -5283,8 +5311,12 @@ Profiling and reproducibility helpers:
   producer-owned follow-up.  It makes the input LayerNorm + dual-GEMM producer
   write exact-length grouped contractor tensors itself, and validates both
   sorted and shuffled mixed-length batches.  Current result after tiled
-  assembly: positive on both Sam-style v2 buckets, about `2.0x` on the short
-  bucket and `1.15-1.16x` on the long bucket, with BF16-valid parity.
+  assembly and tiled producer row statistics: positive on both Sam-style v2
+  buckets, about `2.1x` on the short bucket and `1.24-1.25x` on the long
+  bucket, with BF16-valid parity.  The row-stat tile defaults to eight compact
+  rows per program because this was best in the H100 screen; use
+  `--row-stats scalar` or `--row-stat-block-rows` to reproduce the scalar
+  baseline or hill-climb a new shape.
 - `scripts/perf/pairformer_compact_segmented_triangle_update_probe.py`: full
   v2 `PairformerBlock` gate for compact/direct segmented triangle-update ideas.
   It replaces both triangle-multiplication updates, zeroes invalid pair rows
@@ -5292,9 +5324,9 @@ Profiling and reproducibility helpers:
   win survives attention/transition/token dilution.  The old compact wrapper is
   rejected (`0.37-0.38x` short bucket, `0.21x` long bucket).  The newer direct
   producer-owned mode uses cached metadata/weights plus invalid-offset zeroing;
-  it is a real block win (`1.31x` short bucket, repeated `1.019x` long bucket)
-  but still too small on the long v2 block to be a default without deeper
-  fusion and end-to-end gates.
+  with tiled row statistics it is a real block win (`1.31x` short bucket,
+  repeated `1.043x` long bucket) but still too small on the long v2 block to be
+  a production default without deeper fusion and end-to-end gates.
 - `scripts/perf/pairformer_cudagraph_probe.py`: CUDA graph replay screen for
   v2-width Pairformer blocks/stacks.  It separates pure replay from realistic
   changed-input copies so graph launch-overhead wins are not confused with

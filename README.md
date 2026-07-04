@@ -444,9 +444,14 @@ positive: about `2.0x` faster than padded CUEQ on the short v2 bucket and
 not a promoted model default.  After replacing full dense invalid-row
 `masked_fill` with a small invalid-offset zeroing kernel, the full
 `PairformerBlock` gate kept a large short-bucket win (`1.31x`) and a repeated
-small long-bucket win (`~1.02x`).  That is encouraging, but still too small on
-the long Sam-style v2 bucket to promote without deeper integration and full
-end-to-end gates.
+small long-bucket win (`~1.02x`).  The latest direct-boundary screen also tiles
+the row-statistics pass for the producer-owned LayerNorm: one Triton program
+now reduces eight compact rows instead of launching one tiny program per row.
+That moved the repeated long-bucket full-block gate from `25.99 -> 24.92 ms`
+(`1.043x` versus padded CUEQ, with BF16-scale valid-region drift).  This is
+useful learning for the native fused boundary, but still too small on the long
+Sam-style v2 bucket to promote without deeper integration and full end-to-end
+gates.
 Whole-Pairformer CUDA graph replay was also screened as a lower-risk
 launch-overhead fix.  It was exact and helped the short v2 bucket by about
 `3%`, but the full 48-block long bucket was flat (`~1.00x`) once changed

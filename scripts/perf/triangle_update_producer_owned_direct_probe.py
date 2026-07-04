@@ -206,7 +206,7 @@ def direct_owned_groups(
     weights: dict[str, torch.Tensor],
     *,
     row_stats: str = "tiled",
-    row_stat_block_rows: int = 4,
+    row_stat_block_rows: int = 8,
 ) -> tuple[torch.Tensor, list[OwnedGroup]]:
     rows = dense_offsets.numel()
     mean = torch.empty(rows, device=z.device, dtype=torch.float32)
@@ -274,7 +274,7 @@ def direct_owned_update(
     weights: dict[str, torch.Tensor],
     *,
     row_stats: str = "tiled",
-    row_stat_block_rows: int = 4,
+    row_stat_block_rows: int = 8,
 ) -> torch.Tensor:
     x_norm, groups = direct_owned_groups(
         module,
@@ -302,7 +302,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--row-stats", choices=["scalar", "tiled"], default="tiled")
-    parser.add_argument("--row-stat-block-rows", type=int, default=4)
+    parser.add_argument("--row-stat-block-rows", type=int, default=8)
     parser.add_argument("--output-json")
     return parser.parse_args()
 

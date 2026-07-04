@@ -251,7 +251,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--randomize-zero-weights", type=str_bool, default=True)
     parser.add_argument("--direct-row-stats", choices=["scalar", "tiled"], default="tiled")
-    parser.add_argument("--direct-row-stat-block-rows", type=int, default=4)
+    parser.add_argument("--direct-row-stat-block-rows", type=int, default=8)
     parser.add_argument("--output-json")
     return parser.parse_args()
 
