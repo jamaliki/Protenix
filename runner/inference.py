@@ -18,6 +18,7 @@ import time
 import traceback
 import urllib.request
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Mapping as MappingABC
 from contextlib import nullcontext
 from numbers import Number
@@ -1038,6 +1039,33 @@ def _dump_prediction(
     )
 
 
+def _dump_worker_count(batch_size: int) -> int:
+    """Return the number of host-side dump workers for one completed batch.
+
+    Dumping is CPU/file-system work after GPU prediction has synchronized:
+    tensors are copied to CPU, CIF text is generated, and confidence JSON files
+    are written.  For throughput campaigns this can be parallelized across
+    independent records, but keep it opt-in because extra threads can hurt small
+    interactive runs or overloaded filesystems.
+    """
+    try:
+        requested = int(os.getenv("PROTENIX_DUMP_WORKERS", "1"))
+    except ValueError:
+        requested = 1
+    return max(1, min(batch_size, requested))
+
+
+def _dump_prediction_item(
+    runner: InferenceRunner,
+    data: Mapping[str, Any],
+    atom_array: Any,
+    seed: int,
+    prediction: Mapping[str, Any],
+) -> str:
+    _dump_prediction(runner, data, atom_array, seed, prediction)
+    return str(data["sample_name"])
+
+
 def _describe_batch(
     items: list[tuple[dict[str, Any], Any]], seed: int, batch_mode: str
 ) -> None:
@@ -1307,22 +1335,50 @@ def _predict_and_dump_items(
     split_start = time.perf_counter()
     predictions = _prediction_items(prediction, configs, batch_size)
     split_sec = time.perf_counter() - split_start
-    dump_sec = 0.0
-    for prediction_i, (data, atom_array) in zip(predictions, items):
-        dump_start = time.perf_counter()
-        _dump_prediction(runner, data, atom_array, seed, prediction_i)
-        dump_sec += time.perf_counter() - dump_start
-        logger.info(
-            "[Rank %s] %s [seed:%s] succeeded in batched forward. "
-            "Results saved to %s",
-            DIST_WRAPPER.rank,
-            data["sample_name"],
-            seed,
-            configs.dump_dir,
-        )
+    dump_start = time.perf_counter()
+    dump_workers = _dump_worker_count(batch_size)
+    if dump_workers == 1:
+        for prediction_i, (data, atom_array) in zip(predictions, items):
+            _dump_prediction_item(runner, data, atom_array, seed, prediction_i)
+            logger.info(
+                "[Rank %s] %s [seed:%s] succeeded in batched forward. "
+                "Results saved to %s",
+                DIST_WRAPPER.rank,
+                data["sample_name"],
+                seed,
+                configs.dump_dir,
+            )
+    else:
+        # Each record writes into a distinct output directory and owns a
+        # separate prediction slice/AtomArray.  Parallelizing at record
+        # granularity avoids mutating one AtomArray from multiple threads while
+        # overlapping CPU CIF/JSON serialization and filesystem writes.
+        with ThreadPoolExecutor(max_workers=dump_workers) as executor:
+            futures = [
+                executor.submit(
+                    _dump_prediction_item,
+                    runner,
+                    data,
+                    atom_array,
+                    seed,
+                    prediction_i,
+                )
+                for prediction_i, (data, atom_array) in zip(predictions, items)
+            ]
+            for future in as_completed(futures):
+                sample_name = future.result()
+                logger.info(
+                    "[Rank %s] %s [seed:%s] succeeded in batched forward. "
+                    "Results saved to %s",
+                    DIST_WRAPPER.rank,
+                    sample_name,
+                    seed,
+                    configs.dump_dir,
+                )
+    dump_sec = time.perf_counter() - dump_start
     logger.info(
         "[Rank %s] Finished %d/%d input(s) [seed:%s] in %.2fs "
-        "(predict %.2fs, split %.2fs, dump %.2fs).",
+        "(predict %.2fs, split %.2fs, dump %.2fs, dump_workers %d).",
         DIST_WRAPPER.rank,
         batch_size,
         num_data,
@@ -1331,6 +1387,7 @@ def _predict_and_dump_items(
         predict_sec,
         split_sec,
         dump_sec,
+        dump_workers,
     )
     torch.cuda.empty_cache()
 
