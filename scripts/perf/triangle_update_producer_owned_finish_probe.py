@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import triton
+import triton.language as tl
 
 from scripts.perf.triangle_update_compact_segmented_probe import (
     C_Z,
@@ -101,13 +103,42 @@ def contract_groups(groups: list[OwnedGroup], direction: str) -> list[torch.Tens
     return [torch.bmm(group.lhs.transpose(1, 2), group.rhs) for group in groups]
 
 
+@triton.jit
+def _assemble_grouped_update_kernel(
+    contracted,
+    update,
+    group_start: tl.constexpr,
+    group_rows: tl.constexpr,
+    length: tl.constexpr,
+    channels: tl.constexpr,
+    block_rows: tl.constexpr,
+    block_c: tl.constexpr,
+) -> None:
+    # ``torch.bmm`` returns each exact-length group as
+    # [record * channel, i, j].  The output projection wants row-major compact
+    # rows [record, i, j, channel].  A naive ``permute(...).reshape(...)`` makes
+    # PyTorch clone every group; this tiled copy does only the required layout
+    # move and keeps the tax visible as one small kernel per exact length.
+    row = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
+    c = tl.program_id(1) * block_c + tl.arange(0, block_c)
+    pair_rows = length * length
+    record = row // pair_rows
+    pair = row - record * pair_rows
+    src = contracted + (record[:, None] * channels + c[None, :]) * pair_rows + pair[:, None]
+    dst = update + (group_start + row[:, None]) * channels + c[None, :]
+    mask = (row[:, None] < group_rows) & (c[None, :] < channels)
+    tl.store(dst, tl.load(src, mask=mask, other=0.0), mask=mask)
+
+
 def assemble_update(groups: list[OwnedGroup], contracted: list[torch.Tensor], rows: int) -> torch.Tensor:
     update = contracted[0].new_empty((rows, C_Z))
     for group, result in zip(groups, contracted, strict=True):
         length = group.length
         group_rows = group.count * length * length
-        records = result.reshape(group.count, C_Z, length, length).permute(0, 2, 3, 1)
-        update[group.start : group.start + group_rows] = records.reshape(group_rows, C_Z)
+        grid = (triton.cdiv(group_rows, 16), triton.cdiv(C_Z, 64))
+        _assemble_grouped_update_kernel[grid](
+            result, update, group.start, group_rows, length, C_Z, 16, 64, num_warps=4
+        )
     return update
 
 
