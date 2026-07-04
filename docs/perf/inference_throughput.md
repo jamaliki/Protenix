@@ -4074,9 +4074,9 @@ inference path does the following for `x: [B, N, N, D]`:
 1. fused LayerNorm plus layout production;
 2. a Triton fused sigmoid-gated dual GEMM over the flattened `B*N*N` pair rows,
    optionally storing the result transposed as `[2D, B, N, N]`;
-3. a tensor-core triangular contraction, equivalent to
-   `out[d,b,i,j] = sum_k a[d,b,i,k] * b[d,b,j,k]` for outgoing updates, with
-   the analogous incoming orientation;
+3. a dense `torch.einsum` triangular contraction, dispatched by PyTorch to its
+   optimized dense matmul path, equivalent to `out[d,b,i,j] = sum_k a[d,b,i,k] *
+   b[d,b,j,k]` for outgoing updates, with the analogous incoming orientation;
 4. fused output LayerNorm/layout conversion back to `[B, N, N, D]`;
 5. a second fused gated dual GEMM for the output projection/gate.
 
@@ -4086,6 +4086,26 @@ rounded `M`, `N`, `K`, dtype, and transpose mode.  Protenix-v2's wide
 cache.  Once those tiles are supplied, the remaining CUEQ triangle-multiplication
 cost is not an obvious weak kernel; it is the dense schedule doing padded work
 for mixed token lengths.
+
+The tempting threshold shortcut was also screened.  CUEQ normally falls back to
+its pure PyTorch triangle-multiplication implementation only when physical
+`N <= 100`.  Job `109465`, run
+`runs/v2_trimul_fallback_threshold_20260704_163254_d465667`, tested forcing that
+fallback for the short v2 bucket:
+
+| threshold | bucket | block total | triangle-mul total | decision |
+| ---: | --- | ---: | ---: | --- |
+| 100 | B16/N124 | 10.669 ms | 5.039 ms | baseline |
+| 128 | B16/N124 | 15.692 ms (`0.68x`) | 10.044 ms (`0.50x`) | reject |
+| 160 | B16/N124 | 15.711 ms (`0.68x`) | 10.047 ms (`0.50x`) | reject |
+| 100 | B16/N220 | 27.151 ms | 7.871 ms | baseline |
+| 128 | B16/N220 | 27.110 ms (`1.00x`) | 7.859 ms (`1.00x`) | unchanged |
+| 160 | B16/N220 | 27.142 ms (`1.00x`) | 7.868 ms (`1.00x`) | unchanged |
+
+This rejects raising `CUEQ_TRIMUL_FALLBACK_THRESHOLD` for Protenix-v2.  The
+short bucket needs the CUEQ fused LayerNorm/GatedGEMM path even though its
+records contain many sub-100-token proteins; using the physical `N=124` PyTorch
+fallback doubles the triangle-multiplication time.
 
 The first attractive CuTe/CUDA target is therefore not "rewrite the whole
 pairformer".  It is a segmented triangle-multiplication update that keeps one
@@ -4291,6 +4311,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Forcing CUEQ triangle attention below its default `Q <= 100` PyTorch fallback threshold | useful isolated effect at `B8, N100` (`1.018 -> 0.534 ms`) but neutral at `B8, N76`, worse at `B4/B8, N52`, and neutral for the promoted B16 shapes | this explains one short-bucket artifact but cannot rescue token bucketing because the full-gate failure was dominated by diffusion/atom fragmentation |
 | Full-block ragged pairformer islands | two split buckets improved the long `136-220` block `1.15x`, but slowed the short `40-124` block to `0.66x`; exact-length groups and singletons were much slower | launch count and lost batching eat the padding savings unless the ragged schedule is a real one-launch/vendor-quality kernel |
 | Bool masks for CUEQ triangle multiplication | block screen was flat at `N=124` and only +0.5% at `N=220` | mask dtype plumbing is not a meaningful bottleneck after triangle-attention bool-mask cleanup |
+| Raising CUEQ triangle-multiplication PyTorch fallback threshold for v2 | forcing the `N=124` bucket through the PyTorch fallback doubled triangle-mul time (`5.04 -> 10.04 ms`) and slowed the block (`10.67 -> 15.69 ms`); `N=220` was unchanged | the short physical bucket still needs CUEQ's fused LayerNorm/GatedGEMM path; fallback thresholds are not the ragged-v2 fix |
 | Materializing pairformer token-attention bias as contiguous `[B, H, Q, K]` | traced pairformer SDPA shape `[16, 16, 124, 24]` moved from math-dispatch attempt to a cuDNN frontend "no valid execution plans" error; fallback timing then segfaulted in the isolated screen | the non-contiguous bias layout is not the only blocker; head_dim 24 plus dense additive bias lacks a safe cuDNN plan in this runtime, so do not pay a bias copy hoping for a backend flip |
 | CUEQ `attention_pair_bias` for diffusion token attention | native pair-bias projection needed an explicit zero LayerNorm bias, then CUEQ's internal SDPA failed with `No valid execution plans built`; forced PyTorch fallback was slower than the current full conv2d+SDPA baseline | CUEQ's wrapper is not a drop-in win here; use it only if we can call a narrower fused pair-bias producer while keeping Protenix's SDPA fallback policy |
 | Compact rank-5 diffusion pair-bias cache | stored `5x` less cached bias, but the hybrid flattened-GEMM/rank-5-SDPA screen was slower than the current expanded rank-4 cache (`29.82 -> 35.05 ms` at `N=124`, `64.06 -> 69.85 ms` at `N=220`) | memory footprint is not the active limiter; preserve the faster cuDNN rank-4 SDPA schedule unless a future workload becomes memory-bound |
