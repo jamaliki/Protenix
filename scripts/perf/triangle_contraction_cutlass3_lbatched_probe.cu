@@ -31,11 +31,20 @@ using TileShape = Shape<_128, _128, _64>;
 using ClusterShape = Shape<_2, _1, _1>;
 using UnderlyingProblemShape = Shape<int, int, int, int>;
 using GroupProblemShape = cutlass::gemm::GroupProblemShape<UnderlyingProblemShape>;
+using RowMajorStride = Stride<int64_t, Int<1>, int64_t>;
+using ColumnMajorStride = Stride<Int<1>, int64_t, int64_t>;
 
 // This is the same SM90 grouped-TMA path as the per-(feature, record) probe,
 // but the grouped problem shape is now [M, N, K, L].  L is the pair-channel
 // batch (256 in Protenix-v2), so the grouped scheduler sees B large problems
 // instead of B*D tiny problems.
+//
+// CUTLASS' convenience pointer-array tags (cutlass::layout::RowMajor*) hard
+// code the L stride to zero because normal grouped GEMM treats each problem as
+// one matrix.  This probe deliberately uses explicit CuTe stride-pointer types
+// so the L dimension walks from one pair channel to the next in the original
+// [D, B, N, N] tensor.  If this works, it answers whether a larger grouped
+// boundary can remove the metadata overhead that killed the B*D grouped probe.
 template <typename LayoutA, typename LayoutB>
 struct GroupedGemmTypes {
   using FusionOperation =
@@ -51,10 +60,10 @@ struct GroupedGemmTypes {
           ElementAccumulator,
           ElementCompute,
           void,
-          cutlass::layout::RowMajor*,
+          RowMajorStride*,
           1,
           Element,
-          cutlass::layout::RowMajor*,
+          RowMajorStride*,
           8,
           cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative,
           FusionOperation>::CollectiveOp;
@@ -198,12 +207,12 @@ torch::Tensor run_impl(torch::Tensor const& lhs, torch::Tensor const& rhs, torch
     host_b[b] = rhs_base + offset;
     host_d[b] = out_base + offset;
 
-    if constexpr (cute::is_same_v<LayoutA, cutlass::layout::RowMajor*>) {
+    if constexpr (cute::is_same_v<LayoutA, RowMajorStride*>) {
       host_stride_a[b] = InternalStrideA{n_max, _1{}, feature_stride};
     } else {
       host_stride_a[b] = InternalStrideA{_1{}, n_max, feature_stride};
     }
-    if constexpr (cute::is_same_v<LayoutB, cutlass::layout::ColumnMajor*>) {
+    if constexpr (cute::is_same_v<LayoutB, ColumnMajorStride*>) {
       host_stride_b[b] = InternalStrideB{n_max, _1{}, feature_stride};
     } else {
       host_stride_b[b] = InternalStrideB{_1{}, n_max, feature_stride};
@@ -266,9 +275,9 @@ torch::Tensor run_impl(torch::Tensor const& lhs, torch::Tensor const& rhs, torch
 torch::Tensor run_grouped_lbatched(torch::Tensor const& lhs, torch::Tensor const& rhs,
                                    torch::Tensor const& lengths, bool outgoing) {
   if (outgoing) {
-    return run_impl<cutlass::layout::RowMajor*, cutlass::layout::ColumnMajor*>(lhs, rhs, lengths);
+    return run_impl<RowMajorStride*, ColumnMajorStride*>(lhs, rhs, lengths);
   }
-  return run_impl<cutlass::layout::ColumnMajor*, cutlass::layout::RowMajor*>(lhs, rhs, lengths);
+  return run_impl<ColumnMajorStride*, RowMajorStride*>(lhs, rhs, lengths);
 }
 
 }  // namespace protenix_cutlass3_lbatched_probe
