@@ -45,6 +45,7 @@ _CHANNELS = 256
 _BLOCK_M = 64
 _BLOCK_N = 128
 _BLOCK_K = 64
+_DEFAULT_MAX_ROWS = 300_000
 
 
 def triton_triangle_ln_dual_gemm_enabled() -> bool:
@@ -59,6 +60,16 @@ def triton_triangle_ln_dual_gemm_available() -> bool:
         and layer_norm_transpose is not None
         and fused_sigmoid_gated_dual_gemm_dual_x is not None
     )
+
+
+def triton_triangle_ln_dual_gemm_max_rows() -> int:
+    raw = os.getenv("PROTENIX_TRITON_TRIANGLE_LN_DUAL_GEMM_MAX_ROWS")
+    if raw is None:
+        return _DEFAULT_MAX_ROWS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_MAX_ROWS
 
 
 if triton_triangle_ln_dual_gemm_available():
@@ -222,6 +233,10 @@ def triangle_update_with_ln_dual_gemm(
     if torch.is_grad_enabled() or z.dim() != 4 or z.dtype not in _SUPPORTED_DTYPES:
         return None
     if not z.is_cuda or not z.is_contiguous() or z.shape[-1] != _CHANNELS:
+        return None
+    rows = z.numel() // z.shape[-1]
+    max_rows = triton_triangle_ln_dual_gemm_max_rows()
+    if max_rows > 0 and rows > max_rows:
         return None
     if p_in_weight.shape != (2 * _CHANNELS, _CHANNELS):
         return None
