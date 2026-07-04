@@ -43,7 +43,6 @@ from protenix.model.utils import (
 
 
 _PROFILE_PAIRFORMER_SCOPES: Optional[bool] = None
-_COMPACT_PAIR_TRANSITION: Optional[bool] = None
 
 
 def _profile_pairformer_scopes_enabled() -> bool:
@@ -72,87 +71,6 @@ def _pairformer_scope(name: str):
     if not _profile_pairformer_scopes_enabled():
         return contextlib.nullcontext()
     return torch.profiler.record_function(f"protenix/{name}")
-
-
-def _compact_pair_transition_enabled() -> bool:
-    """Whether to skip padded pair rows in the row-wise pair transition.
-
-    The pair transition is an MLP applied independently to each `(i, j)` pair
-    row.  In mixed-length inference batches many rows are padding introduced so
-    nearby sequence lengths can share one dense PairformerBlock.  Unlike
-    triangle multiplication/attention, this sub-layer has no dependency across
-    pair rows, so it is a safe first ragged boundary: gather real rows, run the
-    existing Transition module unchanged, then scatter the update back.
-
-    This is opt-in while it is being gated end-to-end.  The surrounding dense
-    Pairformer layout is unchanged, so CUEQ triangle kernels still see the same
-    tensor shape.
-    """
-
-    global _COMPACT_PAIR_TRANSITION
-    if _COMPACT_PAIR_TRANSITION is None:
-        _COMPACT_PAIR_TRANSITION = os.getenv(
-            "PROTENIX_COMPACT_PAIR_TRANSITION", "0"
-        ).lower() not in {
-            "0",
-            "false",
-            "off",
-            "no",
-        }
-    return _COMPACT_PAIR_TRANSITION
-
-
-def _compact_pair_transition_min_padding_fraction() -> float:
-    value = os.getenv("PROTENIX_COMPACT_PAIR_TRANSITION_MIN_PADDING", "0.10")
-    try:
-        return max(0.0, min(1.0, float(value)))
-    except ValueError:
-        return 0.10
-
-
-def _pair_transition_update(
-    transition: Transition,
-    z: torch.Tensor,
-    pair_mask: Optional[torch.Tensor],
-) -> torch.Tensor:
-    """Return `transition(z)`, optionally skipping padded pair rows.
-
-    The guard deliberately keeps this as a narrow inference-only optimization:
-    no gradients, CUDA tensors, a real padding mask, and enough padding to pay
-    for gather/scatter.  Exact-shape batches therefore stay on the original
-    dense path with zero extra overhead.
-    """
-
-    if not _compact_pair_transition_enabled():
-        return transition(z)
-    if torch.is_grad_enabled() or pair_mask is None or not z.is_cuda:
-        return transition(z)
-    if pair_mask.shape != z.shape[:-1]:
-        return transition(z)
-    if z.numel() == 0:
-        return transition(z)
-
-    flat_mask = pair_mask.reshape(-1).to(dtype=torch.bool)
-    valid_rows = int(flat_mask.sum().item())
-    total_rows = flat_mask.numel()
-    if valid_rows == 0 or valid_rows == total_rows:
-        return transition(z)
-
-    padding_fraction = 1.0 - (valid_rows / total_rows)
-    if padding_fraction < _compact_pair_transition_min_padding_fraction():
-        return transition(z)
-
-    flat_z = z.reshape(total_rows, z.shape[-1])
-    valid_index = flat_mask.nonzero(as_tuple=False).squeeze(-1)
-    compact_update = transition(flat_z.index_select(0, valid_index))
-
-    # Scatter an update tensor, not a replacement `z`, so the call site can keep
-    # the same residual expression (`z += update` or `z = z + update`).  Invalid
-    # rows receive a zero update; downstream pair/token masks prevent those rows
-    # from contributing to valid tokens.
-    update = torch.zeros_like(flat_z)
-    update.index_copy_(0, valid_index, compact_update)
-    return update.reshape_as(z)
 
 
 class PairformerBlock(nn.Module):
@@ -306,7 +224,7 @@ class PairformerBlock(nn.Module):
                 with _pairformer_scope("pairformer_block/transpose_to_start"):
                     z = z.transpose(-2, -3).contiguous()
             with _pairformer_scope("pairformer_block/pair_transition"):
-                z += _pair_transition_update(self.pair_transition, z, pair_mask)
+                z += self.pair_transition(z)
         else:
             with _pairformer_scope("pairformer_block/triangle_mul_out"):
                 tmu_update = self.tri_mul_out(
@@ -376,7 +294,7 @@ class PairformerBlock(nn.Module):
                     z = z.transpose(-2, -3).contiguous()
 
             with _pairformer_scope("pairformer_block/pair_transition"):
-                z = z + _pair_transition_update(self.pair_transition, z, pair_mask)
+                z = z + self.pair_transition(z)
         if self.c_s > 0:
             token_mask = (
                 None
