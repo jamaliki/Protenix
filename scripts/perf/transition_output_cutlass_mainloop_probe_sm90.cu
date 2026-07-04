@@ -7,6 +7,7 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
 #include <cutlass/epilogue/fusion/sm90_callbacks_tma_warpspecialized.hpp>
+#include <cutlass/epilogue/thread/activation.h>
 #include <cutlass/gemm/collective/collective_builder.hpp>
 #include <cutlass/gemm/dispatch_policy.hpp>
 #include <cutlass/gemm/device/gemm_universal_adapter.h>
@@ -27,8 +28,8 @@ using TileShape = Shape<_128, _128, _64>;
 using ClusterShape = Shape<_2, _1, _1>;
 
 // This probe stores the raw accumulator as BF16.  No C tensor, residual, gate,
-// or auxiliary load is present, so differences between the two exposed entry
-// points are GEMM scheduling/layout differences rather than epilogue work.
+// or auxiliary load is present, so differences between the exposed plain-GEMM
+// entry points are GEMM scheduling/layout differences rather than epilogue work.
 using FusionOperation = cutlass::epilogue::fusion::Sm90EVT<
     cutlass::epilogue::fusion::Sm90AccFetch>;
 
@@ -79,6 +80,70 @@ using StrideB = typename Gemm::GemmKernel::StrideB;
 using StrideC = typename Gemm::GemmKernel::StrideC;
 using StrideD = typename Gemm::GemmKernel::StrideD;
 
+using ResidualScale = cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementCompute>;
+
+// D = residual + accumulator.
+//
+// This is the pairformer Transition output boundary we actually want to test:
+// the model computes the output GEMM, then the enclosing PairformerBlock adds
+// the residual pair tensor.  A useful native epilogue must preserve the GEMM
+// mainloop throughput while deleting that extra full-tensor add launch.
+using ResidualAddEVT = cutlass::epilogue::fusion::Sm90EVT<
+    cutlass::epilogue::fusion::Sm90Compute<cutlass::homogeneous_multiply_add, Element, ElementCompute, RoundStyle>,
+    ResidualScale,
+    cutlass::epilogue::fusion::Sm90SrcFetch<Element>,
+    cutlass::epilogue::fusion::Sm90AccFetch>;
+
+using ResidualScaleArguments = typename ResidualScale::Arguments;
+using ResidualAddArguments = typename ResidualAddEVT::Arguments;
+
+using ResidualCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm90,
+    cutlass::arch::OpClassTensorOp,
+    TileShape,
+    ClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAccumulator,
+    ElementCompute,
+    Element,
+    cutlass::layout::RowMajor,
+    8,
+    Element,
+    cutlass::layout::RowMajor,
+    8,
+    cutlass::epilogue::TmaWarpSpecialized,
+    ResidualAddEVT>::CollectiveOp;
+
+using ResidualCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm90,
+    cutlass::arch::OpClassTensorOp,
+    Element,
+    cutlass::layout::RowMajor,
+    8,
+    Element,
+    cutlass::layout::ColumnMajor,
+    8,
+    ElementAccumulator,
+    TileShape,
+    ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename ResidualCollectiveEpilogue::SharedStorage))>,
+    cutlass::gemm::KernelTmaWarpSpecialized>::CollectiveOp;
+
+using ResidualGemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int, int, int, int>,
+    ResidualCollectiveMainloop,
+    ResidualCollectiveEpilogue,
+    cutlass::gemm::PersistentScheduler>;
+
+using ResidualGemm = cutlass::gemm::device::GemmUniversalAdapter<ResidualGemmKernel>;
+using ResidualProblemShapeType = typename ResidualGemm::GemmKernel::ProblemShape;
+using ResidualMainloopArguments = typename ResidualGemm::GemmKernel::MainloopArguments;
+using ResidualEpilogueArguments = typename ResidualGemm::GemmKernel::EpilogueArguments;
+using ResidualStrideA = typename ResidualGemm::GemmKernel::StrideA;
+using ResidualStrideB = typename ResidualGemm::GemmKernel::StrideB;
+using ResidualStrideC = typename ResidualGemm::GemmKernel::StrideC;
+using ResidualStrideD = typename ResidualGemm::GemmKernel::StrideD;
+
 Element const* bf16_ptr(torch::Tensor const& t) {
   return reinterpret_cast<Element const*>(t.data_ptr<at::BFloat16>());
 }
@@ -95,6 +160,19 @@ void check_inputs(torch::Tensor const& b, torch::Tensor const& weight) {
   TORCH_CHECK(weight.size(1) == b.size(2), "hidden mismatch");
   TORCH_CHECK(b.is_contiguous() && weight.is_contiguous(), "all tensors must be contiguous");
   TORCH_CHECK(b.size(2) % 8 == 0 && weight.size(0) % 8 == 0, "BF16 tensor-core dimensions must be aligned");
+}
+
+void check_residual_inputs(
+    torch::Tensor const& b,
+    torch::Tensor const& weight,
+    torch::Tensor const& residual) {
+  check_inputs(b, weight);
+  TORCH_CHECK(residual.is_cuda(), "residual must be CUDA");
+  TORCH_CHECK(residual.scalar_type() == at::kBFloat16, "residual must be BF16");
+  TORCH_CHECK(residual.dim() == 3, "residual must be rank 3");
+  TORCH_CHECK(residual.size(0) == b.size(0) && residual.size(1) == b.size(1), "residual prefix mismatch");
+  TORCH_CHECK(residual.size(2) == weight.size(0), "residual output-channel mismatch");
+  TORCH_CHECK(residual.is_contiguous(), "residual must be contiguous");
 }
 
 torch::Tensor run_gemm(
@@ -139,6 +217,59 @@ torch::Tensor run_gemm(
   return out;
 }
 
+ResidualAddArguments make_residual_add_args() {
+  // The visitor tree computes 1.0 * C + Accumulator and stores BF16 D.
+  return ResidualAddArguments{
+      ResidualScaleArguments{{ElementCompute(1.0f)}},
+      {},
+      {},
+      {}};
+}
+
+torch::Tensor run_gemm_residual(
+    torch::Tensor const& b,
+    torch::Tensor const& weight,
+    torch::Tensor const& residual,
+    ResidualProblemShapeType problem_shape,
+    ResidualStrideA stride_a,
+    ResidualStrideB stride_b,
+    ResidualStrideC stride_c,
+    ResidualStrideD stride_d) {
+  auto out = torch::empty_like(residual);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto hw_info = cutlass::KernelHardwareInfo::make_kernel_hardware_info<ResidualGemmKernel>(
+      b.get_device(), 0, 0, stream);
+
+  ResidualMainloopArguments mainloop_args{bf16_ptr(b), stride_a, bf16_ptr(weight), stride_b};
+  ResidualEpilogueArguments epilogue_args{
+      make_residual_add_args(),
+      bf16_ptr(residual),
+      stride_c,
+      mutable_bf16_ptr(out),
+      stride_d};
+  typename ResidualGemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      problem_shape,
+      mainloop_args,
+      epilogue_args,
+      hw_info,
+      {}};
+
+  ResidualGemm gemm;
+  size_t workspace_size = ResidualGemm::get_workspace_size(arguments);
+  auto workspace = torch::empty(
+      {static_cast<long>(workspace_size)},
+      torch::TensorOptions().dtype(torch::kUInt8).device(b.device()));
+
+  cutlass::Status status = gemm.can_implement(arguments);
+  TORCH_CHECK(status == cutlass::Status::kSuccess, "CUTLASS residual can_implement failed");
+  status = gemm.initialize(arguments, workspace.data_ptr(), stream);
+  TORCH_CHECK(status == cutlass::Status::kSuccess, "CUTLASS residual initialize failed");
+  status = gemm.run(stream);
+  TORCH_CHECK(status == cutlass::Status::kSuccess, "CUTLASS residual run failed");
+  return out;
+}
+
 }  // namespace
 
 torch::Tensor forward_flat(torch::Tensor b, torch::Tensor weight) {
@@ -159,6 +290,31 @@ torch::Tensor forward_flat(torch::Tensor b, torch::Tensor weight) {
       StrideA{hidden, _1{}, 0},
       StrideB{hidden, _1{}, 0},
       StrideD{output_channels, _1{}, 0});
+}
+
+torch::Tensor forward_flat_residual(
+    torch::Tensor b,
+    torch::Tensor weight,
+    torch::Tensor residual) {
+  check_residual_inputs(b, weight, residual);
+  int64_t samples = b.size(0);
+  int64_t tokens = b.size(1);
+  int64_t hidden = b.size(2);
+  int64_t output_channels = weight.size(0);
+  ResidualProblemShapeType problem_shape{
+      static_cast<int>(samples * tokens),
+      static_cast<int>(output_channels),
+      static_cast<int>(hidden),
+      1};
+  return run_gemm_residual(
+      b,
+      weight,
+      residual,
+      problem_shape,
+      ResidualStrideA{hidden, _1{}, 0},
+      ResidualStrideB{hidden, _1{}, 0},
+      ResidualStrideC{output_channels, _1{}, 0},
+      ResidualStrideD{output_channels, _1{}, 0});
 }
 
 torch::Tensor forward_token_batched(torch::Tensor b, torch::Tensor weight) {
@@ -183,5 +339,6 @@ torch::Tensor forward_token_batched(torch::Tensor b, torch::Tensor weight) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward_flat", &forward_flat, "Flattened transition output GEMM CUTLASS probe");
+  m.def("forward_flat_residual", &forward_flat_residual, "Flattened transition output GEMM plus residual CUTLASS probe");
   m.def("forward_token_batched", &forward_token_batched, "Token-batched transition output GEMM CUTLASS probe");
 }

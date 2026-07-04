@@ -91,6 +91,17 @@ def cutlass_flat(b: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return _extension().forward_flat(b.contiguous(), weight_bf16)
 
 
+def cutlass_flat_residual(
+    b: torch.Tensor,
+    weight: torch.Tensor,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    weight_bf16 = _bf16_weight(weight, b.dtype)
+    return _extension().forward_flat_residual(
+        b.contiguous(), weight_bf16, residual.contiguous()
+    )
+
+
 def cutlass_token_batched(b: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     weight_bf16 = _bf16_weight(weight, b.dtype)
     return _extension().forward_token_batched(b.contiguous(), weight_bf16)
@@ -131,6 +142,7 @@ def main() -> None:
         fixture = make_fixture(block, args)
         b = fixture["b"]
         weight = fixture["weight"]
+        residual = fixture["residual"]
         hidden = b.shape[-1]
         out_channels = weight.shape[0]
 
@@ -146,6 +158,16 @@ def main() -> None:
         )
         batched_out, batched_ms = cuda_time(
             lambda: cutlass_token_batched(b, weight),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        residual_reference, baseline_residual_ms = cuda_time(
+            lambda: F.linear(b, weight) + residual,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        residual_out, flat_residual_ms = cuda_time(
+            lambda: cutlass_flat_residual(b, weight, residual),
             warmup=args.warmup,
             iters=args.iters,
         )
@@ -166,11 +188,34 @@ def main() -> None:
             "ms": baseline_ms,
             "tflops": tflops(args.samples, args.tokens, hidden, out_channels, baseline_ms),
         },
+        "baseline_cublas_plus_residual": {
+            "ms": baseline_residual_ms,
+            "tflops": tflops(
+                args.samples,
+                args.tokens,
+                hidden,
+                out_channels,
+                baseline_residual_ms,
+            ),
+        },
         "cutlass_flat": {
             "ms": flat_ms,
             "tflops": tflops(args.samples, args.tokens, hidden, out_channels, flat_ms),
             "speedup_vs_cublas": baseline_ms / flat_ms,
             "parity": max_mean_abs(reference, flat_out),
+        },
+        "cutlass_flat_residual": {
+            "ms": flat_residual_ms,
+            "tflops": tflops(
+                args.samples,
+                args.tokens,
+                hidden,
+                out_channels,
+                flat_residual_ms,
+            ),
+            "speedup_vs_cublas_plus_residual": baseline_residual_ms
+            / flat_residual_ms,
+            "parity": max_mean_abs(residual_reference, residual_out),
         },
         "cutlass_token_batched": {
             "ms": batched_ms,
