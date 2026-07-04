@@ -119,6 +119,8 @@ the GPU predicts the current batch.  It does not change model math or output
 serialization; it only overlaps host featurization with GPU work.  Keep it off
 for tiny jobs, debugging runs where exact error timing matters, or host-memory
 constrained runs because it holds one extra batch of CPU tensors/AtomArrays.
+In CUDA-MPS multi-worker mode the same flag remains valid, but the expected win
+is only `~1-2%` because concurrent workers already overlap most host stalls.
 
 The default `--batch_mode auto` chooses the fastest safe boundary for each
 bucket:
@@ -3171,6 +3173,41 @@ after removing the rejected triangle qkv weight cache:
 | CUDA MPS, `/tmp` socket | 5 | 20 | 16 | 160 | 90.46 | 1.769 | practical knee |
 | CUDA MPS, `/tmp` socket | 5 | 20 | 32 | 160 | 126.00 | 1.270 | B32 is wrong for mixed lengths |
 | CUDA MPS, `/tmp` socket | 6 | 16 | 16 | 192 | 112.04 | 1.714 | regressed |
+
+MPS dataloader-prefetch follow-up gates: commit `b69e9dc`, one H100, same 32
+mixed 40-220-token records per worker, `--batch_size 16`, five MPS workers,
+`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20`, confidence and normal dumping enabled.
+Each endpoint ran an off/on/off/on paired sequence in one allocation:
+
+`N_sample=1`, job `99888`, run directory
+`runs/mps_prefetch_nsample1_20260704_021822_b69e9dc`:
+
+| case | prefetch | generated records | wall s | wall records/s | sum predict s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| no prefetch A | off | 160 | 89.75 | 1.783 | 428.46 |
+| prefetch A | on | 160 | 88.07 | 1.817 | 429.09 |
+| no prefetch B | off | 160 | 89.24 | 1.793 | 424.97 |
+| prefetch B | on | 160 | 87.82 | 1.822 | 428.03 |
+
+Average MPS throughput moved from `1.788` to `1.819` records/s (`1.018x`).
+The summed predict time did not improve, which is expected: prefetch overlaps
+host featurization before each worker's next batch, not GPU model kernels.
+
+`N_sample=5`, job `99968`, run directory
+`runs/mps_prefetch_nsample5_20260704_023612_b69e9dc`:
+
+| case | prefetch | generated samples | wall s | wall samples/s | sum predict s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| no prefetch A | off | 800 | 142.84 | 5.601 | 682.55 |
+| prefetch A | on | 800 | 141.27 | 5.663 | 684.92 |
+| no prefetch B | off | 800 | 142.98 | 5.595 | 682.63 |
+| prefetch B | on | 800 | 141.26 | 5.663 | 684.84 |
+
+Average MPS throughput moved from `5.598` to `5.663` generated samples/s
+(`1.012x`).  Decision: keep prefetch documented for long MPS campaign shards
+because it is a small reproducible end-to-end win, but do not treat it as a
+kernel or model-forward optimization.  The MPS-mode speedup still comes from
+filling under-occupied GPU time with independent workers.
 
 Interpretation:
 

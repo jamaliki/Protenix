@@ -141,6 +141,11 @@ improved seed wall time from `412.9s` to `371.5s` (`1.11x`) with all CIF and
 confidence outputs present.  Leave it off for tiny jobs or memory/debug runs:
 it holds one extra CPU batch of tensors/AtomArrays, and input errors can surface
 from the prefetch thread rather than exactly at the consuming record.
+Under the CUDA-MPS multi-worker mode below, prefetch is still safe but the gain
+is much smaller because other workers already hide most host gaps: paired H100
+gates moved five-worker throughput from `1.79` to `1.82` records/s for
+`N_sample=1` (`1.018x`) and from `5.60` to `5.66` generated samples/s for
+`N_sample=5` (`1.012x`).
 
 The `5-6x` public CLI speedup below is the exact-shape case: every feature
 tensor, including atom-shaped tensors, has the same shape.  Real design
@@ -303,6 +308,10 @@ Important details:
   low-sample branch boundary (`0.753` generated samples/s).  Seven workers at
   `14%` reached `5.55` generated samples/s once for `N_sample=5`, but that is
   within noise while adding more memory pressure and per-shard latency.
+- Keep `PROTENIX_PREFETCH_DATALOADER=1` for long MPS campaigns if host memory
+  allows it, but treat it as a modest host-overlap polish rather than the main
+  speedup.  In paired five-worker MPS gates it added `1-2%` throughput while
+  leaving summed model-predict time essentially unchanged.
 - No-MPS multi-process concurrency helped only modestly (`4.19` generated
   samples/s at four workers), so use MPS if you choose this operational mode.
 
