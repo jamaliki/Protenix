@@ -4211,12 +4211,37 @@ short-term implementation ladder is:
    the old grouped wrapper, but it still does not justify production integration
    as a standalone contraction replacement.
 
-   Decision: reject simple library-wrapper contraction paths for Protenix-v2.
-   The next kernel attempt should fuse a larger triangle-multiplication boundary
-   so custom scheduling amortizes metadata over LayerNorm, gated projections,
-   contraction, output normalization, and residual store.  Do not spend more
-   effort on another bare grouped-GEMM wrapper unless its design specifically
-   removes the `4096` tiny-problem scheduler cost.
+   Triton segmented scheduler follow-up: commits `d2cda3e` and `4125803` added
+   `scripts/perf/triangle_contraction_triton_segmented_probe.py`.  This was the
+   non-library version of the same question: one Triton launch, direct
+   per-record length checks, no host-built CUTLASS grouped problem descriptors,
+   and zero invalid-region stores.  Job `109450`, run
+   `runs/triangle_contraction_triton_segmented_20260704_162905_4125803`, ran the
+   full v2 bucket screen:
+
+   | bucket / direction | dense `einsum` | best Triton segmented | decision |
+   | --- | ---: | ---: | --- |
+   | short outgoing | 0.175 ms | 0.315 ms (`0.56x`) | reject |
+   | short incoming | 0.154 ms | 0.336 ms (`0.46x`) | reject |
+   | long outgoing | 0.826 ms | 1.798 ms (`0.46x`) | reject |
+   | long incoming | 0.751 ms | 1.901 ms (`0.40x`) | reject |
+
+   The Triton path is correct at BF16 contraction tolerance (`max_abs` up to
+   `0.25`) and writes exactly zero invalid regions, so this is a clean
+   scheduling result rather than a correctness failure.  The failure mode is
+   that a hand-written `tl.dot` tile over many small per-feature contractions is
+   nowhere near the vendor dense batched/einsum schedule.  Removing CUTLASS
+   grouped metadata was not enough; the matmul mainloop itself also has to be
+   vendor-quality or fused with enough surrounding work to amortize the loss.
+
+   Decision: reject all bare contraction replacements tried so far: cuBLAS
+   exact-length calls, old CUTLASS grouped, CUTLASS 3 grouped, and direct Triton
+   segmented scheduling.  The next kernel attempt should fuse a larger
+   triangle-multiplication boundary so custom scheduling amortizes overhead over
+   LayerNorm, gated projections, contraction, output normalization, and residual
+   store.  Do not spend more effort on another standalone contraction wrapper
+   unless its design specifically preserves a CUEQ/cuBLAS/CUTLASS-class
+   tensor-core mainloop while eliminating padded work.
 2. **Full segmented triangle-mul update:** fuse or internally schedule the
    LayerNorm, gated input projection, segmented contraction, output LayerNorm,
    output projection/gate, and residual store for valid rows.  This is the first
@@ -4397,6 +4422,11 @@ Profiling and reproducibility helpers:
   outgoing contraction, but regresses short buckets and is flat for long
   incoming; use this as evidence that the next v2 kernel needs a wider fused
   triangle-multiplication boundary, not another bare grouped-GEMM wrapper.
+- `scripts/perf/triangle_contraction_triton_segmented_probe.py`: direct Triton
+  segmented contraction screen.  It removes host-built grouped-GEMM metadata and
+  writes zero invalid regions in one launch, but is still much slower than dense
+  `einsum`; use it as evidence that a non-vendor standalone contraction
+  mainloop is the wrong boundary.
 - `scripts/perf/submit_tokyo_triangle_attention_ncu.sh` and
   `scripts/perf/tokyo_triangle_attention_ncu.sbatch`: Tokyo one-H100 Nsight
   Compute capture for one starting or ending CUEQ triangle-attention module.
