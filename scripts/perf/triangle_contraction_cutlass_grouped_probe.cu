@@ -98,8 +98,10 @@ torch::Tensor run_impl(torch::Tensor const& lhs, torch::Tensor const& rhs, torch
 
   for (int p = 0; p < problem_count; ++p) {
     auto item = order[p];
+    int aligned_length = ((item.length + 7) / 8) * 8;
+    TORCH_CHECK(aligned_length <= n_max, "aligned problem length exceeds padded storage");
     int64_t offset = (item.feature * batch + item.batch_index) * matrix_stride;
-    host_problem_sizes[p] = cutlass::gemm::GemmCoord(item.length, item.length, item.length);
+    host_problem_sizes[p] = cutlass::gemm::GemmCoord(aligned_length, aligned_length, aligned_length);
     host_a[p] = lhs_base + offset;
     host_b[p] = rhs_base + offset;
     host_c[p] = out_base + offset;
