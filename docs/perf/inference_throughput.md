@@ -4371,6 +4371,27 @@ short-term implementation ladder is:
    predict delta is not enough to promote because pairformer barely moved and
    diffusion timing drifted between repeats, which this flag should not
    mechanistically affect.
+
+   Probe audit follow-up: commit `1921b22` fixed an unfair extra `z.clone()` in
+   `scripts/perf/triangle_multiplication_ln_dualgemm_full_probe.py` and reran a
+   producer-tile hill-climb in job `109738`,
+   `runs/triangle_ln_dualgemm_tile_hillclimb_fixed_20260704_180354_1921b22`.
+   The existing production tile (`64x128x64`, 4 warps, 3 stages) remained best
+   in that standalone composition, with apparent full triangle-mul-boundary
+   speedups of `1.11-1.13x` on the short and long v2 buckets.  However, the
+   authoritative PairformerBlock confirmation job `109741`,
+   `runs/v2_triangle_ln_dualgemm_block_confirm_20260704_180622_1921b22`,
+   reproduced the earlier promotion result:
+
+   | v2 bucket | block off | block forced on | triangle-mul movement | decision |
+   | --- | ---: | ---: | --- | --- |
+   | short variable `B16/N124` | 10.124 ms | 9.365 ms (`1.081x`) | outgoing `2.583 -> 2.148 ms`, incoming `2.416 -> 2.105 ms` | useful short-shape opt-in |
+   | long variable `B16/N220` | 25.528 ms | 27.152 ms (`0.940x`) | outgoing `3.960 -> 4.779 ms`, incoming `3.894 -> 4.707 ms` | reject unguarded |
+
+   This closes the tile-hillclimb escape hatch: the long-bucket loss is not
+   fixed by nearby producer tiles, and the standalone full-probe composition is
+   not promotion evidence when it disagrees with the block.  Keep using the
+   PairformerBlock and full Sam-style v2 gates for default decisions.
 2. **Full segmented triangle-mul update:** fuse or internally schedule the
    LayerNorm, gated input projection, segmented contraction, output LayerNorm,
    output projection/gate, and residual store for valid rows.  This is the first

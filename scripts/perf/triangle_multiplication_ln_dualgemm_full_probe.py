@@ -6,6 +6,10 @@ output gate also needs the normalized input tensor.  This script tests the
 realistic boundary: the Triton producer writes both the projected `[2D,B,N,N]`
 layout and the normalized `[B,N,N,D]` tensor, then the rest of triangle
 multiplication is identical to the current CUEQ/PyTorch composition.
+
+Use this as a tile/prototype screen only.  The PairformerBlock benchmark is the
+promotion gate because this standalone composition has disagreed with the
+block-level movement for long Protenix-v2 buckets.
 """
 
 from __future__ import annotations
