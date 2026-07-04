@@ -164,6 +164,24 @@ if triton is not None and tl is not None:
             mask=q_mask[:, None] & d_mask[None, :],
         )
 
+    @triton.jit
+    def _sigmoid_mul_flat_fwd(
+        gate_ptr,
+        value_ptr,
+        out_ptr,
+        n_elements: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        """One-pass ``sigmoid(gate) * value`` for a contiguous flattened epilogue."""
+
+        pid = tl.program_id(0)
+        offsets = (pid * block_size + tl.arange(0, block_size)).to(tl.int64)
+        mask = offsets < n_elements
+        gate = tl.load(gate_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        value = tl.load(value_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        out = (1.0 / (1.0 + tl.exp(-gate))) * value
+        tl.store(out_ptr + offsets, out, mask=mask)
+
 
 def parse_ints(text: str) -> list[int]:
     values = [int(item) for item in text.split(",") if item.strip()]
@@ -372,6 +390,47 @@ def triton_varlen_core(
     return out
 
 
+def triton_heads_last_wrap_up(
+    module: TriangleAttention,
+    heads_last: torch.Tensor,
+    q_x: torch.Tensor,
+) -> torch.Tensor:
+    """Gate/flatten a heads-last attention result before the output projection.
+
+    CUEQ's promoted path already has a specialized epilogue because it returns
+    ``[..., H, Q, D]`` and the ordinary transpose+flatten becomes real HBM
+    traffic.  The varlen probe returns ``[..., Q, H, D]`` directly, so it does
+    not need that transpose fix.  It may still lose time to separate PyTorch
+    sigmoid and multiply launches.  This benchmark-only helper tests the clean
+    lower bound: keep the output projection unchanged, but stream
+    ``sigmoid(gate) * heads_last`` into the flattened layout in one Triton pass.
+    """
+
+    if module.mha.linear_g is None:
+        return module.mha.linear_o(heads_last.flatten(-2))
+    if triton is None or tl is None:
+        return module.mha._wrap_up(heads_last, q_x)
+
+    gate = module.mha.linear_g(q_x)
+    if not gate.is_contiguous() or not heads_last.is_contiguous():
+        return module.mha._wrap_up(heads_last, q_x)
+    if gate.numel() != heads_last.numel():
+        return module.mha._wrap_up(heads_last, q_x)
+
+    flattened = torch.empty_like(gate)
+    block_size = 1024
+    grid = (triton.cdiv(flattened.numel(), block_size),)
+    _sigmoid_mul_flat_fwd[grid](
+        gate,
+        heads_last,
+        flattened,
+        flattened.numel(),
+        block_size=block_size,
+        num_warps=4,
+    )
+    return module.mha.linear_o(flattened)
+
+
 def cueq_module_forward(
     module: TriangleAttention,
     z: torch.Tensor,
@@ -391,6 +450,7 @@ def triton_varlen_module_forward(
     block_n: int,
     warps: int,
     scale: float,
+    fused_epilogue: bool = False,
 ) -> torch.Tensor:
     # This intentionally pays the surrounding producer/consumer costs.  The
     # core screen above answers whether the attention mainloop has promise; this
@@ -405,6 +465,8 @@ def triton_varlen_module_forward(
         warps=warps,
         scale=scale,
     )
+    if fused_epilogue:
+        return triton_heads_last_wrap_up(module, heads_last, tensors["x_norm"])
     return module.mha._wrap_up(heads_last, tensors["x_norm"])
 
 
@@ -619,6 +681,32 @@ def main() -> None:
                         args.lengths,
                     ),
                 }
+                fused_full_candidate, fused_full_timing = cuda_time(
+                    lambda descriptors=descriptors, block_m=block_m, block_n=block_n, warps=warps: triton_varlen_module_forward(
+                        module,
+                        z,
+                        mask,
+                        lengths_tensor,
+                        descriptors,
+                        block_m=block_m,
+                        block_n=block_n,
+                        warps=warps,
+                        scale=scale,
+                        fused_epilogue=True,
+                    ),
+                    args.warmup,
+                    args.iters,
+                )
+                row["full_boundary_fused_epilogue"] = {
+                    "timing": fused_full_timing,
+                    "speedup_vs_cueq_module": full_cueq_timing["ms"]
+                    / fused_full_timing["ms"],
+                    "parity_vs_cueq_valid": compare_valid_pair(
+                        full_reference,
+                        fused_full_candidate,
+                        args.lengths,
+                    ),
+                }
             candidates.append(row)
 
     best = max(candidates, key=lambda row: row["speedup_vs_cueq_core"])
@@ -631,6 +719,19 @@ def main() -> None:
         if full_candidates
         else None
     )
+    fused_full_candidates = [
+        row for row in candidates if "full_boundary_fused_epilogue" in row
+    ]
+    best_fused_full = (
+        max(
+            fused_full_candidates,
+            key=lambda row: row["full_boundary_fused_epilogue"][
+                "speedup_vs_cueq_module"
+            ],
+        )
+        if fused_full_candidates
+        else None
+    )
     print(
         json.dumps(
             {
@@ -641,6 +742,7 @@ def main() -> None:
                 "candidates": candidates,
                 "best": best,
                 "best_full_boundary": best_full,
+                "best_full_boundary_fused_epilogue": best_fused_full,
                 "device": torch.cuda.get_device_name(),
                 "torch": {"version": torch.__version__, "cuda": torch.version.cuda},
                 "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
