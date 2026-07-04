@@ -5168,6 +5168,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Full dense `masked_fill` invalid-row zeroing in the direct producer-owned block probe | after caching setup outside timing, the short block improved (`1.24x`) but the long block still regressed (`0.96x`) because every compact update paid a dense padded-row materialization pass | precompute invalid row offsets and zero only padded rows; this turned the same direct block positive (`1.31x` short, repeated `1.019x` long before the later row-stat tiling), though still not enough for promotion |
 | One-row-per-program row statistics in the direct producer-owned probe | profiler-attributed scopes showed `_compact_row_stats_kernel` costing about `0.40 ms` per triangle update on the long v2 bucket; tiling eight compact rows per Triton program reduced repeated direct-update producer time from about `1.80 ms` to `1.55 ms` and moved the full long block from scalar-direct `25.39 ms` to tiled-direct `24.92 ms` | row-stat tiling is a real cleanup of the benchmark boundary and should be the default for future direct screens, but the long full-block win is still only `1.043x` versus padded CUEQ, so production promotion still needs a larger fused/native boundary |
 | Fusing direct output LayerNorm/gate/scatter in a benchmark kernel | direct short updates improved strongly (`~2.1x -> ~3.0x`) and long updates improved slightly (`~1.24x -> ~1.26x`), but the repeated long full-block gain over current direct was only `24.987 -> 24.887 ms`; valid-region mean drift was also higher (`z` mean `0.00230 -> 0.00349`) | useful evidence that the output boundary is fusible, but too small and numerically different to promote; keep it as an opt-in benchmark only |
+| Native cuBLAS contraction plus native compact assembly using the current direct producer | job `110868` compiled and passed BF16-valid parity, but the actual full update lost to current direct: short `0.97-0.98x`, long `0.89-0.91x`; the post-producer native boundary looked plausible in isolation, but excluding producer cost was misleading | do not chase another standalone cuBLAS wrapper; the next native v2 attempt must own producer, contraction, output/residual, and invalid-row handling together |
 | Compact valid-row triangle-multiplication bridge | valid-only compact row work was slower than padded CUEQ (`0.70x` short, `0.27x` long), and scattering back to padded layout was worse | do not bridge compact row-wise work through dense `a/b` tensors; a real segmented native update must stay segmented through contraction and output |
 | Compact segmented triangle-multiplication update inside a full v2 `PairformerBlock` | isolated short-bucket update improved, but the full block slowed badly: short `10.237 -> 27.144 ms` best (`0.38x`), long `25.791 -> 123.764 ms` best (`0.21x`) | the dense-ABI compact bridge pays too much pack/scatter, invalid-row zeroing, and custom-contraction cost; the next attempt needs a native vendor-quality CuTe/SM90 segmented update |
 | Unguarded fused triangle-multiplication input LayerNorm + dual-GEMM producer | short v2 blocks improved about `1.08x`, but long `B16/N220` blocks slowed to `0.94x`; the path is now default-off and guarded to <=300k physical pair rows | local producer fusion can be shape-specific; do not enable it globally for Sam-style v2 campaigns unless the long bucket is protected by fallback |
@@ -5350,6 +5351,16 @@ Profiling and reproducibility helpers:
   rows per program because this was best in the H100 screen; use
   `--row-stats scalar` or `--row-stat-block-rows` to reproduce the scalar
   baseline or hill-climb a new shape.
+- `scripts/perf/triangle_update_native_cublas_probe.py` and
+  `scripts/perf/triangle_update_native_cublas_probe.cu`: first executable
+  native slice after the v2 design note.  It consumes the direct producer's
+  exact-length groups, uses `cublasGemmStridedBatchedEx` per exact-length group,
+  and assembles compact update rows in CUDA.  Current result: correct but
+  rejected as a deployable path.  Job `110868` showed the actual full update
+  with the current producer is slower than current direct (`0.89-0.91x` on the
+  long `B16/N220` bucket, `0.97-0.98x` on the short bucket).  Use it as
+  evidence that the next kernel must own producer + contraction + output
+  together, not as another wrapper to promote.
 - `scripts/perf/pairformer_compact_segmented_triangle_update_probe.py`: full
   v2 `PairformerBlock` gate for compact/direct segmented triangle-update ideas.
   It replaces both triangle-multiplication updates, zeroes invalid pair rows

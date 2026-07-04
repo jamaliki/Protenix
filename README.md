@@ -452,6 +452,11 @@ That moved the repeated long-bucket full-block gate from `25.99 -> 24.92 ms`
 useful learning for the native fused boundary, but still too small on the long
 Sam-style v2 bucket to promote without deeper integration and full end-to-end
 gates.
+The first native cuBLAS contraction-plus-assembly slice compiled and matched
+BF16-valid parity, but the actual full update with the current direct producer
+was slower than current direct (`0.89-0.91x` on the long `B16/N220` bucket).
+That rules out another standalone wrapper; the next useful kernel must own
+producer, contraction, output/residual, and invalid-row handling together.
 Whole-Pairformer CUDA graph replay was also screened as a lower-risk
 launch-overhead fix.  It was exact and helped the short v2 bucket by about
 `3%`, but the full 48-block long bucket was flat (`~1.00x`) once changed

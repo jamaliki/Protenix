@@ -32,6 +32,7 @@ Important measured results:
 | Direct producer-owned update after tiled assembly and row-stat tiling | isolated update `~2.1x` | isolated update `~1.25x` | useful benchmark boundary |
 | Direct producer-owned full Pairformer block | `1.31x` | repeated `1.043x` | too small for production default |
 | Fused output finish benchmark | isolated short update `~3.0x` | isolated long update `~1.26x`, full long block `1.045x` | opt-in learning path only |
+| Native cuBLAS contraction + native assembly with the current producer | full update `0.97-0.98x` vs current direct | full update `0.89-0.91x` vs current direct | reject as a deployable path; useful boundary evidence only |
 
 The takeaway is narrow but important: exact-length work reduction is real, but
 not when implemented as a dense-ABI bridge.  The next kernel must avoid:
@@ -42,6 +43,33 @@ not when implemented as a dense-ABI bridge.  The next kernel must avoid:
 - dense `masked_fill` over all padded pair rows;
 - replacing CUEQ/cuBLAS tensor-core mainloops with scalar or low-occupancy
   custom math.
+
+### First native cuBLAS slice result
+
+Commit `802b1ce` added
+`scripts/perf/triangle_update_native_cublas_probe.py` and
+`scripts/perf/triangle_update_native_cublas_probe.cu` as the first executable
+native slice.  It consumes the direct producer's exact-length groups, calls
+`cublasGemmStridedBatchedEx` per exact-length group, and assembles compact
+row-major update rows in CUDA.  Job `110868` on one H100
+(`runs/native_cublas_triangle_corrected_802b1ce_20260704_235245`) compiled and
+passed BF16-valid parity, but the full path still using the current producer
+lost to the current direct update:
+
+| bucket | direction | padded CUEQ | current direct | native full with current producer | decision |
+| --- | --- | ---: | ---: | ---: | --- |
+| short `B16/N124` | incoming | `2.437 ms` | `1.144 ms` | `1.182 ms` (`0.968x` vs direct) | reject full path |
+| short `B16/N124` | outgoing | `2.448 ms` | `1.170 ms` | `1.200 ms` (`0.975x` vs direct) | reject full path |
+| long `B16/N220` | incoming | `4.121 ms` | `3.327 ms` | `3.718 ms` (`0.895x` vs direct) | reject full path |
+| long `B16/N220` | outgoing | `4.232 ms` | `3.403 ms` | `3.727 ms` (`0.913x` vs direct) | reject full path |
+
+The post-producer native boundary is still useful diagnostic evidence:
+`native_contract_assemble_only` was `~0.24-0.25 ms` on the short bucket and
+`~1.09-1.12 ms` on the long bucket, but once the current producer and output
+finish are included it does not beat the tiled direct path.  Do not spend more
+time on a standalone cuBLAS wrapper.  The next attempt must own a larger
+boundary, especially the producer and output/residual store, or it will keep
+paying the same wrapper tax.
 
 ## Boundary to own
 
@@ -250,16 +278,17 @@ Use one-GPU Slurm jobs with:
 
 ## Next concrete coding step
 
-Start with an isolated native extension that consumes the same exact-group
-producer layout as `triangle_update_producer_owned_direct_probe.py` and emits
-row-major compact update rows without PyTorch `bmm` or PyTorch assembly.  It
-should be compared directly against:
+The first native cuBLAS contraction/update-emission slice has now been tested
+and rejected as a deployable path because the actual full update with the
+current producer is slower than the tiled direct update.  The next coding step
+should therefore skip more standalone GEMM wrappers and prototype a larger
+native boundary for one direction:
 
-1. exact-group `torch.bmm` plus tiled assembly;
-2. the current direct full update;
-3. padded CUEQ baseline.
+1. input row statistics and producer into exact-length layout;
+2. tensor-core contraction in that layout;
+3. output row statistics, gate/value projection, residual store, and invalid-row
+   handling without returning intermediate update tensors to PyTorch.
 
-If that first native contraction/update-emission slice is slower than
-exact-group `torch.bmm` by more than about 20% on the long bucket, reject the
-mainloop before adding output fusion.  If it is close, then fuse output
-LayerNorm/gate/residual into the same native layout and run the full block gate.
+The acceptance target is still the long bucket.  If this larger native boundary
+does not beat the current direct update on `B16/N220`, reject it before running
+full Pairformer gates.
