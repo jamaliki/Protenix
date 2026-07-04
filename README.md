@@ -392,8 +392,9 @@ individual shard is slower than the single-process B16 mode, but aggregate
 samples/sec per H100 is higher.
 
 For Sam-style Protenix-v2 work, treat the v2 rows above as the target workload,
-not the base-checkpoint headline.  The current matched win is closer to `2x`
-end to end because Protenix-v2 has a wider pair representation (`c_z=256`,
+not the base-checkpoint headline.  The current matched upstream-compatible win
+is about `2.7-2.8x` end to end, not the base-checkpoint `6-7x` headline,
+because Protenix-v2 has a wider pair representation (`c_z=256`,
 `hidden_scale_up=True`) and low-sample, mixed-token batches do not amortize the
 trunk as aggressively as large-sample single-sequence jobs.  A focused H100
 profile of the exact sorted
@@ -402,13 +403,15 @@ mixed-token trunk buckets (`B16/N124` and `B16/N220`, `c_z=256`,
 the long bucket spends about 46% of one block in triangle attention, 29% in
 triangle multiplication, and 21% in the pair transition.  The two sorted
 buckets are only about 67% pair-token efficient overall, so the next large
-kernel opportunity is a true ragged/segmented triangle-attention or
-triangle-multiplication schedule that avoids padded pair work while keeping
-CUEQ/cuDNN-class mainloops.  Small queue buckets, pair-transition-only
-compaction, residual-only triangle-multiplication epilogues, and more same-GPU
-workers have already plateaued for v2.  The last simple CUTLASS wrapper idea
-also failed: grouped GEMM cannot express "one sequence group with 256 feature
-contractions in GEMM's `L` dimension" through the stock SM90 grouped scheduler.
+kernel opportunity is a true ragged/segmented triangle-multiplication update
+that avoids padded pair work while keeping CUEQ/cuDNN-class mainloops.
+Triangle-attention varlen wrappers have now been tested at the full-block level
+and were slower once both orientations were wired fairly.  Small queue buckets,
+pair-transition-only compaction, residual-only triangle-multiplication
+epilogues, and more same-GPU workers have already plateaued for v2.  The last
+simple CUTLASS wrapper idea also failed: grouped GEMM cannot express "one
+sequence group with 256 feature contractions in GEMM's `L` dimension" through
+the stock SM90 grouped scheduler.
 The detailed CUEQ reverse-engineering notes, rejected cuBLAS/CUTLASS grouped
 screens, and the proposed first fused CuTe boundary are in
 [docs/perf/inference_throughput.md](docs/perf/inference_throughput.md#cueq-reverse-engineering-the-native-boundary-worth-targeting).

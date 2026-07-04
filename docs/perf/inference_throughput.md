@@ -4508,9 +4508,8 @@ short-term implementation ladder is:
    the producer/output boundary unless the epilogue is also fused.  Even then,
    the integrated module win is only about `1%` on the short bucket and `5%` on
    the long bucket.  Do not promote this as a production path yet.  The next
-   legitimate step would be a guarded starting+ending triangle-attention
-   implementation followed by the actual v2 `PairformerBlock` and full
-   Sam-style `N_sample=1/5` gates; otherwise the safe decision is to keep CUEQ.
+   integration question was whether a fair starting+ending replacement survives
+   the actual v2 `PairformerBlock`; that block-level test is recorded below.
 
    PairformerBlock varlen-attention screen: commit `eca9a1b` added
    `scripts/perf/pairformer_varlen_triangle_attention_probe.py` and job
@@ -4537,6 +4536,31 @@ short-term implementation ladder is:
    CUEQ ending producer.  A future triangle-attention attempt must own a larger
    production boundary, especially the LayerNorm/qkv/bias/gate/output producer
    for both starting and ending orientations, or it should not displace CUEQ.
+
+   Ending-contiguous start+end follow-up: commit `c817dcf` added
+   `scripts/perf/pairformer_varlen_attention_ending_contig_probe.py` and job
+   `109951` ran the fairer block screen in
+   `runs/pairformer_varlen_attn_ending_contig_20260704_205512_c817dcf`.  This
+   version avoids the known-bad physical `x_norm.transpose(...).contiguous()`
+   for ending-node attention: the ending q/k/v/bias/gate producers stay on the
+   original contiguous `[B, I, J, C]` pair tensor and only the logical attention
+   axes are swapped.  That gives the benchmark-only varlen attention path the
+   same ending-orientation layout advantage as the promoted CUEQ producer.
+
+   | bucket | baseline block | best start+end-varlen, ending-contiguous | tile | parity vs baseline | decision |
+   | --- | ---: | ---: | --- | --- | --- |
+   | short `40-124` | 10.213 ms | 10.465 ms (`0.976x`) | `64x32x4` | `z` max/mean `0.0625`/`0.0016`, `s` max/mean `0.03125`/`0.0026` | reject |
+   | long `136-220` | 25.854 ms | 26.886 ms (`0.962x`) | `64x32x4` | `z` max/mean `0.0625`/`0.0014`, `s` max/mean `0.0625`/`0.0023` | reject |
+
+   This closes the current varlen-attention branch of the search tree for the
+   Sam-style v2 trunk.  The valid-work attention core has real microbenchmark
+   headroom, but once both orientations are embedded in a whole
+   `PairformerBlock`, producer/output work, CUEQ's optimized ending path, and
+   the still-dominant triangle multiplication/pair transition erase the win.  A
+   future triangle-attention rewrite must own a larger fused production boundary
+   and preserve cuDNN/CUEQ-class softmax throughput; otherwise the next
+   kernel-writing effort should move to the full segmented
+   triangle-multiplication update below.
 
    Fused producer follow-up: commits `9b238f1`, `9ba65f4`, `4660f23`,
    `9b58fc6`, and `a22eec7` tested the next larger triangle-multiplication
@@ -4833,6 +4857,12 @@ Profiling and reproducibility helpers:
   answers whether the module-level attention win survives the real v2 block
   with CUEQ triangle multiplication, pair transition, token attention, and the
   current optimized ending-node CUEQ path.
+- `scripts/perf/pairformer_varlen_attention_ending_contig_probe.py`: fairer
+  start+end version of the previous block screen.  It keeps ending-node
+  q/k/v/bias/gate producers on the original contiguous pair layout instead of
+  physically transposing the normalized pair tensor.  The current result is
+  slower than CUEQ on both Sam-style v2 buckets, so use it as negative evidence
+  before attempting another triangle-attention wrapper.
 - `scripts/perf/triangle_multiplication_ragged_hotspot.py`: v2 BF16
   CUEQ triangle-multiplication screen for padded versus smaller ragged islands;
   use it to filter segmented-kernel ideas before touching production code.
