@@ -42,7 +42,6 @@ from protenix.model.modules.transition_dual_gemm_triton import (
     triton_dual_gemm_silu_product,
     triton_transition_dual_gemm_available,
     triton_transition_dual_gemm_enabled,
-    triton_transition_dual_gemm_min_rows,
 )
 
 
@@ -423,7 +422,6 @@ class Transition(nn.Module):
             triton_transition_dual_gemm_enabled()
             and triton_transition_dual_gemm_available()
             and x.dtype in (torch.float16, torch.bfloat16)
-            and x.shape[0] >= triton_transition_dual_gemm_min_rows()
         ):
             weight_a, weight_b = self._dual_gemm_params(dtype=x.dtype, device=x.device)
             projected = triton_dual_gemm_silu_product(x, weight_a, weight_b)
