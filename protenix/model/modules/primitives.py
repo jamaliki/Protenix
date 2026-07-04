@@ -40,7 +40,9 @@ from protenix.model.modules.fused_elementwise_triton import (
 )
 from protenix.model.modules.transition_dual_gemm_triton import (
     triton_dual_gemm_silu_product,
+    triton_transition_dual_gemm_available,
     triton_transition_dual_gemm_enabled,
+    triton_transition_dual_gemm_min_rows,
 )
 
 
@@ -417,7 +419,12 @@ class Transition(nn.Module):
     def _fused_input_projection(self, x: torch.Tensor) -> Optional[torch.Tensor]:
         if not self._can_fuse_input_projection(x):
             return None
-        if triton_transition_dual_gemm_enabled():
+        if (
+            triton_transition_dual_gemm_enabled()
+            and triton_transition_dual_gemm_available()
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and x.shape[0] >= triton_transition_dual_gemm_min_rows()
+        ):
             weight_a, weight_b = self._dual_gemm_params(dtype=x.dtype, device=x.device)
             projected = triton_dual_gemm_silu_product(x, weight_a, weight_b)
             if projected is not None:

@@ -57,7 +57,7 @@ def _env_flag_enabled(name: str, default: bool) -> bool:
 
 
 def triton_transition_dual_gemm_enabled() -> bool:
-    return _env_flag_enabled("PROTENIX_TRITON_TRANSITION_DUAL_GEMM", default=False)
+    return _env_flag_enabled("PROTENIX_TRITON_TRANSITION_DUAL_GEMM", default=True)
 
 
 def triton_transition_dual_gemm_available() -> bool:
@@ -67,11 +67,20 @@ def triton_transition_dual_gemm_available() -> bool:
 def _min_rows() -> int:
     raw = os.getenv("PROTENIX_TRITON_TRANSITION_DUAL_GEMM_MIN_ROWS")
     if raw is None:
-        return 262_144
+        # The direct dual-GEMM kernel is a clear win for large same-token
+        # variable-atom batches (B32/N251: ~2M rows), but the B16 mixed-token
+        # N_sample=5 gate was flat/slower once diffusion variance was included.
+        # Keep the default high enough to leave that recommended mixed path on
+        # cuBLAS while still accelerating the large pairformer trunk endpoint.
+        return 1_000_000
     try:
         return max(0, int(raw))
     except ValueError:
-        return 262_144
+        return 1_000_000
+
+
+def triton_transition_dual_gemm_min_rows() -> int:
+    return _min_rows()
 
 
 def _max_output_elements() -> int:

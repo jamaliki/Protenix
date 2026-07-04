@@ -180,6 +180,18 @@ around ending-node triangle attention and gave about `+1.5%` on the pairformer
 subtotal, or `+0.6%` on the full B32 same-token variable-atom predict gate.  Set
 it to `0` only when bisecting a numerical or shape-specific issue.
 
+Large same-token pairformer batches also use a Triton dual-GEMM transition
+input kernel by default (`PROTENIX_TRITON_TRANSITION_DUAL_GEMM=1`).  Pairformer
+transition normally computes two projections from the same normalized pair rows
+and immediately consumes them as `SiLU(a) * b`; the Triton path keeps both
+accumulators inside one tiled launch and writes only the consumed hidden tensor.
+The default row-count guard is intentionally high
+(`PROTENIX_TRITON_TRANSITION_DUAL_GEMM_MIN_ROWS=1000000`): it speeds the
+important B32 same-token, variable-atom endpoint, but stays out of the
+recommended B16 mixed-token `N_sample=5` path where the full gate was flat to
+slightly slower.  Set `PROTENIX_TRITON_TRANSITION_DUAL_GEMM=0` for conservative
+bisects, or lower the min-row guard only when benchmarking a new campaign shape.
+
 For normal multi-step inference, the diffusion transformer also caches the
 step-invariant token pair-attention bias once per block.  This spends a few GiB
 on long mixed batches, but removes repeated pair-bias projection and sample-lane
@@ -188,13 +200,13 @@ repeat work from the `N_step=200` denoising loop.  Set
 the older path; one-step scout runs skip the cache automatically because there
 is no reuse window.
 
-Do not set the experimental Triton elementwise/residual/transition flags for
-this mixed-campaign path unless you are running a new benchmark.  On the B16
-mixed-length gate they slowed the representative predict section from `41.6s`
-to `69.3s`.  A later B32 same-token, variable-atom gate showed that transition
-input fusion still speeds the isolated pairformer block, but the full predict
-path was slightly slower once diffusion/confidence variance was included.  The
-default branch settings are therefore the measured fast path.
+Do not set the older experimental Triton elementwise/residual/transition flags
+for this mixed-campaign path unless you are running a new benchmark.  On the
+B16 mixed-length gate they slowed the representative predict section from
+`41.6s` to `69.3s`.  The promoted dual-GEMM transition kernel above is a
+different, narrower path with its own high-row guard; leave the broad
+`PROTENIX_TRITON_FUSED_ELEMENTWISE` and
+`PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION` flags off for normal inference.
 
 The default `--batch_mode auto` is deliberately conservative but usable for real
 sequence-design campaigns.  If all featurized tensor shapes match, the whole
@@ -263,7 +275,7 @@ dumping:
 | --- | ---: | ---: | ---: |
 | 32 one-record JSON files in a directory | 342.7 s, 0.093 seq/s | 121.5 s, 0.263 seq/s | 2.82x end to end |
 | One combined JSON with 32 same-shape records | 361.8 s runner time | 69.3 s runner time | 5.2x after initialization |
-| 32 same-token, variable-atom 251-token records | 301.9 s summed predict at `--batch_size 1` | 44.4 s predict, 42.6 s model-forward at `--batch_size 32`; pairformer is 30.1 s | 6.8x predict vs current unbatched path |
+| 32 same-token, variable-atom 251-token records | 301.9 s summed predict at `--batch_size 1` | 41.2 s predict, 39.3 s model-forward at `--batch_size 32`; pairformer is 26.7 s with the large-row dual-GEMM transition guard | 7.3x predict vs current unbatched path |
 | 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.1 s wall, 29.9 s summed predict, 0.968 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.83x single-process throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 41.6 s, 3.85 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, BF16 diffusion core, BF16 atom attention, Triton local atom attention, default Triton LayerNorm fallback, and cached diffusion pair bias | 5.11x over the old branch boundary |
@@ -272,7 +284,7 @@ dumping:
 
 For same-token, variable-atom campaigns, compare the `predict` or
 model-forward section rather than the outer Slurm/script wall time.  Current
-code measured closer to `6-7x` for the comparable `B32, N_token=251,
+code now measures about `7.3x` for the comparable `B32, N_token=251,
 N_sample=1` predict path, while end-to-end wrapper speedups can look much
 smaller if the run includes model initialization, cold caches, file dumping, an
 older container, or a checkpoint variant that has not been re-benchmarked.

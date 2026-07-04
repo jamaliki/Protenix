@@ -55,7 +55,7 @@ The same-output speedup is about **17x per GPU** over the original default.
 Numbers vary slightly by run and node state; changes below about 1% should be
 treated as noise unless repeated in a paired gate.
 
-Later boundary-fusion experiments added three more opt-in flags:
+Later boundary-fusion experiments also screened these older opt-in flags:
 
 ```bash
 export PROTENIX_TRITON_LOCAL_ATTN_FUSE_GATE=1
@@ -63,14 +63,14 @@ export PROTENIX_TRITON_FUSED_ATTENTION_RESIDUAL=1
 export PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION=1
 ```
 
-They are not included in the headline large-`N_sample` throughput table yet.
+They are not included in the headline large-`N_sample` throughput table.
 The atom-attention boundary fusion is a clean isolated win and reduces peak
 allocated memory, but the paired full `N_sample=1280`, `N_step=200` gate
 improved forward throughput by only 0.15%, which is below the promotion
-threshold.  `PROTENIX_FUSED_TRANSITION_INPUT_PROJECTION=1` is validated for the
-many-sequence/few-sample path described below; its pairformer use is
-shape-guarded so larger batches fall back when the fused temporary would be too
-large.
+threshold.  The older wide transition input flag is not the promoted path for
+normal inference; it is superseded in large same-token pairformer batches by
+the default-on, high-row-guarded
+`PROTENIX_TRITON_TRANSITION_DUAL_GEMM` kernel described below.
 
 For the many-independent-sequence path, two triangle-attention layout fusions
 are now default-on when Triton is available.  They can be disabled independently
@@ -193,15 +193,16 @@ CIF/JSON dumping:
 | run | inputs | predict sec | seq/s | model-forward sec | pairformer | diffusion | path |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | current unbatched | 32 x B1 | 301.85 | 0.106 | 301.03 | 82.31 | 217.78 | exact singleton calls |
-| same-token variable-atom batch | B32 | 44.42 | 0.720 | 42.57 | 30.07 | 11.69 | `token-trunk+diffusion-token-atom-batch` |
+| same-token variable-atom batch, pre dual-GEMM transition | B32 | 44.42 | 0.720 | 42.57 | 30.07 | 11.69 | `token-trunk+diffusion-token-atom-batch` |
+| same-token variable-atom batch, current large-row dual-GEMM guard | B32 | 41.16 | 0.778 | 39.33 | 26.74 | 11.80 | `token-trunk+diffusion-token-atom-batch` |
 | same atom count control | B32 | 50.92 | 0.628 | 49.94 | 30.64 | 18.88 | `exact-model-batch` |
 
-The B32 same-token variable-atom case is a `6.8x` predict speedup over the
+The current B32 same-token variable-atom case is a `7.3x` predict speedup over the
 current unbatched path, but it is not the same measurement as the public
 repeated-`7r6r` wrapper/runner gate.  If an older build reports roughly
 `78s` model-forward per 32 records on this shape, rebuild from a newer commit
 before interpreting the gap as a missing flag; current optimized code measured
-`42.57s` model-forward on the comparable base-checkpoint gate.
+`39.33s` model-forward on the comparable base-checkpoint gate.
 
 Host-prefetch gate: job `99731`, run directory
 `runs/prefetch_gate_20260704_013822_0e4d701`, commit `0e4d701`, one H100,
@@ -2321,6 +2322,75 @@ design clue, but do not promote it as a default for the many-sequence
 variable-atom path.  The right next kernel boundary is not "use one wider GEMM"
 globally; it is to remove the transition intermediate write/read without
 increasing temporary memory or disturbing the diffusion/confidence tail.
+
+The follow-up direct dual-GEMM Triton kernel does exactly that for large
+pair-transition row counts.  Instead of concatenating `Wa/Wb` into one wider
+cuBLAS GEMM and writing a `2 * hidden` activation, it computes the two
+accumulators inside one Triton tile and stores only `SiLU(a) * b`.  The output
+projection remains the ordinary cuBLAS `Linear`, which preserves the good
+library mainloop for the larger `hidden -> c_in` GEMM.
+
+The first actual-shape micro-boundary screen was job `100577`
+(`runs/pair_transition_dual_gemm_triton_screen_20260704_042928_8ef18db`).  The
+Slurm job failed only after writing JSONs because the ad hoc summary heredoc
+mangled Python f-strings; the JSON outputs are valid:
+
+| shape | hidden two-GEMM | best hidden dual GEMM | transition input-to-output baseline | dual-GEMM input-to-output | parity after output |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `B16/N220` | 2.048 ms | 0.946 ms (`2.17x`) | 2.395 ms | 1.292 ms (`1.85x`) | max abs `0.03125`, mean `0.00174` |
+| `B32/N251` | 5.316 ms | 2.440 ms (`2.18x`) | 6.210 ms | 3.336 ms (`1.86x`) | max abs `0.03125`, mean `0.00175` |
+
+Commit `7cd0cda` then integrated the kernel behind
+`PROTENIX_TRITON_TRANSITION_DUAL_GEMM`.  The integration gate, job `100618`
+(`runs/transition_dual_gemm_integration_gate_20260704_043423_7cd0cda`), kept
+the older wide-input and broad elementwise flags off and changed only the new
+dual-GEMM flag:
+
+| screen | baseline | dual GEMM | speedup | parity / memory |
+| --- | ---: | ---: | ---: | --- |
+| `Transition.forward`, `B16/N220` | 3.231 ms | 2.116 ms | `1.53x` | max abs `0.0234`; peak essentially unchanged |
+| `Transition.forward`, `B32/N251` | 8.332 ms | 5.454 ms | `1.53x` | max abs `0.03125`; peak essentially unchanged |
+| `PairformerBlock`, `B16/N220` | 17.275 ms | 16.214 ms | `1.065x` | pair transition `3.411 -> 2.310 ms` |
+| `PairformerBlock`, `B32/N251` | 43.860 ms | 41.110 ms | `1.067x` | pair transition `8.797 -> 5.937 ms` |
+
+The decisive same-token, variable-atom full gate was job `100640`
+(`runs/transition_dual_gemm_full_issue_gate_20260704_043713_7cd0cda`).  It used
+the same 32-record `N_token=251`, `N_atom=1834-1940`, `N_sample=1`,
+`N_step=200`, confidence-enabled issue-shaped campaign as the earlier gates.
+All four measured cases produced 32 CIFs; the Slurm job failed only in its
+summary parser after the outputs and timing logs were complete, so
+`summary_salvaged.json` is the authoritative summary:
+
+| metric | baseline avg | dual-GEMM avg | speedup |
+| --- | ---: | ---: | ---: |
+| predict | 42.56 s | 41.155 s | `1.034x` |
+| model forward | 40.716 s | 39.335 s | `1.035x` |
+| pairformer | 28.012 s | 26.744 s | `1.047x` |
+| diffusion | 11.835 s | 11.798 s | `1.003x` |
+| confidence | 0.870 s | 0.795 s | noisy positive |
+
+The matched mixed-token `N_sample=5` gate was job `100754`
+(`runs/transition_dual_gemm_mixed_nsample5_gate_20260704_044838_7cd0cda`).
+This used the current promoted B16 mixed 40-220-token campaign with diffusion
+pair-bias caching and the atom/BF16 fast path enabled.  With the lower
+experimental row guard used before promotion, the kernel was not a full
+workload win:
+
+| metric | baseline avg | dual-GEMM avg | speedup |
+| --- | ---: | ---: | ---: |
+| predict | 40.52 s | 40.85 s | `0.992x` |
+| pairformer | 15.675 s | 15.411 s | `1.017x` |
+| diffusion | 20.686 s | 21.050 s | `0.983x` |
+| confidence | 2.500 s | 2.576 s | `0.970x` |
+
+Decision: promote the direct dual-GEMM kernel only behind a large-row default
+guard.  `PROTENIX_TRITON_TRANSITION_DUAL_GEMM` is default-on, but
+`PROTENIX_TRITON_TRANSITION_DUAL_GEMM_MIN_ROWS` defaults to `1000000`.  That
+triggers for the B32/N251 same-token variable-atom trunk (`~2.0M` transition
+rows), where the full gate improved the intended pairformer subtotal and the
+whole predict path, while leaving the recommended B16 mixed-token `N_sample=5`
+path (`B16 * 220^2 = 774400` rows in the long bucket) on the cuBLAS baseline.
+Lower the row guard only for a new campaign after running the same paired gate.
 
 ### 3. Specialize atom local attention
 
