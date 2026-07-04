@@ -340,6 +340,7 @@ def main() -> None:
                 weights,
                 row_stats=args.row_stats,
                 row_stat_block_rows=args.row_stat_block_rows,
+                finish=args.finish,
             ),
             args.warmup,
             args.iters,
