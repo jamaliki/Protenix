@@ -4309,10 +4309,36 @@ short-term implementation ladder is:
    grouped metadata was not enough; the matmul mainloop itself also has to be
    vendor-quality or fused with enough surrounding work to amortize the loss.
 
+   Descriptor-scheduled Triton follow-up: commit `cf82f17` added
+   `scripts/perf/triangle_contraction_triton_descriptors_probe.py` to test the
+   obvious missing scheduler improvement from the rectangular Triton probe.  It
+   precomputes one compact descriptor list of valid `(batch, tile_i, tile_j)`
+   tiles, so short records no longer launch invalid tile programs.  Job
+   `109792`, run
+   `runs/triangle_contraction_triton_descriptors_20260704_182555_cf82f17`, ran
+   the same v2 short/long buckets:
+
+   | bucket / direction | dense `einsum` | best descriptor Triton | valid tile fraction | decision |
+   | --- | ---: | ---: | ---: | --- |
+   | short outgoing | 0.176 ms | 0.266 ms (`0.66x`) | 84 / 128 (`0.656`) | reject |
+   | short incoming | 0.156 ms | 0.252 ms (`0.62x`) | 84 / 128 (`0.656`) | reject |
+   | long outgoing | 0.821 ms | 1.396 ms (`0.59x`) | 356 / 448 (`0.795`) | reject |
+   | long incoming | 0.748 ms | 1.485 ms (`0.50x`) | 356 / 448 (`0.795`) | reject |
+
+   This is useful because it separates two possible explanations.  The original
+   Triton segmented failure was not mainly wasted invalid tile launches: even
+   after deleting those launches, the custom mainloop reaches only about
+   `19-40` logical exact TFLOP/s while dense PyTorch/einsum is around
+   `100-117` dense TFLOP/s.  Therefore the next triangle-multiplication attempt
+   should not be another Triton contraction scheduler variant.  It needs either
+   a vendor-quality CuTe/CUEQ-class contraction mainloop inside the larger fused
+   update, or a different boundary such as segmented triangle attention.
+
    Decision: reject all bare contraction replacements tried so far: cuBLAS
    exact-length calls, old CUTLASS grouped, CUTLASS 3 grouped, and direct Triton
-   segmented scheduling.  The next kernel attempt should fuse a larger
-   triangle-multiplication boundary so custom scheduling amortizes overhead over
+   segmented scheduling, including compact tile descriptors.  The next kernel
+   attempt should fuse a larger triangle-multiplication boundary so custom
+   scheduling amortizes overhead over
    LayerNorm, gated projections, contraction, output normalization, and residual
    store.  Do not spend more effort on another standalone contraction wrapper
    unless its design specifically preserves a CUEQ/cuBLAS/CUTLASS-class
@@ -4621,6 +4647,10 @@ Profiling and reproducibility helpers:
   writes zero invalid regions in one launch, but is still much slower than dense
   `einsum`; use it as evidence that a non-vendor standalone contraction
   mainloop is the wrong boundary.
+- `scripts/perf/triangle_contraction_triton_descriptors_probe.py`:
+  descriptor-scheduled variant of the Triton segmented contraction screen.  It
+  removes invalid tile launches, but still loses to dense `einsum`, proving the
+  remaining failure is mainloop quality rather than only rectangular-grid waste.
 - `scripts/perf/triangle_multiplication_compact_rows_probe.py`: compact
   valid-row triangle-multiplication bridge.  It proves that gathering valid
   rows and scattering dense `a/b` tensors around the existing contraction is
