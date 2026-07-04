@@ -307,7 +307,10 @@ checkpoint load completed in both cases, and model/predict timings were
 unchanged within normal noise (`0.99-1.00x`).  The wall-time rows below use the
 new default-on strict init skip because it is now part of the promoted
 inference path; set `PROTENIX_SKIP_INFERENCE_WEIGHT_INIT=0` only when debugging
-initialization itself.
+initialization itself.  Slurm marks job `109924` as failed because the
+ad-hoc post-processing summarizer raised a Python `NameError` after all four
+`CASE_END` markers were written; the inference cases themselves completed, and
+the parsed evidence is saved as `summary_manual.json` in the run directory.
 
 | case | baseline wall | current wall | wall speedup | baseline model/predict | current predict | model speedup | current pairformer | current diffusion | current confidence |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
