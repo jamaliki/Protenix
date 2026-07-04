@@ -180,6 +180,18 @@ around ending-node triangle attention and gave about `+1.5%` on the pairformer
 subtotal, or `+0.6%` on the full B32 same-token variable-atom predict gate.  Set
 it to `0` only when bisecting a numerical or shape-specific issue.
 
+On H100, this branch also installs a small Protenix overlay for CUEQ's Triton
+autotune cache (`PROTENIX_CUEQ_H100_TRITON_CACHE=1`).  CUEQ already ships a
+large cache of tuned tile choices, but Protenix-v2's wider B32/N251 triangle
+multiplication shape was missing two important entries.  The overlay merges
+those entries with CUEQ's installed cache in a user-writable cache directory
+before CUEQ is imported; it does not run ONDEMAND tuning during inference, and
+it respects a user-supplied `CUEQ_TRITON_CACHE_DIR`.  On the v2-shaped
+PairformerBlock screen (`c_z=256`, `hidden_scale_up=True`) this moved block time
+from `88.4 ms` to `68.7 ms` by reducing each triangle-multiplication call from
+about `21.4 ms` to `11.5 ms`.  Set
+`PROTENIX_CUEQ_H100_TRITON_CACHE=0` for conservative bisects.
+
 Large same-token pairformer batches also use a Triton dual-GEMM transition
 input kernel by default (`PROTENIX_TRITON_TRANSITION_DUAL_GEMM=1`).  Pairformer
 transition normally computes two projections from the same normalized pair rows

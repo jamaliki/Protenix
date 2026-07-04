@@ -213,6 +213,51 @@ not as evidence that batching is disabled: v2 doubles the pair channel
 (`c_z=256`) and enables `hidden_scale_up=True`, which widens the CUEQ triangle
 attention/multiplication and transition work.
 
+Protenix-v2 CUEQ cache overlay: the v2-shaped `PairformerBlock` screen showed
+that the biggest immediate v2 bottleneck was not missing batching, but missing
+CUEQ Triton autotune entries for the wider triangle-multiplication gated GEMM.
+ONDEMAND tuning found better H100 tile choices, but tuning on first inference
+costs minutes.  Commit `6e5a670` packages only the two missing H100 entries as
+a small Protenix overlay, merges them with CUEQ's installed site cache in a
+user-writable cache directory, and sets `CUEQ_TRITON_CACHE_DIR` before CUEQ is
+imported.  User-provided `CUEQ_TRITON_CACHE_DIR` still wins, and
+`PROTENIX_CUEQ_H100_TRITON_CACHE=0` disables the overlay.
+
+Default-overlay gate: job `101742`, run directory
+`runs/v2_cueq_overlay_default_gate_20260704_063450_6e5a670`, one H100, synthetic
+v2-shaped `PairformerBlock` with `B32`, `N=251`, `c_z=256`,
+`hidden_scale_up=True`, BF16 inputs/compute, CUEQ triangle attention and
+triangle multiplication:
+
+| case | total block ms | triangle-mul out | triangle-mul in | speedup vs disabled | decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| overlay disabled | 88.408 | 21.454 | 21.330 | 1.00x | control |
+| overlay default-on | 68.686 | 11.506 | 11.414 | 1.29x | promote |
+
+Base-shape guardrail: job `101774`
+(`runs/base_cueq_overlay_guard_20260704_063822_6e5a670`) repeated the same
+block screen with the base-checkpoint shape (`c_z=128`,
+`hidden_scale_up=False`).  Overlay-on and overlay-off were within noise
+(`34.048 ms` vs `33.996 ms`), which confirms the merge preserves CUEQ's existing
+site-cache behavior for the narrower path.
+
+Mechanistically, this is what made CUEQ "fast" for the v2 endpoint: the tuned
+input-projection/gating GEMM uses a `128x128x64` tile with 8 warps, and the
+output-gate GEMM uses a `64x128x64` tile with 4 warps.  Those choices are much
+better for the very large `B*N*N = 2,016,032` row count than CUEQ's untuned
+fallback for this exact shape.  Because the change only supplies CUEQ with the
+same kind of tile config it would write after ONDEMAND tuning, it is lower risk
+than replacing CUEQ's kernel math.
+
+A separate Protenix-side residual-gate fusion remains opt-in via
+`PROTENIX_TRITON_TRIANGLE_OUTPUT_GATE_RESIDUAL=1`.  It was useful as a
+diagnostic: at the target B32/N251 v2 block shape it moved `89.93 ms` to
+`78.67 ms` (`1.14x`) with finite BF16-scale drift (`z` mean abs `0.0034`, max
+abs `0.09375`; job `101685`,
+`runs/v2_triangle_residual_parity_b32_20260704_062834_77968b2`).  But once the
+CUEQ cache overlay is active, it adds only `68.70 ms -> 68.41 ms`; that is too
+small, and the full-model quality gate has not been run, so it is not a default.
+
 Host-prefetch gate: job `99731`, run directory
 `runs/prefetch_gate_20260704_013822_0e4d701`, commit `0e4d701`, one H100,
 base checkpoint, synthetic 256-record campaign made by repeating the same 32
