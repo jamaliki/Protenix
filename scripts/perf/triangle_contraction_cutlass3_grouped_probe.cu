@@ -244,20 +244,20 @@ torch::Tensor run_impl(torch::Tensor const& lhs, torch::Tensor const& rhs, torch
 
   GroupProblemShape problem_shape{
       problem_count,
-      reinterpret_cast<UnderlyingProblemShape*>(problem_blob.data_ptr<uint8_t>()),
+      reinterpret_cast<UnderlyingProblemShape*>(problem_blob.data_ptr()),
       host_problem_shapes.data()};
 
   MainloopArguments mainloop_args{
       reinterpret_cast<Element const**>(ptr_a.data_ptr<int64_t>()),
-      reinterpret_cast<StrideA>(stride_a_blob.data_ptr<uint8_t>()),
+      reinterpret_cast<StrideA>(stride_a_blob.data_ptr()),
       reinterpret_cast<Element const**>(ptr_b.data_ptr<int64_t>()),
-      reinterpret_cast<StrideB>(stride_b_blob.data_ptr<uint8_t>())};
+      reinterpret_cast<StrideB>(stride_b_blob.data_ptr())};
   EpilogueArguments epilogue_args{
       {},
       nullptr,
       StrideC{},
       reinterpret_cast<Element**>(ptr_d.data_ptr<int64_t>()),
-      reinterpret_cast<StrideD>(stride_d_blob.data_ptr<uint8_t>())};
+      reinterpret_cast<StrideD>(stride_d_blob.data_ptr())};
 
   auto hw_info = cutlass::KernelHardwareInfo::make_kernel_hardware_info<GemmKernel>(
       lhs.get_device(), 0, 0, stream);
