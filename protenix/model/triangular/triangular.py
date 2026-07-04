@@ -32,6 +32,10 @@ from protenix.model.triangular.layers import (
     OpenfoldLinear,
     cuequivariance_triangular_attn,
 )
+from protenix.model.triangular.triangle_output_gate_residual_triton import (
+    triangle_update_with_residual,
+    triton_triangle_output_gate_residual_enabled,
+)
 from protenix.model.utils import (
     chunk_layer,
     flatten_final_dims,
@@ -147,6 +151,28 @@ class BaseTriangleMultiplicativeUpdate(nn.Module, ABC):
         self.layer_norm_out = LayerNorm(self.c_hidden)
 
         self.sigmoid = nn.Sigmoid()
+        self._triton_output_gate_cache_key = None
+        self._triton_output_gate_weight_g = None
+        self._triton_output_gate_weight_z = None
+
+    def _triton_output_gate_weights(
+        self,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weights = (self.linear_g.weight, self.linear_z.weight)
+        cache_key = tuple(
+            (weight.data_ptr(), weight._version, dtype, device) for weight in weights
+        )
+        if cache_key != self._triton_output_gate_cache_key:
+            self._triton_output_gate_weight_g = weights[0].to(
+                device=device, dtype=dtype
+            ).contiguous()
+            self._triton_output_gate_weight_z = weights[1].to(
+                device=device, dtype=dtype
+            ).contiguous()
+            self._triton_output_gate_cache_key = cache_key
+        return self._triton_output_gate_weight_g, self._triton_output_gate_weight_z
 
     def _combine_projections(
         self,
@@ -520,6 +546,35 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
         # Therefore, we include a check here: if c != c_z, we fall back to using plain PyTorch.
         # This situation may occur in our template module.
         if triangle_multiplicative == "cuequivariance" and (self.c_z == self.c_hidden):
+            if (
+                _input_inplace_safe
+                and _add_with_inplace
+                and triton_triangle_output_gate_residual_enabled()
+            ):
+                weight_g, weight_z = self._triton_output_gate_weights(
+                    dtype=z.dtype,
+                    device=z.device,
+                )
+                fused_update = triangle_update_with_residual(
+                    z,
+                    direction="outgoing" if self._outgoing else "incoming",
+                    mask=(z.new_ones(z.shape[:-1]) if mask is None else mask),
+                    norm_in_weight=self.layer_norm_in.weight,
+                    norm_in_bias=self.layer_norm_in.bias,
+                    p_in_weight=torch.cat(
+                        [self.linear_a_p.weight, self.linear_b_p.weight], 0
+                    ),
+                    g_in_weight=torch.cat(
+                        [self.linear_a_g.weight, self.linear_b_g.weight], 0
+                    ),
+                    norm_out_weight=self.layer_norm_out.weight,
+                    norm_out_bias=self.layer_norm_out.bias,
+                    p_out_weight=weight_z,
+                    g_out_weight=weight_g,
+                    eps=1e-5,
+                )
+                if fused_update is not None:
+                    return fused_update
             update = kernel_triangular_mult(
                 z[None],
                 direction="outgoing" if self._outgoing else "incoming",
