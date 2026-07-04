@@ -58,8 +58,12 @@ def profile_one(
             rows.append(item)
     top_events = []
     for event in prof.key_averages():
-        cuda_total = getattr(event, "cuda_time_total", 0.0)
-        self_cuda = getattr(event, "self_cuda_time_total", 0.0)
+        cuda_total = getattr(event, "cuda_time_total", 0.0) or getattr(
+            event, "device_time_total", 0.0
+        )
+        self_cuda = getattr(event, "self_cuda_time_total", 0.0) or getattr(
+            event, "self_device_time_total", 0.0
+        )
         if cuda_total <= 0 and self_cuda <= 0:
             continue
         top_events.append(

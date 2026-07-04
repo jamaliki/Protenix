@@ -4720,6 +4720,26 @@ short-term implementation ladder is:
    SM90/CuTe compact contraction/update mainloop, or a narrow shape-guarded
    short-bucket integration whose full-block and end-to-end dilution is measured
    honestly.
+
+   Launch-level profiler follow-up: commit `a08d4e3` added
+   `scripts/perf/triangle_update_compact_segmented_profile.py`, and job `109960`
+   ran the long outgoing bucket in
+   `runs/triangle_update_compact_profile_a08d4e3_20260704_211416`.
+
+   | path | dominant CUDA launches on long outgoing bucket |
+   | --- | --- |
+   | CUEQ baseline, `~4.2 ms` total CUDA | `fused_sigmoid_gated_dual_gemm_forward_kernel` `1.96 ms` across two calls, dense triangular CUTLASS/`bmm` `0.82 ms`, `layer_norm_transpose_forward_kernel` `0.78 ms` across two calls, residual add `0.38 ms`, clone/copy `0.26 ms` |
+   | compact segmented, Triton producer, `13.7 ms` total CUDA | `_compact_contract_kernel` `9.77 ms` (`71%`), `_compact_ln_dual_gemm_kernel` `1.44 ms`, `_scatter_residual_kernel` `1.37 ms`, output `fused_sigmoid_gated_dual_gemm_forward_kernel` `0.49 ms`, `_compact_row_stats_kernel` `0.40 ms`, output `layer_norm_transpose_forward_kernel` `0.25 ms` |
+   | compact segmented, CUEQ producer, `14.3 ms` total CUDA | `_compact_contract_kernel` `9.71 ms` (`68%`), compact input/output CUEQ `fused_sigmoid_gated_dual_gemm_forward_kernel` `1.39 ms`, `_pack_valid_rows_kernel` `1.37 ms`, `_scatter_residual_kernel` `1.37 ms`, two `layer_norm_transpose_forward_kernel` calls `0.49 ms` |
+
+   This profile is decisive: the long-bucket failure is not a mystery launch or
+   Python orchestration overhead.  The custom compact contraction is an order of
+   magnitude slower than CUEQ/PyTorch's dense vendor schedule (`9.7 ms` versus
+   `0.82 ms` for the triangular product), and the dense-ABI pack/scatter bridge
+   adds another `~2.7 ms` when using the compact CUEQ producer.  A next attempt
+   must either replace `_compact_contract_kernel` with a true SM90/CuTe
+   vendor-class mainloop and fuse away pack/scatter, or abandon the long-bucket
+   compact-update path and only consider a guarded short-bucket optimization.
 3. **Segmented triangle attention:** only after the multiplication schedule is
    credible, attempt grouped/segmented attention that preserves cuDNN/CUEQ-class
    softmax throughput.  This is harder because the current fast path's native
@@ -4915,6 +4935,10 @@ Profiling and reproducibility helpers:
   storage, applies the output gate, and scatters valid rows back to dense output
   with the residual.  Current result: real short-bucket signal, long-bucket
   rejection unless the compact contraction/update mainloop becomes vendor-class.
+- `scripts/perf/triangle_update_compact_segmented_profile.py`: profiler companion
+  for the compact segmented update screen.  Use it when a timing result needs
+  launch-level attribution, especially to separate producer, contraction,
+  output-gate, pack, and scatter costs.
 - `scripts/perf/triangle_contraction_cutlass_probe.py` and
   `scripts/perf/triangle_contraction_cutlass_probe_sm90.cu`: first native
   CUTLASS/CuTe screen for the triangle-multiplication contraction core.  This is
