@@ -29,7 +29,7 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -43,12 +43,14 @@ try:
     import triton.language as tl
     from cuequivariance_ops_torch.fused_layer_norm_torch import layer_norm_transpose
     from cuequivariance_ops_torch.gated_gemm_torch import (
+        fused_sigmoid_gated_dual_gemm,
         fused_sigmoid_gated_dual_gemm_dual_x,
     )
 except ImportError:  # pragma: no cover - optional GPU dependency.
     triton = None
     tl = None
     layer_norm_transpose = None
+    fused_sigmoid_gated_dual_gemm = None
     fused_sigmoid_gated_dual_gemm_dual_x = None
 
 
@@ -265,6 +267,22 @@ if triton is not None and tl is not None:
         residual = tl.load(z + dense_row * channels + c, mask=mask, other=0.0)
         tl.store(out + dense_row * channels + c, delta + residual, mask=mask)
 
+    @triton.jit
+    def _pack_valid_rows_kernel(
+        z,
+        dense_offsets,
+        packed,
+        rows,
+        channels: tl.constexpr,
+        block_c: tl.constexpr,
+    ) -> None:
+        row = tl.program_id(0)
+        c = tl.program_id(1) * block_c + tl.arange(0, block_c)
+        dense_row = tl.load(dense_offsets + row).to(tl.int64)
+        mask = (row < rows) & (c < channels)
+        values = tl.load(z + dense_row * channels + c, mask=mask, other=0.0)
+        tl.store(packed + row * channels + c, values, mask=mask)
+
 
 def parse_ints(text: str) -> list[int]:
     values = [int(item) for item in text.split(",") if item.strip()]
@@ -275,6 +293,14 @@ def parse_ints(text: str) -> list[int]:
 
 def parse_configs(text: str) -> list[ContractConfig]:
     return [ContractConfig.parse(item.strip()) for item in text.split(",") if item.strip()]
+
+
+def parse_producers(text: str) -> list[str]:
+    producers = [item.strip() for item in text.split(",") if item.strip()]
+    bad = sorted(set(producers) - {"triton", "cueq"})
+    if bad:
+        raise argparse.ArgumentTypeError(f"unknown producer(s): {', '.join(bad)}")
+    return producers
 
 
 def lengths_from_args(args: argparse.Namespace) -> list[int]:
@@ -346,7 +372,55 @@ def cached_weights(module: torch.nn.Module) -> dict[str, torch.Tensor]:
     }
 
 
-def compact_segmented_update(
+def segmented_finish(
+    module: torch.nn.Module,
+    z: torch.Tensor,
+    x_norm: torch.Tensor,
+    ab: torch.Tensor,
+    dense_offsets: torch.Tensor,
+    descriptors: torch.Tensor,
+    config: ContractConfig,
+    direction: str,
+    weights: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    rows = dense_offsets.numel()
+    update = torch.empty((rows, C_Z), device=z.device, dtype=z.dtype)
+    contract_grid = (descriptors.shape[0], triton.cdiv(C_Z, config.block_d))
+    _compact_contract_kernel[contract_grid](
+        ab,
+        descriptors,
+        update,
+        rows,
+        C_Z,
+        z.shape[1],
+        0 if direction == "outgoing" else 1,
+        config.block_m,
+        config.block_n,
+        config.block_k,
+        config.block_d,
+        num_warps=config.num_warps,
+        num_stages=config.num_stages,
+    )
+    update_norm = layer_norm_transpose(
+        update,
+        module.layer_norm_out.weight,
+        module.layer_norm_out.bias,
+        eps=1e-5,
+        layout="nd->nd",
+    )
+    compact_delta = fused_sigmoid_gated_dual_gemm_dual_x(
+        x_norm,
+        update_norm,
+        weights["g_out"],
+        weights["p_out"],
+    )
+    out = torch.empty_like(z)
+    scatter_grid = (rows, triton.cdiv(C_Z, 64))
+    _scatter_residual_kernel[scatter_grid](compact_delta, z, dense_offsets, out, rows, C_Z, 64)
+    return out
+
+
+def triton_producer_update(
     module: torch.nn.Module,
     z: torch.Tensor,
     dense_offsets: torch.Tensor,
@@ -382,41 +456,37 @@ def compact_segmented_update(
         num_warps=4,
         num_stages=3,
     )
+    return segmented_finish(module, z, x_norm, ab, dense_offsets, descriptors, config, direction, weights)
 
-    update = torch.empty((rows, C_Z), device=z.device, dtype=z.dtype)
-    contract_grid = (descriptors.shape[0], triton.cdiv(C_Z, config.block_d))
-    _compact_contract_kernel[contract_grid](
-        ab,
-        descriptors,
-        update,
-        rows,
-        C_Z,
-        z.shape[1],
-        0 if direction == "outgoing" else 1,
-        config.block_m,
-        config.block_n,
-        config.block_k,
-        config.block_d,
-        num_warps=config.num_warps,
-        num_stages=config.num_stages,
-    )
-    update_norm = layer_norm_transpose(
-        update,
-        module.layer_norm_out.weight,
-        module.layer_norm_out.bias,
+
+def cueq_producer_update(
+    module: torch.nn.Module,
+    z: torch.Tensor,
+    dense_offsets: torch.Tensor,
+    descriptors: torch.Tensor,
+    config: ContractConfig,
+    direction: str,
+    weights: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    rows = dense_offsets.numel()
+    z_valid = torch.empty((rows, C_Z), device=z.device, dtype=z.dtype)
+    pack_grid = (rows, triton.cdiv(C_Z, 64))
+    _pack_valid_rows_kernel[pack_grid](z, dense_offsets, z_valid, rows, C_Z, 64)
+    x_norm = layer_norm_transpose(
+        z_valid,
+        module.layer_norm_in.weight,
+        module.layer_norm_in.bias,
         eps=1e-5,
         layout="nd->nd",
     )
-    compact_delta = fused_sigmoid_gated_dual_gemm_dual_x(
+    ab = fused_sigmoid_gated_dual_gemm(
         x_norm,
-        update_norm,
-        weights["g_out"],
-        weights["p_out"],
+        weights["g_in"],
+        weights["p_in"],
+        mask=None,
+        transpose_out=True,
     )
-    out = torch.empty_like(z)
-    scatter_grid = (rows, triton.cdiv(C_Z, 64))
-    _scatter_residual_kernel[scatter_grid](compact_delta, z, dense_offsets, out, rows, C_Z, 64)
-    return out
+    return segmented_finish(module, z, x_norm, ab, dense_offsets, descriptors, config, direction, weights)
 
 
 def baseline_update(module: torch.nn.Module, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -463,6 +533,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preset", choices=["short", "long"], default="long")
     parser.add_argument("--lengths", type=parse_ints)
     parser.add_argument("--direction", choices=["outgoing", "incoming", "both"], default="both")
+    parser.add_argument("--producers", type=parse_producers, default=parse_producers("triton,cueq"))
     parser.add_argument(
         "--configs",
         type=parse_configs,
@@ -479,8 +550,8 @@ def main() -> None:
     args = parse_args()
     if triton is None or tl is None or layer_norm_transpose is None:
         raise RuntimeError("Triton and CUEQ torch ops are required")
-    if fused_sigmoid_gated_dual_gemm_dual_x is None:
-        raise RuntimeError("CUEQ dual-input gated GEMM is required")
+    if fused_sigmoid_gated_dual_gemm is None or fused_sigmoid_gated_dual_gemm_dual_x is None:
+        raise RuntimeError("CUEQ gated GEMM ops are required")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -500,34 +571,36 @@ def main() -> None:
         )
         direction_results: dict[str, Any] = {
             "baseline_cueq": {"ms": base_ms},
-            "compact_segmented": {},
+            "compact_segmented": {producer: {} for producer in args.producers},
         }
         for config in args.configs:
             dense_offsets, descriptors = make_metadata(lengths, config)
-            candidate, ms = cuda_time(
-                lambda config=config, dense_offsets=dense_offsets, descriptors=descriptors: compact_segmented_update(
-                    module,
-                    z,
-                    dense_offsets,
-                    descriptors,
-                    config,
-                    direction,
-                    weights,
-                ),
-                args.warmup,
-                args.iters,
-            )
-            direction_results["compact_segmented"][config.label()] = {
-                "config": vars(config),
-                "descriptor_count": int(descriptors.shape[0]),
-                "valid_rows": int(dense_offsets.numel()),
-                "ms": ms,
-                "speedup_vs_baseline": base_ms / ms,
-                "parity_valid": compare(
-                    valid_from_dense(base_out, dense_offsets),
-                    valid_from_dense(candidate, dense_offsets),
-                ),
-            }
+            for producer in args.producers:
+                update_fn = triton_producer_update if producer == "triton" else cueq_producer_update
+                candidate, ms = cuda_time(
+                    lambda update_fn=update_fn, config=config, dense_offsets=dense_offsets, descriptors=descriptors: update_fn(
+                        module,
+                        z,
+                        dense_offsets,
+                        descriptors,
+                        config,
+                        direction,
+                        weights,
+                    ),
+                    args.warmup,
+                    args.iters,
+                )
+                direction_results["compact_segmented"][producer][config.label()] = {
+                    "config": vars(config),
+                    "descriptor_count": int(descriptors.shape[0]),
+                    "valid_rows": int(dense_offsets.numel()),
+                    "ms": ms,
+                    "speedup_vs_baseline": base_ms / ms,
+                    "parity_valid": compare(
+                        valid_from_dense(base_out, dense_offsets),
+                        valid_from_dense(candidate, dense_offsets),
+                    ),
+                }
         results[direction] = direction_results
 
     n_max = max(lengths)
