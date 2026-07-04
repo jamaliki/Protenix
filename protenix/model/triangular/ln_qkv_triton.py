@@ -46,7 +46,7 @@ _DEFAULT_MIN_ROWS = 100_000
 
 
 def triton_ln_qkv_cueq_enabled() -> bool:
-    value = os.getenv("PROTENIX_TRITON_LN_QKV_CUEQ", "0")
+    value = os.getenv("PROTENIX_TRITON_LN_QKV_CUEQ", "1")
     return value.lower() not in _FALSE_ENV_VALUES
 
 

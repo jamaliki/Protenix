@@ -180,6 +180,16 @@ around ending-node triangle attention and gave about `+1.5%` on the pairformer
 subtotal, or `+0.6%` on the full B32 same-token variable-atom predict gate.  Set
 it to `0` only when bisecting a numerical or shape-specific issue.
 
+Base-width CUEQ triangle attention also uses a guarded Triton
+LayerNorm+q/k/v producer (`PROTENIX_TRITON_LN_QKV_CUEQ=1`).  Triangle
+attention still needs the normalized pair tensor for its bias and gate
+projections, so this is not a giant attention rewrite: it keeps the CUEQ
+attention mainloop and only fuses the normalized activation write, q/k/v GEMM,
+and CUEQ heads-first layout producer.  The guard is deliberately narrow
+(BF16, CUDA, no grad, contiguous base-model `c_z=128`, enough rows), because
+the wider Protenix-v2 shape lost to cuBLAS in the screen.  Set it to `0` for
+conservative bisects or when profiling a new shape family.
+
 On H100, this branch also installs a small Protenix overlay for CUEQ's Triton
 autotune cache (`PROTENIX_CUEQ_H100_TRITON_CACHE=1`).  CUEQ already ships a
 large cache of tuned tile choices, but Protenix-v2's wider B32/N251 triangle
@@ -302,7 +312,7 @@ dumping:
 | 32 same-token, variable-atom 251-token records, base checkpoint | 301.9 s summed predict at `--batch_size 1` | 41.2 s predict, 39.3 s model-forward at `--batch_size 32`; pairformer is 26.7 s with the large-row dual-GEMM transition guard | 7.3x predict vs current unbatched path |
 | 64 shuffled variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=1` scout gate | 32.94 s batch-section time, 1.94 records/s | 12.15 s, 5.27 records/s after automatic length sort | 2.71x batch-section throughput |
 | 32 variable-length proteins, 40-220 tokens, `N_sample=1`, `N_step=200` | 193.2 s summed predict, 0.166 warm records/s | 33.1 s wall, 29.9 s summed predict, 0.968 records/s at `--batch_size 16` with batched diffusion token+atom+conditioning path | 5.83x single-process throughput |
-| 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 41.6 s, 3.85 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, BF16 diffusion core, BF16 atom attention, Triton local atom attention, default Triton LayerNorm fallback, and cached diffusion pair bias | 5.11x over the old branch boundary |
+| 32 variable-length proteins, 40-220 tokens, `N_sample=5`, `N_step=200` | 212.5 s summed predict, 0.753 generated samples/s with the old low-sample boundary | 38.3 s, 4.18 generated samples/s at `--batch_size 16` with flattened sample lanes, BF16 full attention, BF16 diffusion core, BF16 atom attention, Triton local atom attention, default Triton LayerNorm fallback, cached diffusion pair bias, and guarded triangle LN+q/k/v production | 5.55x over the old branch boundary |
 | Same mixed-token `N_sample=1` workload, many campaign shards on one H100 | 0.166 records/s original low-sample boundary | 1.77 records/s with five `--batch_size 16` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20` | 10.7x per-GPU operational throughput |
 | Same mixed-token `N_sample=5` workload, many campaign shards on one H100 | 0.753 generated samples/s original low-sample boundary | 6.60 generated samples/s with sixteen `--batch_size 4` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=6` | 8.8x per-GPU operational throughput |
 
@@ -358,11 +368,13 @@ Important details:
   low-sample branch boundary (`0.166` records/s).  For mixed `N_sample=5`,
   smaller per-worker batches helped once MPS recovered occupancy: sixteen
   `--batch_size 4` workers at 6% reached `6.60` generated samples/s, `1.71x`
-  over the prior single-process promoted rate (`3.85` generated samples/s) and
-  about `8.8x` over the original low-sample boundary (`0.753` generated
-  samples/s).  B4 with 12 or 14 workers and B8 with 10 workers were slower; a
-  B4/18 follow-up was already below the B4/16 rate before it finished, so do
-  not keep adding workers blindly.
+  over the cache-era single-process promoted rate (`3.85` generated samples/s)
+  and about `8.8x` over the original low-sample boundary (`0.753` generated
+  samples/s).  The newer triangle LN+q/k/v default moves the single-process
+  gate to `4.18` generated samples/s, but the MPS width sweep has not yet been
+  repeated with that default.  B4 with 12 or 14 workers and B8 with 10 workers
+  were slower; a B4/18 follow-up was already below the B4/16 rate before it
+  finished, so do not keep adding workers blindly.
 - Keep `PROTENIX_PREFETCH_DATALOADER=1` for long MPS campaigns if host memory
   allows it, but treat it as a modest host-overlap polish rather than the main
   speedup.  In paired five-worker MPS gates it added `1-2%` throughput while

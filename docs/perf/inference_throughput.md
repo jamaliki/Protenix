@@ -396,19 +396,67 @@ fallback:
 | --- | --- | ---: | ---: | ---: | --- | --- |
 | v2 `c_z=256`, `heads=8` | start | 4.823 ms | 4.802 ms | 5.070 ms | `64x128x4` | reject, `0.95x` vs current |
 | v2 `c_z=256`, `heads=8` | ending/swapped | 5.056 ms | 5.046 ms | 5.145 ms | `64x128x4` | reject, `0.98x` vs current |
-| base `c_z=128`, `heads=4` | start | 3.029 ms | 3.021 ms | 2.028 ms | `32x64x4` | isolated `1.49x`, not promoted here |
-| base `c_z=128`, `heads=4` | ending/swapped | 3.119 ms | 3.107 ms | 2.038 ms | `32x64x4` | isolated `1.53x`, not promoted here |
+| base `c_z=128`, `heads=4` | start | 3.029 ms | 3.021 ms | 2.028 ms | `32x64x4` | isolated `1.49x`, advanced to guarded production gate |
+| base `c_z=128`, `heads=4` | ending/swapped | 3.119 ms | 3.107 ms | 2.038 ms | `32x64x4` | isolated `1.53x`, advanced to guarded production gate |
 
 Parity against the cached producer was within BF16 projection tolerance
 (`max_abs <= 0.03125`, mean absolute error about `1.5e-7`).  Mechanistically,
 the base shape is narrow enough that deleting the LayerNorm materialization and
 layout pass beats the less-polished Triton matmul.  At the actual v2 target
 shape (`C=256`, hidden q/k/v width `256`), the custom kernel cannot match the
-library qkv GEMM plus existing layout helper.  Do not integrate this fused
+library qkv GEMM plus existing layout helper.  Do not enable this fused
 producer for Protenix-v2 unless the mainloop is rewritten with a vendor-class
 CuTe/CUTLASS design; the simple Triton boundary is not the remaining v2 win.
-The base-shape signal is a possible future guardrail follow-up, but it does not
-solve the current v2 same-token campaign bottleneck.
+
+The base-width follow-up used a production-usable boundary: the Triton kernel
+still writes `x_norm` because triangle attention also consumes the normalized
+pair tensor for its small bias and gate projections.  It therefore replaces
+`LayerNorm -> qkv GEMM -> CUEQ qkv layout` without replacing CUEQ's attention
+mainloop.  Job `103155`
+(`runs/ln_qkv_probe_mixed_b16_storenorm_20260704_091035_778003b`) screened the
+store-normalized variant on the two padded mixed-token endpoints:
+
+| shape | orientation | current producer | store-normalized fused producer | producer speedup |
+| --- | --- | ---: | ---: | ---: |
+| `B16, N124` | start | 0.3912 ms | 0.2072 ms | `1.888x` |
+| `B16, N124` | ending/swapped | 0.3930 ms | 0.2134 ms | `1.841x` |
+| `B16, N220` | start | 1.1745 ms | 0.6300 ms | `1.864x` |
+| `B16, N220` | ending/swapped | 1.1994 ms | 0.6542 ms | `1.833x` |
+
+Commit `8d45cc7` integrated this as
+`PROTENIX_TRITON_LN_QKV_CUEQ`, guarded by BF16, CUDA, no grad, contiguous
+base-width `c_z=128`, CUEQ heads `4x32`, and a default minimum of 100k pair
+rows.  The production block gate, job `103176`
+(`runs/ln_qkv_production_gate_20260704_091705_8d45cc7`), first checked parity
+against the ordinary CUEQ triangle-attention path (`max_abs <= 9.77e-4`,
+mean absolute error about `3e-7`) and then timed full `PairformerBlock`
+for the representative mixed-token padded buckets:
+
+| shape | flag off block | flag on block | block speedup | moved subranges |
+| --- | ---: | ---: | ---: | --- |
+| `B16, N124` | 4.7825 ms | 4.4480 ms | `1.075x` | start triangle attention `0.9135 -> 0.7380 ms`; ending producer `0.9692 -> 0.7879 ms` |
+| `B16, N220` | 14.5197 ms | 13.3630 ms | `1.087x` | start triangle attention `3.3265 -> 2.7591 ms`; ending producer `3.5058 -> 2.9352 ms` |
+
+The representative full mixed-token `N_sample=5`, `N_step=200`, `B16`, normal
+dumping, confidence-enabled gate was job `103226`
+(`runs/ln_qkv_mixed_full_gate_20260704_092542_8d45cc7`).  It warmed both
+policies, then ran an off/on/on/off sequence.  All measured cases produced the
+expected 160 CIFs:
+
+| case | predict sec | generated samples/s | pairformer | diffusion | confidence |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| baseline A, flag off | 39.290 | 4.072 | 14.410 | 20.717 | 2.457 |
+| candidate A, flag on | 38.280 | 4.180 | 13.632 | 20.591 | 2.399 |
+| candidate B, flag on | 38.330 | 4.174 | 13.647 | 20.576 | 2.424 |
+| baseline B, flag off | 39.100 | 4.092 | 14.420 | 20.580 | 2.425 |
+| average | 39.195 | 4.082 | 14.415 | 20.649 | 2.441 |
+| average, flag on | 38.305 | 4.177 | 13.640 | 20.584 | 2.412 |
+
+Decision: promote the base-width LN+q/k/v producer as default-on.  The full
+gate improved predict throughput by `1.023x` and the pairformer subtotal by
+`1.057x`, with diffusion essentially unchanged.  The implementation remains
+safe for v2 because the default guard excludes `c_z=256`/8-head triangle
+attention, where the isolated screen lost to cuBLAS.
 
 Current-head Protenix-v2 end-to-end validation is still blocked by checkpoint
 availability in the Kiarash runtime, not by model code.  Job `102199`
@@ -1042,11 +1090,13 @@ old local-attention/SDPA boundary still stores and reloads large FP32 tensors.
 The Triton local-attention kernel consumes the profiled 32-query by 128-key atom
 window directly, and the fused bias producer writes the layout that kernel
 expects.  The atom encoder+decoder subtotal falls from `14.83s` to `5.06s`;
-pairformer and confidence stay flat.  The current mixed-sequence `N_sample=5`
+pairformer and confidence stay flat.  At this point in the campaign, the
+mixed-sequence `N_sample=5`
 headline is therefore `212.51s -> 44.36s` predict and `0.753 -> 3.607`
 generated samples/s, or `4.79x` over the old low-sample boundary.  The later
-diffusion pair-bias cache gate below supersedes this headline with a `5.11x`
-default by reducing the remaining diffusion-transformer subtotal.
+diffusion pair-bias cache and triangle LN+q/k/v gates below supersede this
+headline by reducing the remaining diffusion-transformer and pairformer
+subtotals.
 
 Pairformer token-attention follow-up: job `96365`
 (`runs/token_attention_gate_n200_20260703_015502_0dda88a`) tested an opt-in
@@ -1220,9 +1270,12 @@ default/cache repeats:
 
 The paired result improves the intended diffusion-transformer subtotal by about
 `1.30x` and the whole predict section by `1.08x` without moving pairformer or
-confidence.  The current practical mixed-sequence `N_sample=5` headline is now
+confidence.  At this point in the campaign, the practical mixed-sequence
+`N_sample=5` headline is
 `212.51s -> 41.61s` predict on average and `0.753 -> 3.85` generated samples/s,
-or `5.11x` over the old low-sample boundary.  The cache is now default-on for
+or `5.11x` over the old low-sample boundary; the later triangle LN+q/k/v gate
+raises the current single-process headline to `38.3s` and `4.18` generated
+samples/s.  The cache is now default-on for
 multi-step batched diffusion and can be disabled with
 `PROTENIX_CACHE_DIFFUSION_PAIR_BIAS=0`; `N_step=1` scout runs skip it because
 there is no reuse window.
@@ -3713,10 +3766,13 @@ Interpretation:
   `N_sample=1`, treat **five MPS workers per H100 at 20% each** as the
   practical knee.  For maximum `N_sample=5` aggregate throughput, the best
   measured operational mode is **sixteen B4 workers at 6% each**.
-- Compared with the prior promoted single-process low-sample rate (`3.85`
+- Compared with the cache-era promoted single-process low-sample rate (`3.85`
   generated samples/s), the B4/sixteen-worker `6.601` generated samples/s
-  result is a `1.71x` operational gain.  Compared with the original low-sample
-  branch boundary (`0.753` generated samples/s), it is about `8.8x` per-GPU
+  result is a `1.71x` operational gain.  The later triangle LN+q/k/v default
+  moved the single-process gate to `4.18` generated samples/s, but this MPS
+  width sweep has not yet been repeated with that default.  Compared with the
+  original low-sample branch boundary (`0.753` generated samples/s), the
+  measured B4/sixteen-worker MPS result remains about `8.8x` per-GPU
   throughput.
 - For `N_sample=1`, current single-process throughput is `0.968` records/s
   versus the original `0.166` records/s default (`5.83x`).  Five MPS workers at
