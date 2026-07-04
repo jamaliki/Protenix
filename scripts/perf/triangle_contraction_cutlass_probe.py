@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """CUTLASS/CuTe screen for the v2 triangle-multiplication contraction core.
 
-Benchmark-only candidate.  It isolates the middle of CUEQ triangle
-multiplication:
-
     out[d,b,i,j] = sum_k lhs[d,b,i,k] * rhs[d,b,j,k]
 
-Exact-length rows pre-materialize groups before timing, so they are an
-optimistic core-only ceiling rather than a deployable ragged path.
+Exact-length rows pre-materialize groups before timing: this is an optimistic
+core-only ceiling, not a deployable ragged path.
 """
 
 from __future__ import annotations
@@ -31,13 +28,13 @@ from scripts.perf.transition_output_epilogue_cutlass_candidate import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DTYPE = torch.bfloat16
 _EXT = None
+_CUTLASS_MULTIPLE = 8
 
 SHORT_LENGTHS = [40, 40, 52, 52, 64, 64, 76, 76, 88, 88, 100, 100, 112, 112, 124, 124]
 LONG_LENGTHS = [
     136, 136, 160, 160, 172, 172, 184, 184,
     196, 196, 208, 208, 216, 216, 220, 220,
 ]
-
 def parse_ints(text: str) -> list[int]:
     values = [int(item) for item in text.split(",") if item.strip()]
     if not values or any(value <= 0 for value in values):
@@ -102,7 +99,6 @@ def make_operands(
     lengths: list[int],
     *,
     features: int,
-    direction: str,
     seed: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     n_max = max(lengths)
@@ -117,16 +113,23 @@ def make_operands(
         rhs[:, batch_index, :length, :length] = torch.randn(
             shape, device="cuda", dtype=DTYPE, generator=generator
         )
-    if direction == "incoming":
-        # Incoming triangle multiplication reads a[d,b,k,i] and b[d,b,k,j].
-        # Transposing both operands turns it into the same row-major GEMM core.
-        lhs = lhs.transpose(-1, -2)
-        rhs = rhs.transpose(-1, -2)
     return lhs.contiguous(), rhs.contiguous()
 
 
 def torch_contract(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     return torch.einsum("dbik,dbjk->dbij", lhs, rhs)
+
+
+def pad_for_cutlass(lhs: torch.Tensor, rhs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+    n = lhs.shape[-1]
+    n_pad = ((n + _CUTLASS_MULTIPLE - 1) // _CUTLASS_MULTIPLE) * _CUTLASS_MULTIPLE
+    if lhs.shape[-2] == n_pad and rhs.shape[-2] == n_pad and n == n_pad:
+        return lhs, rhs, n_pad
+    lhs_pad = lhs.new_zeros(*lhs.shape[:-2], n_pad, n_pad)
+    rhs_pad = rhs.new_zeros(*rhs.shape[:-2], n_pad, n_pad)
+    lhs_pad[..., : lhs.shape[-2], : lhs.shape[-1]] = lhs
+    rhs_pad[..., : rhs.shape[-2], : rhs.shape[-1]] = rhs
+    return lhs_pad.contiguous(), rhs_pad.contiguous(), n_pad
 
 
 def cutlass_contract(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
@@ -148,14 +151,10 @@ def make_exact_groups(
     out = []
     for length, indices in length_groups(lengths):
         index_tensor = torch.tensor(indices, device=lhs.device)
-        out.append(
-            (
-                length,
-                indices,
-                lhs[:, index_tensor, :length, :length].contiguous(),
-                rhs[:, index_tensor, :length, :length].contiguous(),
-            )
-        )
+        lhs_group = lhs[:, index_tensor, :length, :length].contiguous()
+        rhs_group = rhs[:, index_tensor, :length, :length].contiguous()
+        lhs_group, rhs_group, _ = pad_for_cutlass(lhs_group, rhs_group)
+        out.append((length, indices, lhs_group, rhs_group))
     return out
 
 
@@ -192,7 +191,7 @@ def grouped_error(
         for group_pos, source_index in enumerate(indices):
             diff = (
                 ref[:, source_index, :length, :length].float()
-                - out[:, group_pos, :, :].float()
+                - out[:, group_pos, :length, :length].float()
             ).abs()
             max_abs = max(max_abs, float(diff.max().item()))
             total_abs += float(diff.sum().item())
@@ -223,7 +222,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preset", choices=["short", "long"], default="long")
     parser.add_argument("--lengths", type=parse_ints)
     parser.add_argument("--features", type=int, default=256)
-    parser.add_argument("--direction", choices=["outgoing", "incoming"], default="outgoing")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=123)
@@ -238,7 +236,8 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
 
     lengths = lengths_from_args(args)
-    lhs, rhs = make_operands(lengths, features=args.features, direction=args.direction, seed=args.seed)
+    lhs, rhs = make_operands(lengths, features=args.features, seed=args.seed)
+    lhs_cutlass, rhs_cutlass, n_cutlass = pad_for_cutlass(lhs, rhs)
     groups = make_exact_groups(lhs, rhs, lengths)
     n_max = max(lengths)
     dense_work = len(lengths) * n_max**3
@@ -246,7 +245,7 @@ def main() -> None:
 
     timing = {"warmup": args.warmup, "iters": args.iters}
     ref, torch_ms = cuda_time(lambda: torch_contract(lhs, rhs), **timing)
-    dense_cutlass, cutlass_ms = cuda_time(lambda: cutlass_contract(lhs, rhs), **timing)
+    dense_cutlass, cutlass_ms = cuda_time(lambda: cutlass_contract(lhs_cutlass, rhs_cutlass), **timing)
     grouped_torch, grouped_torch_ms = cuda_time(lambda: grouped_contract(groups, torch_contract), **timing)
     grouped_cutlass, grouped_cutlass_ms = cuda_time(
         lambda: grouped_contract(groups, cutlass_contract), **timing
@@ -259,6 +258,7 @@ def main() -> None:
             "features": args.features,
             "batch": len(lengths),
             "n_max": n_max,
+            "n_cutlass_dense": n_cutlass,
             "lengths": lengths,
             **efficiency(lengths),
         },

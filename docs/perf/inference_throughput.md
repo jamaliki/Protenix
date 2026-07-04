@@ -4113,7 +4113,10 @@ short-term implementation ladder is:
    executable benchmark scaffold is
    `scripts/perf/triangle_contraction_cutlass_probe.py`, with its SM90
    CUTLASS/CuTe candidate in
-   `scripts/perf/triangle_contraction_cutlass_probe_sm90.cu`.
+   `scripts/perf/triangle_contraction_cutlass_probe_sm90.cu`.  The first smoke
+   compile showed that raw `N=124/220` BF16 row strides are not TMA-friendly, so
+   the probe pads CUTLASS operands to a multiple of 8 and compares only the
+   valid region.
 2. **Full segmented triangle-mul update:** fuse or internally schedule the
    LayerNorm, gated input projection, segmented contraction, output LayerNorm,
    output projection/gate, and residual store for valid rows.  This is the first
