@@ -34,6 +34,7 @@ LONG_LENGTHS = [
     196, 196, 208, 208, 216, 216, 220, 220,
 ]
 _EXT = None
+_CUTLASS_MULTIPLE = 8
 
 
 def parse_ints(text: str) -> list[int]:
@@ -105,6 +106,18 @@ def make_operands(lengths: list[int], *, features: int, seed: int):
             shape, device="cuda", dtype=DTYPE, generator=generator
         )
     return lhs.contiguous(), rhs.contiguous()
+
+
+def pad_for_cutlass(lhs: torch.Tensor, rhs: torch.Tensor):
+    n = lhs.shape[-1]
+    n_pad = ((n + _CUTLASS_MULTIPLE - 1) // _CUTLASS_MULTIPLE) * _CUTLASS_MULTIPLE
+    if n == n_pad:
+        return lhs, rhs, n_pad
+    lhs_pad = lhs.new_zeros(*lhs.shape[:-2], n_pad, n_pad)
+    rhs_pad = rhs.new_zeros(*rhs.shape[:-2], n_pad, n_pad)
+    lhs_pad[..., :n, :n] = lhs
+    rhs_pad[..., :n, :n] = rhs
+    return lhs_pad.contiguous(), rhs_pad.contiguous(), n_pad
 
 
 def torch_contract(lhs: torch.Tensor, rhs: torch.Tensor, direction: str) -> torch.Tensor:
@@ -181,6 +194,7 @@ def main() -> None:
     lengths = lengths_from_args(args)
     lengths_tensor = torch.tensor(lengths, device="cuda", dtype=torch.int32)
     lhs, rhs = make_operands(lengths, features=args.features, seed=args.seed)
+    lhs_cutlass, rhs_cutlass, n_cutlass = pad_for_cutlass(lhs, rhs)
     n_max = max(lengths)
     dense_work = len(lengths) * n_max**3
     exact_work = sum(length**3 for length in lengths)
@@ -188,7 +202,7 @@ def main() -> None:
 
     ref, torch_ms = cuda_time(lambda: torch_contract(lhs, rhs, args.direction), **timing)
     grouped, grouped_ms = cuda_time(
-        lambda: cutlass_grouped_contract(lhs, rhs, lengths_tensor, args.direction),
+        lambda: cutlass_grouped_contract(lhs_cutlass, rhs_cutlass, lengths_tensor, args.direction),
         **timing,
     )
 
@@ -199,6 +213,7 @@ def main() -> None:
             "features": args.features,
             "batch": len(lengths),
             "n_max": n_max,
+            "n_cutlass": n_cutlass,
             "lengths": lengths,
             **efficiency(lengths),
         },
