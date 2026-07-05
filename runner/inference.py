@@ -73,6 +73,35 @@ def _skip_inference_weight_init_enabled(configs: Any) -> bool:
     return value not in {"0", "false", "off", "no"}
 
 
+def _cuda_memory_profile_enabled() -> bool:
+    value = os.getenv("PROTENIX_PROFILE_CUDA_MEMORY", "")
+    return torch.cuda.is_available() and value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _reset_cuda_peak_memory_for_profile(enabled: bool) -> None:
+    if not enabled:
+        return
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+
+
+def _cuda_memory_snapshot(enabled: bool) -> dict[str, float] | None:
+    if not enabled:
+        return None
+    torch.cuda.synchronize()
+    return {
+        "allocated_mib": torch.cuda.memory_allocated() / 2**20,
+        "reserved_mib": torch.cuda.memory_reserved() / 2**20,
+        "max_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
+        "max_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
+    }
+
+
 class InferenceRunner(object):
     """
     Runner class for AlphaFold3 model inference.
@@ -312,7 +341,10 @@ class InferenceRunner(object):
             if torch.cuda.is_available()
             else nullcontext()
         )
+        profile_memory = _cuda_memory_profile_enabled()
+        memory_summary: dict[str, Any] = {}
 
+        _reset_cuda_peak_memory_for_profile(profile_memory)
         feature_dicts = [
             to_device(_copy_tree(data["input_feature_dict"]), self.device)
             for data in data_items
@@ -354,6 +386,10 @@ class InferenceRunner(object):
                 prepared_features.append(feature_dict)
                 s_inputs_list.append(s_inputs)
 
+            snapshot = _cuda_memory_snapshot(profile_memory)
+            if snapshot is not None:
+                memory_summary["input_embedder"] = snapshot
+
             if exact_token_trunk or use_trunk_buckets:
                 # Padded-token pairformer batching is fast, but BF16/TF32
                 # triangular reductions are not invariant to the padded physical
@@ -364,6 +400,7 @@ class InferenceRunner(object):
                 # batched across the original queue batch below.
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
+                _reset_cuda_peak_memory_for_profile(profile_memory)
                 trunk_start = time.perf_counter()
                 s_items: list[torch.Tensor | None] = [None] * len(data_items)
                 z_items: list[torch.Tensor | None] = [None] * len(data_items)
@@ -455,6 +492,9 @@ class InferenceRunner(object):
                         )
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
+                snapshot = _cuda_memory_snapshot(profile_memory)
+                if snapshot is not None:
+                    memory_summary["pairformer_trunk"] = snapshot
                 trunk_sec_per_item = (
                     time.perf_counter() - trunk_start
                 ) / len(data_items)
@@ -506,6 +546,7 @@ class InferenceRunner(object):
                     pair_mask = None
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
+                _reset_cuda_peak_memory_for_profile(profile_memory)
                 trunk_start = time.perf_counter()
                 s_batch, z_batch = self.model.get_pairformer_output_from_s_inputs(
                     input_feature_dict=trunk_feature_dict,
@@ -517,6 +558,9 @@ class InferenceRunner(object):
                 )
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
+                snapshot = _cuda_memory_snapshot(profile_memory)
+                if snapshot is not None:
+                    memory_summary["pairformer_trunk"] = snapshot
                 trunk_sec_per_item = (
                     time.perf_counter() - trunk_start
                 ) / len(data_items)
@@ -546,6 +590,7 @@ class InferenceRunner(object):
                 trunk_source = "token-trunk"
             diffusion_batch_source = f"{trunk_source}-batch"
             if use_batched_diffusion:
+                _reset_cuda_peak_memory_for_profile(profile_memory)
                 batched_coordinates, batch_diffusion_time = (
                     self.model.sample_diffusion_batch_token_transformer(
                         input_feature_dicts=prepared_features,
@@ -556,6 +601,9 @@ class InferenceRunner(object):
                         inplace_safe=inplace_safe,
                     )
                 )
+                snapshot = _cuda_memory_snapshot(profile_memory)
+                if snapshot is not None:
+                    memory_summary["batched_diffusion"] = snapshot
                 batch_diffusion_time["diffusion_token_transformer_batched"] = True
                 diffusion_batch_source = (
                     f"{trunk_source}+diffusion-token-atom-batch"
@@ -574,6 +622,7 @@ class InferenceRunner(object):
             for batch_idx, feature_dict in enumerate(prepared_features):
                 s_i = s_items[batch_idx]
                 z_i = z_items[batch_idx]
+                _reset_cuda_peak_memory_for_profile(profile_memory)
                 pred_dict, log_dict, time_tracker = (
                     self.model.finish_inference_from_pairformer(
                         input_feature_dict=feature_dict,
@@ -594,6 +643,9 @@ class InferenceRunner(object):
                         precomputed_diffusion_time=diffusion_time_per_item,
                     )
                 )
+                snapshot = _cuda_memory_snapshot(profile_memory)
+                if snapshot is not None:
+                    memory_summary[f"finish_item_{batch_idx}"] = snapshot
                 log_dict["time"] = time_tracker
                 predictions.append(pred_dict)
                 log_dicts.append(log_dict)
@@ -604,6 +656,12 @@ class InferenceRunner(object):
             item_count=len(data_items),
             source=diffusion_batch_source,
         )
+        if self.last_batch_time_summary is not None and memory_summary:
+            # This is intentionally an opt-in profiling payload.  Stage peaks
+            # are measured after resetting CUDA's process-local peak counter at
+            # stage boundaries, so they should be used for attribution rather
+            # than for normal throughput accounting.
+            self.last_batch_time_summary["cuda_memory"] = memory_summary
         return predictions
 
     def print(self, msg: str) -> None:
@@ -1474,6 +1532,26 @@ def _format_time_fields(values: Mapping[str, float], denominator: float | None) 
     return ", ".join(fields)
 
 
+def _format_cuda_memory_fields(stages: Mapping[str, Mapping[str, float]]) -> str:
+    """Format opt-in stage memory peaks for log parsing.
+
+    ``max_alloc`` is the useful live-tensor signal.  ``max_reserved`` is kept
+    beside it because MPS failures can also come from allocator reserve/context
+    overhead.  Normal inference does not pay for this path; the caller must set
+    ``PROTENIX_PROFILE_CUDA_MEMORY=1``.
+    """
+
+    fields = []
+    for stage, values in stages.items():
+        fields.append(
+            f"{stage}:alloc={values['allocated_mib']:.0f}MiB,"
+            f"res={values['reserved_mib']:.0f}MiB,"
+            f"max_alloc={values['max_allocated_mib']:.0f}MiB,"
+            f"max_res={values['max_reserved_mib']:.0f}MiB"
+        )
+    return "; ".join(fields)
+
+
 def _log_model_time_summary(
     runner: InferenceRunner,
     batch_size: int,
@@ -1512,6 +1590,14 @@ def _log_model_time_summary(
             DIST_WRAPPER.rank,
             summary["source"],
             _format_time_fields(per_input, denominator=None),
+        )
+    memory = summary.get("cuda_memory")
+    if isinstance(memory, MappingABC):
+        logger.info(
+            "[Rank %s] Batch CUDA memory (%s): %s",
+            DIST_WRAPPER.rank,
+            summary["source"],
+            _format_cuda_memory_fields(memory),
         )
 
 
