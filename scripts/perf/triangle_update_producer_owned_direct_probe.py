@@ -41,6 +41,7 @@ from scripts.perf.triangle_update_compact_segmented_probe import (
 )
 from scripts.perf.triangle_update_producer_owned_finish_probe import (
     OwnedGroup,
+    producer_owned_finish_contracted_recompute_gate,
     producer_owned_finish,
     producer_owned_finish_recompute_gate,
 )
@@ -310,6 +311,14 @@ def _producer_owned_finish_for_mode(
     input_mean: torch.Tensor | None = None,
     input_rstd: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if finish == "contracted_recompute_gate":
+        if input_mean is None or input_rstd is None:
+            raise ValueError(
+                "contracted_recompute_gate finish requires input LayerNorm statistics"
+            )
+        return producer_owned_finish_contracted_recompute_gate(
+            module, z, groups, dense_offsets, direction, weights, input_mean, input_rstd
+        )
     if finish == "recompute_gate":
         if input_mean is None or input_rstd is None:
             raise ValueError("recompute_gate finish requires input LayerNorm statistics")
@@ -331,7 +340,7 @@ def direct_owned_update(
     row_stat_block_rows: int = 8,
     finish: str = "current",
 ) -> torch.Tensor:
-    store_x_norm = finish != "recompute_gate"
+    store_x_norm = finish not in {"recompute_gate", "contracted_recompute_gate"}
     x_norm, groups, input_mean, input_rstd = _direct_owned_groups(
         module,
         z,
@@ -373,7 +382,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--row-stat-block-rows", type=int, default=8)
     parser.add_argument(
         "--finish",
-        choices=["current", "fused_output", "recompute_gate"],
+        choices=["current", "fused_output", "recompute_gate", "contracted_recompute_gate"],
         default="current",
     )
     parser.add_argument("--output-json")
@@ -400,7 +409,7 @@ def main() -> None:
             args.warmup,
             args.iters,
         )
-        store_x_norm = args.finish != "recompute_gate"
+        store_x_norm = args.finish not in {"recompute_gate", "contracted_recompute_gate"}
         producer_out, producer_ms = cuda_time(
             lambda: _direct_owned_groups(
                 module,

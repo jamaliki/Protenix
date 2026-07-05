@@ -170,6 +170,43 @@ def _update_row_stats_tiled_kernel(
 
 
 @triton.jit
+def _contracted_row_stats_tiled_kernel(
+    contracted,
+    mean,
+    rstd,
+    group_start: tl.constexpr,
+    group_rows: tl.constexpr,
+    length: tl.constexpr,
+    channels: tl.constexpr,
+    eps: tl.constexpr,
+    block_rows: tl.constexpr,
+    block_c: tl.constexpr,
+) -> None:
+    # ``contracted`` is still in the exact-group GEMM layout
+    # [record * channel, i, j].  This deliberately skips the usual assembly
+    # into row-major [valid_row, channel] storage, so the benchmark can answer
+    # whether the row-major update tensor is a useful cache-friendly ABI or just
+    # memory traffic we should remove in the native kernel.
+    row = (tl.program_id(0) * block_rows + tl.arange(0, block_rows)).to(tl.int64)
+    c = tl.arange(0, block_c).to(tl.int64)
+    pair_rows = length * length
+    record = row // pair_rows
+    pair = row - record * pair_rows
+    mask = (row[:, None] < group_rows) & (c[None, :] < channels)
+    values = tl.load(
+        contracted + (record[:, None] * channels + c[None, :]) * pair_rows + pair[:, None],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    mu = tl.sum(values, axis=1) / channels
+    centered = tl.where(c[None, :] < channels, values - mu[:, None], 0.0)
+    var = tl.sum(centered * centered, axis=1) / channels
+    compact_row = group_start + row
+    tl.store(mean + compact_row, mu, mask=row < group_rows)
+    tl.store(rstd + compact_row, tl.rsqrt(var + eps), mask=row < group_rows)
+
+
+@triton.jit
 def _output_dual_gemm_scatter_kernel(
     update,
     x_norm,
@@ -299,6 +336,95 @@ def _output_dual_gemm_scatter_recompute_gate_kernel(
 
         upd = tl.load(
             update + row[:, None] * channels + k[None, :],
+            mask=row_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        out_w = tl.load(output_norm_weight + k, mask=k_mask, other=0.0).to(tl.float32)
+        out_b = tl.load(output_norm_bias + k, mask=k_mask, other=0.0).to(tl.float32)
+        upd = (upd - out_mean) * out_rstd * out_w[None, :] + out_b[None, :]
+
+        gate_w = tl.load(
+            gate_weight + out_c[:, None] * channels + k[None, :],
+            mask=out_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        value_w = tl.load(
+            value_weight + out_c[:, None] * channels + k[None, :],
+            mask=out_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        acc_gate += tl.dot(gate_x, tl.trans(gate_w))
+        acc_value += tl.dot(upd.to(tl.bfloat16), tl.trans(value_w))
+
+    ptr = dense_row[:, None] * channels + out_c[None, :]
+    residual = tl.load(z + ptr, mask=row_mask[:, None] & out_mask[None, :], other=0.0)
+    delta = (1.0 / (1.0 + tl.exp(-acc_gate))) * acc_value
+    tl.store(out + ptr, delta + residual, mask=row_mask[:, None] & out_mask[None, :])
+
+
+@triton.jit
+def _contracted_output_dual_gemm_scatter_recompute_gate_kernel(
+    contracted,
+    z,
+    dense_offsets,
+    input_mean,
+    input_rstd,
+    output_mean,
+    output_rstd,
+    input_norm_weight,
+    input_norm_bias,
+    output_norm_weight,
+    output_norm_bias,
+    gate_weight,
+    value_weight,
+    out,
+    group_start: tl.constexpr,
+    group_rows: tl.constexpr,
+    length: tl.constexpr,
+    channels: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+) -> None:
+    # Same output boundary as ``recompute_gate``, but it consumes the
+    # contraction result in [record * channel, i, j] layout.  If this wins, a
+    # future CuTe kernel should keep the contraction output in its native layout
+    # and fuse the output projection instead of assembling a row-major update.
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    local_row = (pid_m * block_m + tl.arange(0, block_m)).to(tl.int64)
+    out_c = (pid_n * block_n + tl.arange(0, block_n)).to(tl.int64)
+    k_offsets = tl.arange(0, block_k).to(tl.int64)
+    global_row = group_start + local_row
+    pair_rows = length * length
+    record = local_row // pair_rows
+    pair = local_row - record * pair_rows
+    row_mask = local_row < group_rows
+    out_mask = out_c < channels
+    dense_row = tl.load(dense_offsets + global_row, mask=row_mask, other=0).to(tl.int64)
+    in_mean = tl.load(input_mean + global_row, mask=row_mask, other=0.0)[:, None]
+    in_rstd = tl.load(input_rstd + global_row, mask=row_mask, other=1.0)[:, None]
+    out_mean = tl.load(output_mean + global_row, mask=row_mask, other=0.0)[:, None]
+    out_rstd = tl.load(output_rstd + global_row, mask=row_mask, other=1.0)[:, None]
+    acc_gate = tl.zeros((block_m, block_n), dtype=tl.float32)
+    acc_value = tl.zeros((block_m, block_n), dtype=tl.float32)
+
+    for k0 in range(0, channels, block_k):
+        k = k0 + k_offsets
+        k_mask = k < channels
+        raw_gate = tl.load(
+            z + dense_row[:, None] * channels + k[None, :],
+            mask=row_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        in_w = tl.load(input_norm_weight + k, mask=k_mask, other=0.0).to(tl.float32)
+        in_b = tl.load(input_norm_bias + k, mask=k_mask, other=0.0).to(tl.float32)
+        gate_x = ((raw_gate - in_mean) * in_rstd * in_w[None, :] + in_b[None, :]).to(
+            tl.bfloat16
+        )
+
+        upd = tl.load(
+            contracted + (record[:, None] * channels + k[None, :]) * pair_rows + pair[:, None],
             mask=row_mask[:, None] & k_mask[None, :],
             other=0.0,
         ).to(tl.float32)
@@ -472,6 +598,78 @@ def producer_owned_finish_recompute_gate(
     return compact_finish_from_update_recompute_gate(
         module, z, update, dense_offsets, weights, input_mean, input_rstd
     )
+
+
+def producer_owned_finish_contracted_recompute_gate(
+    module: torch.nn.Module,
+    z: torch.Tensor,
+    groups: list[OwnedGroup],
+    dense_offsets: torch.Tensor,
+    direction: str,
+    weights: dict[str, torch.Tensor],
+    input_mean: torch.Tensor,
+    input_rstd: torch.Tensor,
+) -> torch.Tensor:
+    """Finish directly from exact-group contraction outputs.
+
+    This is a benchmark-only boundary test.  The current best direct path does:
+    ``contracted -> assemble row-major update -> stats -> output projection``.
+    This variant does ``contracted -> stats/output projection`` and therefore
+    answers whether a native triangle-update kernel should keep the contraction
+    result in its natural exact-group layout through the output epilogue.
+    """
+
+    contracted = contract_groups(groups, direction)
+    rows = dense_offsets.numel()
+    output_mean = torch.empty(rows, device=z.device, dtype=torch.float32)
+    output_rstd = torch.empty_like(output_mean)
+    for group, result in zip(groups, contracted, strict=True):
+        group_rows = group.count * group.length * group.length
+        stats_grid = (triton.cdiv(group_rows, 8),)
+        _contracted_row_stats_tiled_kernel[stats_grid](
+            result,
+            output_mean,
+            output_rstd,
+            group.start,
+            group_rows,
+            group.length,
+            C_Z,
+            1e-5,
+            8,
+            C_Z,
+            num_warps=8,
+        )
+
+    out = torch.empty_like(z)
+    for group, result in zip(groups, contracted, strict=True):
+        group_rows = group.count * group.length * group.length
+        grid = (triton.cdiv(group_rows, 64), triton.cdiv(C_Z, 128))
+        _contracted_output_dual_gemm_scatter_recompute_gate_kernel[grid](
+            result,
+            z,
+            dense_offsets,
+            input_mean,
+            input_rstd,
+            output_mean,
+            output_rstd,
+            module.layer_norm_in.weight,
+            module.layer_norm_in.bias,
+            module.layer_norm_out.weight,
+            module.layer_norm_out.bias,
+            weights["g_out"],
+            weights["p_out"],
+            out,
+            group.start,
+            group_rows,
+            group.length,
+            C_Z,
+            64,
+            128,
+            64,
+            num_warps=4,
+            num_stages=3,
+        )
+    return out
 
 
 def producer_owned_output_only(
