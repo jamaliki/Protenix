@@ -160,11 +160,25 @@ finish into the full long v2 `PairformerBlock` gate:
 
 Decision: keep this as the best current benchmark boundary and make it the
 near-term shape of the native kernel.  The production kernel should not treat
-row-major `x_norm` as a required ABI product unless a full-model numerical or
-throughput gate later proves otherwise.  The remaining acceptance bar is a
-full Protenix-v2 same-output gate (`N_sample=1` and `5`, confidence enabled)
-because a one-block `6-7%` win can still dilute across the complete trunk,
-diffusion, confidence, and output-writing path.
+row-major `x_norm` as a required ABI product.  Commit `77a168f` then wired this
+boundary into the production triangle-multiplication modules behind
+`PROTENIX_TRITON_TRIANGLE_DIRECT_RECOMPUTE_GATE=1`.  That path remains
+default-off, but it passed the first full-model gate:
+
+| production gate | flag off | flag on | speedup |
+| --- | ---: | ---: | ---: |
+| long v2 `PairformerBlock` total, job `111309` | `25.450 ms` | `23.801 ms` | `1.069x` |
+| Protenix-v2 mixed `N_sample=1` wall, job `111435` | `0.825` records/s | `0.843` records/s | `1.022x` |
+| Protenix-v2 mixed `N_sample=5` wall, job `111435` | `2.70` generated samples/s | `2.82` generated samples/s | `1.043x` |
+
+Parity job `111417` compared full production `PairformerBlock` outputs with
+the flag off/on on cloned inputs.  Valid-region drift stayed at BF16 scale
+(`z_mean_abs=0.00349`, `z_max_abs=0.078125`, `s_mean_abs=0.00255`,
+`s_max_abs=0.0625`, no NaNs).  The e2e result proves the boundary survives the
+complete trunk, diffusion, confidence, and output-writing path, but the
+remaining win is too small to declare the v2 problem solved.  It is now the
+correct shape for a native kernel to own more of the producer/contraction/output
+boundary instead of adding another wrapper around CUEQ.
 
 ## Boundary to own
 
@@ -319,7 +333,10 @@ Sam-style v2 throughput gain.
 
 ## End-to-end gates before defaulting
 
-After a block-level candidate passes, run real Protenix-v2 mixed-token gates:
+After a block-level candidate passes, run real Protenix-v2 mixed-token gates.
+For the recomputed-gate production flag this was done by job `111435`; for a
+future native CuTe kernel, repeat the same gate rather than relying on the
+numbers above:
 
 - 32 records, token lengths `40..220` repeated twice;
 - `--batch_size 16`;
@@ -336,7 +353,10 @@ Report:
 - peak allocated/reserved memory;
 - output correctness/finite checks.
 
-Only then should a native triangle update become default-on.
+Only then should a native triangle update become default-on.  The current
+`PROTENIX_TRITON_TRIANGLE_DIRECT_RECOMPUTE_GATE=1` path is useful as an opt-in
+throughput knob and as boundary evidence, but it is not default-on because the
+full-model gain is only `1.02-1.04x`.
 
 ## Build environment on Tokyo
 

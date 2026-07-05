@@ -251,6 +251,23 @@ gate then moved `N_sample=5` predict time only `1.009x` and showed almost no
 mechanistic `N_sample=1` pairformer movement, so this remains a
 kernel-learning/benchmarking knob, not a normal Sam-style v2 speed preset.
 
+A larger, still default-off, Protenix-v2 triangle-update path is available
+behind `PROTENIX_TRITON_TRIANGLE_DIRECT_RECOMPUTE_GATE=1`.  This is the first
+production-wired version of the direct segmented-update boundary: for mixed
+BF16 `c_z=256` no-grad batches, it builds exact-length contraction groups and
+then recomputes the output-gate input from dense `z` instead of writing and
+re-reading a compact row-major `x_norm` tensor.  That deliberately spends a
+little extra normalization arithmetic to remove a large global-memory product.
+The guard is narrow and it falls back for same-length batches, training,
+non-BF16 tensors, or unsupported widths.  On the Sam-style v2 mixed 40-220
+token gate at commit `77a168f`, full `PairformerBlock` parity stayed at BF16
+scale (`z_mean_abs=0.00349`, `z_max_abs=0.078125`, no NaNs).  The same-output
+end-to-end gate with confidence enabled improved `N_sample=1` from `0.825` to
+`0.843` wall samples/s (`1.022x`) and `N_sample=5` from `2.70` to `2.82`
+generated samples/s (`1.043x`).  Use this flag when explicitly benchmarking
+wide-z v2 mixed-token throughput; leave it off for conservative numerical
+audits until it has broader production exposure.
+
 A more aggressive compact segmented triangle-multiplication update was also
 tested as a full `PairformerBlock` replacement.  Its isolated short-bucket
 triangle-update screen looked promising, but after the real block paid the
@@ -459,10 +476,13 @@ small amount of extra normalization arithmetic for removing a large compact
 write/read pair.  On the long `B16/N220` v2 update it moved current direct
 `3.315/3.392 ms` incoming/outgoing to `3.038/3.063 ms`; in the full long
 `PairformerBlock` gate it moved current direct `24.98 ms` to `24.28 ms`, or
-`1.067x` versus padded CUEQ.  This is the clearest evidence so far that the
-native v2 kernel should own the producer/output-gate boundary, but it still
-needs full Sam-style end-to-end Protenix-v2 gates before becoming a production
-default.
+`1.067x` versus padded CUEQ.  The production-wired opt-in flag
+`PROTENIX_TRITON_TRIANGLE_DIRECT_RECOMPUTE_GATE=1` then moved the full
+Sam-style Protenix-v2 gate by `1.022x` wall throughput at `N_sample=1` and
+`1.043x` at `N_sample=5`.  This is the clearest evidence so far that the native
+v2 kernel should own the producer/output-gate boundary.  It is not a large
+enough win to stop there: the next kernel still needs to remove the remaining
+wrapper products and keep a CUEQ/cuDNN-class contraction mainloop.
 The first native cuBLAS contraction-plus-assembly slice compiled and matched
 BF16-valid parity, but the actual full update with the current direct producer
 was slower than current direct (`0.89-0.91x` on the long `B16/N220` bucket).

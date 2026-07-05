@@ -4758,10 +4758,55 @@ short-term implementation ladder is:
    benchmark path and use it as design evidence for the native v2 update.  It
    is a real full-block movement (`~2.8%` faster than current direct and
    `~6.7%` faster than padded CUEQ on the long bucket), unlike earlier local
-   fusions.  It is still not a production default until a same-output full
-   Protenix-v2 `N_sample=1` and `N_sample=5` gate confirms that the block win
-   survives the complete 48-block trunk, diffusion, confidence, and output
-   writing path.
+   fusions.
+
+   Production-wired follow-up: commit `77a168f` added
+   `PROTENIX_TRITON_TRIANGLE_DIRECT_RECOMPUTE_GATE=1`, a guarded opt-in path
+   in the real triangle-multiplication modules.  The guard is intentionally
+   narrow: no grad, CUDA BF16, contiguous dense `[B, N, N, 256]`, `c_hidden=256`,
+   mask-derived mixed lengths, and exact-shape metadata derived from
+   `pair_mask`.  Same-length batches and unsupported shapes return to the
+   normal CUEQ path before building compact metadata.
+
+   The first production `PairformerBlock` timing gate, job `111309`
+   (`runs/prod_direct_recompute_block_77a168f_20260705_003634`), measured the
+   same long Sam-style v2 bucket with the actual model code rather than the
+   benchmark helper:
+
+   | long v2 production block | flag off | flag on | speedup |
+   | --- | ---: | ---: | ---: |
+   | total | `25.450 ms` | `23.801 ms` | `1.069x` |
+   | triangle mul outgoing | `3.949 ms` | `3.108 ms` | `1.271x` |
+   | triangle mul incoming | `3.882 ms` | `3.081 ms` | `1.260x` |
+   | triangle attention start | `6.036 ms` | `6.029 ms` | flat |
+   | triangle attention end | `6.381 ms` | `6.374 ms` | flat |
+   | pair transition | `4.043 ms` | `4.051 ms` | flat |
+
+   Production parity, job `111417`
+   (`runs/prod_direct_recompute_parity_77a168f_retry2_20260705_004242`), ran
+   the same full `PairformerBlock` twice on cloned inputs, with the flag off and
+   on.  Valid-region drift stayed at the same BF16/reordered-reduction scale as
+   the benchmark screens: `z_mean_abs=0.00349`, `z_max_abs=0.078125`,
+   `s_mean_abs=0.00255`, `s_max_abs=0.0625`, no NaNs.
+
+   Full same-output Protenix-v2 gate, job `111435`
+   (`runs/v2_widez_mixed_e2e_direct_recompute_77a168f_20260705_004408`), used
+   the Sam-style target workload: 32 protein-only records with token lengths
+   `40, 40, 52, 52, ..., 220, 220`, one H100, `--batch_size 16`, CUEQ triangle
+   kernels, BF16, `N_step=200`, staged `protenix-v2.pt`, confidence retained,
+   and no MPS.  The job compared the flag off/on inside one Slurm allocation:
+
+   | case | flag off wall | flag on wall | wall speedup | flag off predict | flag on predict | predict speedup |
+   | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+   | `N_sample=1` | `0.825` records/s | `0.843` records/s | `1.022x` | `0.923` records/s | `0.945` records/s | `1.024x` |
+   | `N_sample=5` | `2.70` generated samples/s | `2.82` generated samples/s | `1.043x` | `3.07` generated samples/s | `3.23` generated samples/s | `1.050x` |
+
+   The component logs show why the end-to-end win is real but modest.  For the
+   timed `N_sample=5` pass, pairformer subtotal dropped from about `19.8s` to
+   `17.0s`, while diffusion stayed around `28.7-28.8s` and confidence around
+   `2.7-2.9s`.  The flag should therefore be treated as a useful opt-in v2
+   throughput knob and as evidence for the native boundary, not as the final
+   wide-z solution.
 
    Pairformer CUDA graph follow-up: commit `75761ba` added
    `scripts/perf/pairformer_cudagraph_probe.py` to check whether launch/Python
