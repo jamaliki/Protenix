@@ -207,6 +207,11 @@ def direct_owned_groups(
     *,
     row_stats: str = "tiled",
     row_stat_block_rows: int = 8,
+    producer_block_m: int = 64,
+    producer_block_n: int = 128,
+    producer_block_k: int = 64,
+    producer_num_warps: int = 4,
+    producer_num_stages: int = 3,
 ) -> tuple[torch.Tensor, list[OwnedGroup]]:
     rows = dense_offsets.numel()
     mean = torch.empty(rows, device=z.device, dtype=torch.float32)
@@ -237,7 +242,7 @@ def direct_owned_groups(
         group_rows = count * length * length
         lhs = torch.empty((count * C_Z, length, length), device=z.device, dtype=z.dtype)
         rhs = torch.empty_like(lhs)
-        grid = (triton.cdiv(group_rows, 64), triton.cdiv(2 * C_Z, 128))
+        grid = (triton.cdiv(group_rows, producer_block_m), triton.cdiv(2 * C_Z, producer_block_n))
         _owned_group_ln_dual_gemm_kernel[grid](
             z,
             dense_offsets,
@@ -255,11 +260,11 @@ def direct_owned_groups(
             length,
             C_Z,
             2 * C_Z,
-            64,
-            128,
-            64,
-            num_warps=4,
-            num_stages=3,
+            producer_block_m,
+            producer_block_n,
+            producer_block_k,
+            num_warps=producer_num_warps,
+            num_stages=producer_num_stages,
         )
         groups.append(OwnedGroup(length=length, start=start, count=count, lhs=lhs, rhs=rhs))
     return x_norm, groups
@@ -276,6 +281,11 @@ def direct_owned_update(
     row_stats: str = "tiled",
     row_stat_block_rows: int = 8,
     finish: str = "current",
+    producer_block_m: int = 64,
+    producer_block_n: int = 128,
+    producer_block_k: int = 64,
+    producer_num_warps: int = 4,
+    producer_num_stages: int = 3,
 ) -> torch.Tensor:
     x_norm, groups = direct_owned_groups(
         module,
@@ -285,6 +295,11 @@ def direct_owned_update(
         weights,
         row_stats=row_stats,
         row_stat_block_rows=row_stat_block_rows,
+        producer_block_m=producer_block_m,
+        producer_block_n=producer_block_n,
+        producer_block_k=producer_block_k,
+        producer_num_warps=producer_num_warps,
+        producer_num_stages=producer_num_stages,
     )
     return producer_owned_finish(
         module, z, x_norm, groups, dense_offsets, direction, weights, finish
@@ -306,6 +321,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--row-stats", choices=["scalar", "tiled"], default="tiled")
     parser.add_argument("--row-stat-block-rows", type=int, default=8)
+    parser.add_argument("--producer-block-m", type=int, default=64)
+    parser.add_argument("--producer-block-n", type=int, default=128)
+    parser.add_argument("--producer-block-k", type=int, default=64)
+    parser.add_argument("--producer-num-warps", type=int, default=4)
+    parser.add_argument("--producer-num-stages", type=int, default=3)
     parser.add_argument("--finish", choices=["current", "fused_output"], default="current")
     parser.add_argument("--output-json")
     return parser.parse_args()
@@ -340,6 +360,11 @@ def main() -> None:
                 weights,
                 row_stats=args.row_stats,
                 row_stat_block_rows=args.row_stat_block_rows,
+                producer_block_m=args.producer_block_m,
+                producer_block_n=args.producer_block_n,
+                producer_block_k=args.producer_block_k,
+                producer_num_warps=args.producer_num_warps,
+                producer_num_stages=args.producer_num_stages,
             ),
             args.warmup,
             args.iters,
@@ -356,6 +381,11 @@ def main() -> None:
                 row_stats=args.row_stats,
                 row_stat_block_rows=args.row_stat_block_rows,
                 finish=args.finish,
+                producer_block_m=args.producer_block_m,
+                producer_block_n=args.producer_block_n,
+                producer_block_k=args.producer_block_k,
+                producer_num_warps=args.producer_num_warps,
+                producer_num_stages=args.producer_num_stages,
             ),
             args.warmup,
             args.iters,
