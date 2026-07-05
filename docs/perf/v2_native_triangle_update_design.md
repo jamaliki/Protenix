@@ -35,6 +35,7 @@ Important measured results:
 | Direct producer-owned full Pairformer block | `1.31x` | repeated `1.043x` | too small for production default |
 | Fused output finish benchmark | isolated short update `~3.0x` | isolated long update `~1.26x`, full long block `1.045x` | opt-in learning path only |
 | Recompute output-gate input instead of storing compact `x_norm` | not yet repeated | isolated long update `1.36-1.37x`, full long block `1.067x` | best current benchmark boundary; needs full v2 e2e gate |
+| Consume contracted layout directly in the output finish | `0.91-0.93x` vs recompute-gate direct | `0.93-0.95x` vs recompute-gate direct | reject; row-major update layout is cache/coalescing help, not just dead traffic |
 | Native cuBLAS contraction + native assembly with the current producer | full update `0.97-0.98x` vs current direct | full update `0.89-0.91x` vs current direct | reject as a deployable path; useful boundary evidence only |
 | Fusing update assembly with output row statistics | not tested after long-bucket rejection | long update `0.97x` incoming, `0.93x` outgoing vs fused output | reject; extra assembly-kernel work outweighed the saved stats pass |
 | Retuning the direct producer tile | not tested after long-bucket screen | no nearby tile beat `64x128x64`, 4 warps | reject; producer needs a larger native boundary, not local tile changes |
@@ -180,6 +181,34 @@ remaining win is too small to declare the v2 problem solved.  It is now the
 correct shape for a native kernel to own more of the producer/contraction/output
 boundary instead of adding another wrapper around CUEQ.
 
+### Contracted-layout output finish result
+
+Commit `11cbd88` added a benchmark-only `contracted_recompute_gate` finish to
+test a tempting native-boundary idea: after exact-group `torch.bmm`, skip the
+Triton assembly into row-major compact update rows and compute output
+LayerNorm, gate/value projection, and residual scatter directly from the
+contracted `[record * channel, i, j]` layout.  Job `112768`
+(`runs/contracted_finish_screen_20260705_032644_11cbd88`) rejected that idea on
+one H100:
+
+| bucket / direction | recompute-gate full update | contracted-layout full update | finish-only delta | decision |
+| --- | ---: | ---: | ---: | --- |
+| long incoming | `3.086 ms` | `3.250 ms` | `1.820 -> 2.027 ms` | reject |
+| long outgoing | `3.070 ms` | `3.292 ms` | `1.855 -> 2.078 ms` | reject |
+| short incoming | `0.735 ms` | `0.793 ms` | `0.439 -> 0.510 ms` | reject |
+| short outgoing | `0.752 ms` | `0.829 ms` | `0.457 -> 0.535 ms` | reject |
+
+The parity stayed at the same BF16-valid scale (`max_abs=0.03125`,
+`mean_abs~=3.06e-4`, no NaNs), so this was a performance rejection rather than
+a correctness failure.  The mechanism is important: the row-major update tensor
+is not merely wasted HBM traffic.  It turns the contraction result into a
+layout where the output row-statistics and output GEMMs read channels
+coalescently.  A future native kernel should not naively make the output finish
+read `[record * channel, i, j]` from global memory.  Either the contraction
+epilogue should emit an output-consumable row-major layout cheaply, or the
+output projection must be fused close enough to the contraction mainloop to
+consume accumulator fragments before they become a strided global-memory ABI.
+
 ## Boundary to own
 
 The production triangle update computes:
@@ -222,8 +251,9 @@ The exact physical layout is a kernel choice, but it must satisfy:
 
 - the input producer writes it directly from dense `z` and `dense_offsets`;
 - the contraction consumes it without extra packing;
-- the output path either writes dense `z` directly or keeps update rows in a
-  layout that the output LayerNorm/gate can consume without a PyTorch materialize;
+- the output path either writes dense `z` directly or emits update rows in a
+  layout that the output LayerNorm/gate can consume coalescently without a
+  PyTorch materialize;
 - the scatter/residual step writes only valid rows plus explicitly zeroes
   invalid rows needed by downstream dense consumers.
 
