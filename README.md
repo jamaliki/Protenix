@@ -462,6 +462,9 @@ also rejected on the long bucket: the heavier assembly kernel was slower than
 keeping the stats as a simple tiled pass.  This narrows the next target to a
 larger native boundary, not incremental source-level fusion around the current
 layout copy.
+The direct producer tile was also hill-climbed around the current
+`64x128x64`, 4-warp choice; nearby `32`-row, `256`-column, and 8-warp variants
+were all flat or slower on the long v2 bucket.
 Whole-Pairformer CUDA graph replay was also screened as a lower-risk
 launch-overhead fix.  It was exact and helped the short v2 bucket by about
 `3%`, but the full 48-block long bucket was flat (`~1.00x`) once changed

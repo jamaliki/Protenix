@@ -34,6 +34,7 @@ Important measured results:
 | Fused output finish benchmark | isolated short update `~3.0x` | isolated long update `~1.26x`, full long block `1.045x` | opt-in learning path only |
 | Native cuBLAS contraction + native assembly with the current producer | full update `0.97-0.98x` vs current direct | full update `0.89-0.91x` vs current direct | reject as a deployable path; useful boundary evidence only |
 | Fusing update assembly with output row statistics | not tested after long-bucket rejection | long update `0.97x` incoming, `0.93x` outgoing vs fused output | reject; extra assembly-kernel work outweighed the saved stats pass |
+| Retuning the direct producer tile | not tested after long-bucket screen | no nearby tile beat `64x128x64`, 4 warps | reject; producer needs a larger native boundary, not local tile changes |
 
 The takeaway is narrow but important: exact-length work reduction is real, but
 not when implemented as a dense-ABI bridge.  The next kernel must avoid:
@@ -95,6 +96,28 @@ next larger native boundary: fusing more source-level operations is not enough
 if it makes the layout-copy kernel heavier.  The row-stat reduction is cheap
 when it is a simple tiled pass; the real target remains the producer and
 output/residual boundary around a vendor-quality contraction.
+
+### Direct producer tile hill-climb result
+
+Commit `5d24190` briefly parameterized the direct input producer tile and job
+`110923` screened nearby choices on `gpu-canary-0`
+(`runs/direct_producer_tile_5d24190_20260705_001033`).  The existing tile
+`M64/N128/K64`, 4 warps, 3 stages remained best on the long v2 bucket:
+
+| tile | incoming producer/full | outgoing producer/full | decision |
+| --- | ---: | ---: | --- |
+| `64x128x64`, 4 warps | `1.552 / 3.334 ms` | `1.568 / 3.383 ms` | keep |
+| `64x128x32`, 4 warps | `1.563 / 3.338 ms` | `1.573 / 3.393 ms` | flat/slower |
+| `64x256x64`, 8 warps | `1.766 / 3.546 ms` | `1.780 / 3.579 ms` | slower |
+| `32x128x64`, 4 warps | `3.258 / 4.979 ms` | `3.258 / 5.026 ms` | much slower |
+| `32x256x64`, 4 warps | `3.135 / 4.894 ms` | `3.139 / 4.932 ms` | much slower |
+| `64x128x64`, 8 warps | `2.501 / 4.335 ms` | `2.525 / 4.332 ms` | much slower |
+
+The temporary tile knobs were removed after the screen.  This closes another
+cheap escape hatch: the current direct producer is not under-tuned by an
+obvious local tile.  The producer-side win now requires changing the boundary
+itself, for example a native schedule that avoids writing both row-major
+`x_norm` and exact-group contraction inputs as separate global-memory products.
 
 ## Boundary to own
 

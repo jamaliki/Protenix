@@ -127,11 +127,6 @@ def compact_triangle_update(
     direct_row_stats: str,
     direct_row_stat_block_rows: int,
     direct_finish: str,
-    direct_producer_block_m: int,
-    direct_producer_block_n: int,
-    direct_producer_block_k: int,
-    direct_producer_num_warps: int,
-    direct_producer_num_stages: int,
 ) -> torch.Tensor:
     if producer == "direct":
         out = direct_owned_update(
@@ -144,11 +139,6 @@ def compact_triangle_update(
             row_stats=direct_row_stats,
             row_stat_block_rows=direct_row_stat_block_rows,
             finish=direct_finish,
-            producer_block_m=direct_producer_block_m,
-            producer_block_n=direct_producer_block_n,
-            producer_block_k=direct_producer_block_k,
-            producer_num_warps=direct_producer_num_warps,
-            producer_num_stages=direct_producer_num_stages,
         )
         return zero_invalid_offsets_(out, invalid_offsets)
 
@@ -179,11 +169,6 @@ def run_compact_triangles(
     direct_row_stats: str,
     direct_row_stat_block_rows: int,
     direct_finish: str,
-    direct_producer_block_m: int,
-    direct_producer_block_n: int,
-    direct_producer_block_k: int,
-    direct_producer_num_warps: int,
-    direct_producer_num_stages: int,
 ) -> TensorPair:
     s = clone_optional(s)
     z = z.clone()
@@ -202,11 +187,6 @@ def run_compact_triangles(
         direct_row_stats,
         direct_row_stat_block_rows,
         direct_finish,
-        direct_producer_block_m,
-        direct_producer_block_n,
-        direct_producer_block_k,
-        direct_producer_num_warps,
-        direct_producer_num_stages,
     )
     z = compact_triangle_update(
         block.tri_mul_in,
@@ -223,11 +203,6 @@ def run_compact_triangles(
         direct_row_stats,
         direct_row_stat_block_rows,
         direct_finish,
-        direct_producer_block_m,
-        direct_producer_block_n,
-        direct_producer_block_k,
-        direct_producer_num_warps,
-        direct_producer_num_stages,
     )
     z += block.tri_att_start(
         z,
@@ -283,11 +258,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--direct-row-stats", choices=["scalar", "tiled"], default="tiled")
     parser.add_argument("--direct-row-stat-block-rows", type=int, default=8)
     parser.add_argument("--direct-finish", choices=["current", "fused_output"], default="current")
-    parser.add_argument("--direct-producer-block-m", type=int, default=64)
-    parser.add_argument("--direct-producer-block-n", type=int, default=128)
-    parser.add_argument("--direct-producer-block-k", type=int, default=64)
-    parser.add_argument("--direct-producer-num-warps", type=int, default=4)
-    parser.add_argument("--direct-producer-num-stages", type=int, default=3)
     parser.add_argument("--output-json")
     return parser.parse_args()
 
@@ -323,11 +293,6 @@ def main() -> None:
                     args.direct_row_stats,
                     args.direct_row_stat_block_rows,
                     args.direct_finish,
-                    args.direct_producer_block_m,
-                    args.direct_producer_block_n,
-                    args.direct_producer_block_k,
-                    args.direct_producer_num_warps,
-                    args.direct_producer_num_stages,
                 ),
                 args.warmup,
                 args.iters,
@@ -342,17 +307,6 @@ def main() -> None:
                         args.direct_row_stat_block_rows if producer == "direct" else None
                     ),
                     "direct_finish": args.direct_finish if producer == "direct" else None,
-                    "direct_producer_tile": (
-                        {
-                            "block_m": args.direct_producer_block_m,
-                            "block_n": args.direct_producer_block_n,
-                            "block_k": args.direct_producer_block_k,
-                            "num_warps": args.direct_producer_num_warps,
-                            "num_stages": args.direct_producer_num_stages,
-                        }
-                        if producer == "direct"
-                        else None
-                    ),
                     "timing": timing,
                     "speedup_vs_baseline": baseline_timing["ms"] / timing["ms"],
                     "parity_vs_baseline_valid": compare_outputs(
