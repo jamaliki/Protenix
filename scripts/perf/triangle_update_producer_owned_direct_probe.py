@@ -306,11 +306,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--row-stats", choices=["scalar", "tiled"], default="tiled")
     parser.add_argument("--row-stat-block-rows", type=int, default=8)
-    parser.add_argument(
-        "--finish",
-        choices=["current", "fused_output", "fused_stats_output"],
-        default="current",
-    )
+    parser.add_argument("--finish", choices=["current", "fused_output"], default="current")
     parser.add_argument("--output-json")
     return parser.parse_args()
 

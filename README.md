@@ -457,6 +457,11 @@ BF16-valid parity, but the actual full update with the current direct producer
 was slower than current direct (`0.89-0.91x` on the long `B16/N220` bucket).
 That rules out another standalone wrapper; the next useful kernel must own
 producer, contraction, output/residual, and invalid-row handling together.
+A follow-up that fused update assembly with output LayerNorm row-statistics was
+also rejected on the long bucket: the heavier assembly kernel was slower than
+keeping the stats as a simple tiled pass.  This narrows the next target to a
+larger native boundary, not incremental source-level fusion around the current
+layout copy.
 Whole-Pairformer CUDA graph replay was also screened as a lower-risk
 launch-overhead fix.  It was exact and helped the short v2 bucket by about
 `3%`, but the full 48-block long bucket was flat (`~1.00x`) once changed

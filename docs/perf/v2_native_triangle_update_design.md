@@ -33,6 +33,7 @@ Important measured results:
 | Direct producer-owned full Pairformer block | `1.31x` | repeated `1.043x` | too small for production default |
 | Fused output finish benchmark | isolated short update `~3.0x` | isolated long update `~1.26x`, full long block `1.045x` | opt-in learning path only |
 | Native cuBLAS contraction + native assembly with the current producer | full update `0.97-0.98x` vs current direct | full update `0.89-0.91x` vs current direct | reject as a deployable path; useful boundary evidence only |
+| Fusing update assembly with output row statistics | not tested after long-bucket rejection | long update `0.97x` incoming, `0.93x` outgoing vs fused output | reject; extra assembly-kernel work outweighed the saved stats pass |
 
 The takeaway is narrow but important: exact-length work reduction is real, but
 not when implemented as a dense-ABI bridge.  The next kernel must avoid:
@@ -70,6 +71,30 @@ finish are included it does not beat the tiled direct path.  Do not spend more
 time on a standalone cuBLAS wrapper.  The next attempt must own a larger
 boundary, especially the producer and output/residual store, or it will keep
 paying the same wrapper tax.
+
+### Assembly plus output-stat fusion result
+
+Commit `a525163` briefly added a benchmark-only `fused_stats_output` finish
+that fused exact-group update assembly with output LayerNorm row-statistics.
+The hypothesis was memory-bound: the existing `fused_output` path first copies
+`[record * channel, i, j]` contraction results into row-major compact update
+rows, then rereads those rows to compute mean/rstd for the output projection.
+Job `110899` on `gpu-canary-0`
+(`runs/fused_stats_output_a525163_20260704_235941`) showed the fused assembly
+kernel was slower than the saved row-stat pass:
+
+| long `B16/N220` direction | current finish | fused output | fused assembly+stats output | decision |
+| --- | ---: | ---: | ---: | --- |
+| incoming full update | `3.317 ms` | `3.292 ms` | `3.351 ms` | reject |
+| outgoing full update | `3.377 ms` | `3.324 ms` | `3.467 ms` | reject |
+| incoming finish-only | `1.791 ms` | `1.717 ms` | `1.817 ms` | reject |
+| outgoing finish-only | `1.818 ms` | `1.757 ms` | `1.890 ms` | reject |
+
+The failed path was removed after the screen.  This is useful evidence for the
+next larger native boundary: fusing more source-level operations is not enough
+if it makes the layout-copy kernel heavier.  The row-stat reduction is cheap
+when it is a simple tiled pass; the real target remains the producer and
+output/residual boundary around a vendor-quality contraction.
 
 ## Boundary to own
 

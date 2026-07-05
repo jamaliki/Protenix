@@ -143,76 +143,6 @@ def assemble_update(groups: list[OwnedGroup], contracted: list[torch.Tensor], ro
 
 
 @triton.jit
-def _assemble_grouped_update_with_stats_kernel(
-    contracted,
-    update,
-    mean,
-    rstd,
-    group_start: tl.constexpr,
-    group_rows: tl.constexpr,
-    length: tl.constexpr,
-    channels: tl.constexpr,
-    eps: tl.constexpr,
-    block_rows: tl.constexpr,
-    block_c: tl.constexpr,
-) -> None:
-    # Fused-output screens immediately compute LayerNorm statistics over the
-    # row-major update.  The plain path first copies [record * channel, i, j] to
-    # [record, i, j, channel] and then rereads the update for stats.  This
-    # kernel fuses those two memory-bound steps: while each program has all
-    # channels for a small row tile resident, it stores the row-major update and
-    # also writes the exact mean/rstd consumed by the output GEMM.
-    row = (tl.program_id(0) * block_rows + tl.arange(0, block_rows)).to(tl.int64)
-    c = tl.arange(0, block_c).to(tl.int64)
-    row_mask = row < group_rows
-    c_mask = c < channels
-    pair_rows = length * length
-    record = row // pair_rows
-    pair = row - record * pair_rows
-    src = contracted + (record[:, None] * channels + c[None, :]) * pair_rows + pair[:, None]
-    values = tl.load(src, mask=row_mask[:, None] & c_mask[None, :], other=0.0)
-    dst = update + (group_start + row[:, None]) * channels + c[None, :]
-    tl.store(dst, values, mask=row_mask[:, None] & c_mask[None, :])
-
-    values_f32 = values.to(tl.float32)
-    mu = tl.sum(values_f32, axis=1) / channels
-    centered = tl.where(c_mask[None, :], values_f32 - mu[:, None], 0.0)
-    var = tl.sum(centered * centered, axis=1) / channels
-    global_row = group_start + row
-    tl.store(mean + global_row, mu, mask=row_mask)
-    tl.store(rstd + global_row, tl.rsqrt(var + eps), mask=row_mask)
-
-
-def assemble_update_with_stats(
-    groups: list[OwnedGroup],
-    contracted: list[torch.Tensor],
-    rows: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    update = contracted[0].new_empty((rows, C_Z))
-    mean = torch.empty(rows, device=update.device, dtype=torch.float32)
-    rstd = torch.empty_like(mean)
-    for group, result in zip(groups, contracted, strict=True):
-        length = group.length
-        group_rows = group.count * length * length
-        grid = (triton.cdiv(group_rows, 8),)
-        _assemble_grouped_update_with_stats_kernel[grid](
-            result,
-            update,
-            mean,
-            rstd,
-            group.start,
-            group_rows,
-            length,
-            C_Z,
-            1e-5,
-            8,
-            C_Z,
-            num_warps=8,
-        )
-    return update, mean, rstd
-
-
-@triton.jit
 def _update_row_stats_tiled_kernel(
     update,
     mean,
@@ -368,44 +298,6 @@ def compact_finish_from_update_fused_output(
     return out
 
 
-def compact_finish_from_update_fused_output_with_stats(
-    module: torch.nn.Module,
-    z: torch.Tensor,
-    x_norm: torch.Tensor,
-    update: torch.Tensor,
-    dense_offsets: torch.Tensor,
-    weights: dict[str, torch.Tensor],
-    mean: torch.Tensor,
-    rstd: torch.Tensor,
-) -> torch.Tensor:
-    """Fused-output path when assembly already produced update row stats."""
-
-    rows = dense_offsets.numel()
-    out = torch.empty_like(z)
-    grid = (triton.cdiv(rows, 64), triton.cdiv(C_Z, 128))
-    _output_dual_gemm_scatter_kernel[grid](
-        update,
-        x_norm,
-        z,
-        dense_offsets,
-        mean,
-        rstd,
-        module.layer_norm_out.weight,
-        module.layer_norm_out.bias,
-        weights["g_out"],
-        weights["p_out"],
-        out,
-        rows,
-        C_Z,
-        64,
-        128,
-        64,
-        num_warps=4,
-        num_stages=3,
-    )
-    return out
-
-
 def producer_owned_finish(
     module: torch.nn.Module,
     z: torch.Tensor,
@@ -417,13 +309,6 @@ def producer_owned_finish(
     finish: str = "current",
 ) -> torch.Tensor:
     contracted = contract_groups(groups, direction)
-    if finish == "fused_stats_output":
-        update, mean, rstd = assemble_update_with_stats(
-            groups, contracted, dense_offsets.numel()
-        )
-        return compact_finish_from_update_fused_output_with_stats(
-            module, z, x_norm, update, dense_offsets, weights, mean, rstd
-        )
     update = assemble_update(groups, contracted, dense_offsets.numel())
     if finish == "fused_output":
         return compact_finish_from_update_fused_output(
@@ -444,13 +329,6 @@ def producer_owned_output_only(
     weights: dict[str, torch.Tensor],
     finish: str = "current",
 ) -> torch.Tensor:
-    if finish == "fused_stats_output":
-        update, mean, rstd = assemble_update_with_stats(
-            groups, contracted, dense_offsets.numel()
-        )
-        return compact_finish_from_update_fused_output_with_stats(
-            module, z, x_norm, update, dense_offsets, weights, mean, rstd
-        )
     update = assemble_update(groups, contracted, dense_offsets.numel())
     if finish == "fused_output":
         return compact_finish_from_update_fused_output(
@@ -474,11 +352,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument(
-        "--finish",
-        choices=["current", "fused_output", "fused_stats_output"],
-        default="current",
-    )
+    parser.add_argument("--finish", choices=["current", "fused_output"], default="current")
     parser.add_argument("--output-json")
     return parser.parse_args()
 
