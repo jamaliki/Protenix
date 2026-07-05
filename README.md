@@ -555,6 +555,12 @@ Important details:
   Ten B8 workers OOMed on the long-token records and ten B4 workers completed
   but were slower (`4.06` generated samples/s).  Validate MPS on your target
   node before quoting it as a maximum.
+- The B8/10 Protenix-v2 failure is a real live-memory limit, not just allocator
+  cache slack: the B8/9 control measured `8310 MiB` peak allocated and
+  `8688 MiB` peak reserved per worker, so ten B8 workers would exceed an H100
+  80 GB card even if allocator fragmentation were perfect.  Fixing B8/10 would
+  require reducing the model's per-worker live peak, not just changing
+  `PYTORCH_CUDA_ALLOC_CONF`.
 - Start CUDA MPS with pipe and log directories on a node-local filesystem such
   as `/tmp`.  Do not put `CUDA_MPS_PIPE_DIRECTORY` on Lustre; the MPS control
   socket may fail there.

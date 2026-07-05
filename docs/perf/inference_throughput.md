@@ -4145,6 +4145,25 @@ worker logs showed CUDA OOMs with only tens of MiB free during long-token
 records.  Reducing the per-worker batch to B4 keeps B10 alive but gives back
 too much diffusion/atom batching efficiency.
 
+Memory-cliff confirmation: commit `4ef693a` added per-worker CUDA memory
+counters to `scripts/perf/concurrent_batch_inference_gate.py`, then job
+`113111` ran the B8/9 control plus the B8/10 failure point in
+`runs/v2_mps_memory_cliff_20260705_040904_4ef693a`.  The job was cancelled
+after B8/10 entered singleton fallback; the useful evidence was already written
+to the worker logs.
+
+| case | result | peak allocated / worker | peak reserved / worker | interpretation |
+| --- | ---: | ---: | ---: | --- |
+| B8/9, 11% MPS | `4.183` generated samples/s | `8310 MiB` | `8688 MiB` | reproduced the current best operating point |
+| B8/10, 10% MPS | OOM during long-token warmup | worker logs showed `~7.6-7.7 GiB` PyTorch-allocated per live process at failure | only `~136-138 MiB` PyTorch reserve slack in failing workers | not an allocator-cache artifact |
+
+Decision: do not chase B8/10 with `PYTORCH_CUDA_ALLOC_CONF` tweaks or
+`torch.cuda.empty_cache()` plumbing.  Ten B8 workers need roughly `83 GiB` of
+live allocation at the current v2 long-bucket peak, before CUDA contexts and
+allocator reserve.  Unlocking another B8 worker requires lowering the actual
+per-worker model peak below about `7.8 GiB`, which is a model/kernel memory
+problem, not a queue configuration problem.
+
 Decision: keep MPS documented as an operational option, but do not quote the
 old v2 `4.62` generated samples/s row as current without reproducing it.  The
 direct-recompute triangle path helped consistently under MPS (`~1.06x`), but
