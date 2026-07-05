@@ -40,6 +40,31 @@ START_RE = re.compile(r"TIMED_START worker=(?P<worker>\d+) repeat=(?P<repeat>\d+
 DONE_RE = re.compile(r"TIMED_DONE worker=(?P<worker>\d+) repeat=(?P<repeat>\d+)")
 
 
+def cuda_memory_summary() -> dict[str, float | None]:
+    """Return process-local CUDA memory counters in MiB.
+
+    Multi-process/MPS throughput failures are often allocator failures rather
+    than simple "the model is too large" failures.  Recording both allocated
+    and reserved memory lets us tell whether a worker died while live tensors
+    were large, or because each warm process held enough cached blocks that the
+    next long-token batch could not reserve another small segment.
+    """
+
+    if not torch.cuda.is_available():
+        return {
+            "allocated_mib": None,
+            "reserved_mib": None,
+            "max_allocated_mib": None,
+            "max_reserved_mib": None,
+        }
+    return {
+        "allocated_mib": torch.cuda.memory_allocated() / 2**20,
+        "reserved_mib": torch.cuda.memory_reserved() / 2**20,
+        "max_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
+        "max_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
+    }
+
+
 def configure_logging(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
@@ -132,6 +157,8 @@ def worker_main(
         infer_predict(runner, runner.configs)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
         logging.info("WARMUP_DONE worker=%s", worker)
 
         timed_results = []
@@ -139,6 +166,9 @@ def worker_main(
             runner.configs.seeds = [args.seed + 100_000 * repeat + worker]
             set_steps(runner, args.n_step)
             set_output_dir(runner, worker_dir / f"timed_predictions_r{repeat}")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
             barrier.wait(timeout=args.barrier_timeout_sec)
             start_epoch = time.time()
             start_perf = time.perf_counter()
@@ -148,11 +178,18 @@ def worker_main(
                 torch.cuda.synchronize()
             elapsed = time.perf_counter() - start_perf
             end_epoch = time.time()
+            memory = cuda_memory_summary()
             logging.info(
-                "TIMED_DONE worker=%s repeat=%s elapsed_sec=%.6f",
+                "TIMED_DONE worker=%s repeat=%s elapsed_sec=%.6f "
+                "allocated_mib=%.1f reserved_mib=%.1f max_allocated_mib=%.1f "
+                "max_reserved_mib=%.1f",
                 worker,
                 repeat,
                 elapsed,
+                memory["allocated_mib"] or 0.0,
+                memory["reserved_mib"] or 0.0,
+                memory["max_allocated_mib"] or 0.0,
+                memory["max_reserved_mib"] or 0.0,
             )
             timed_results.append(
                 {
@@ -160,6 +197,7 @@ def worker_main(
                     "start_epoch": start_epoch,
                     "end_epoch": end_epoch,
                     "elapsed_sec": elapsed,
+                    **memory,
                 }
             )
 
@@ -169,6 +207,7 @@ def worker_main(
                 "ok": True,
                 "log_path": str(log_path),
                 "timed": timed_results,
+                "memory_after_timed": cuda_memory_summary(),
                 "device": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
             }
         )
@@ -180,6 +219,7 @@ def worker_main(
                 "ok": False,
                 "log_path": str(log_path),
                 "error": repr(exc),
+                "memory_at_failure": cuda_memory_summary(),
             }
         )
 
@@ -266,6 +306,12 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         }
     generated = parsed_records * args.n_sample
     predict_sec = sum(row["predict_sec"] for row in parsed)
+    timed_memory = [
+        timed
+        for row in parsed
+        for timed in row.get("timed", [])
+        if timed.get("max_allocated_mib") is not None
+    ]
     return {
         "ok": True,
         "args": vars(args),
@@ -279,6 +325,16 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         "wall_samples_per_sec": generated / wall_sec,
         "sum_predict_sec": predict_sec,
         "predict_samples_per_sec": generated / predict_sec if predict_sec else None,
+        "max_worker_allocated_mib": (
+            max(row["max_allocated_mib"] for row in timed_memory)
+            if timed_memory
+            else None
+        ),
+        "max_worker_reserved_mib": (
+            max(row["max_reserved_mib"] for row in timed_memory)
+            if timed_memory
+            else None
+        ),
     }
 
 
