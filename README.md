@@ -452,6 +452,17 @@ That moved the repeated long-bucket full-block gate from `25.99 -> 24.92 ms`
 useful learning for the native fused boundary, but still too small on the long
 Sam-style v2 bucket to promote without deeper integration and full end-to-end
 gates.
+The next larger direct-boundary screen is more promising: the producer can skip
+writing compact row-major `x_norm`, then the output-gate kernel recomputes that
+gate input from dense `z` plus the input LayerNorm statistics.  This trades a
+small amount of extra normalization arithmetic for removing a large compact
+write/read pair.  On the long `B16/N220` v2 update it moved current direct
+`3.315/3.392 ms` incoming/outgoing to `3.038/3.063 ms`; in the full long
+`PairformerBlock` gate it moved current direct `24.98 ms` to `24.28 ms`, or
+`1.067x` versus padded CUEQ.  This is the clearest evidence so far that the
+native v2 kernel should own the producer/output-gate boundary, but it still
+needs full Sam-style end-to-end Protenix-v2 gates before becoming a production
+default.
 The first native cuBLAS contraction-plus-assembly slice compiled and matched
 BF16-valid parity, but the actual full update with the current direct producer
 was slower than current direct (`0.89-0.91x` on the long `B16/N220` bucket).

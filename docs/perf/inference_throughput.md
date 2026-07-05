@@ -4713,6 +4713,56 @@ short-term implementation ladder is:
    about the output fusion boundary; do not promote it to default or production
    without a larger long-bucket/end-to-end win and a real numerical audit.
 
+   Recomputed output-gate follow-up: commit `74c10e3` tested a larger boundary
+   than `fused_output`.  The direct producer normally writes compact row-major
+   `x_norm` so the output gate can read the input-normalized activations after
+   contraction.  The new `--finish recompute_gate` screen skips that write,
+   keeps the input LayerNorm mean/rstd, and rebuilds the gate input inside the
+   fused output-gate kernel from dense `z`.  This deliberately answers whether
+   the compact `x_norm` global-memory product is real debt or whether
+   recomputing it costs more than it saves.
+
+   Direct-update job `111092`, run
+   `runs/recompute_gate_74c10e3_retry_20260705_002327`, completed all JSON
+   timing outputs on one H100.  The Slurm job is marked failed only because a
+   post-run pretty-printer expected scalar parity after the benchmark had
+   already written the result files.
+
+   | long `B16/N220` direct update | current finish | fused output | recompute gate | interpretation |
+   | --- | ---: | ---: | ---: | --- |
+   | incoming producer-only | `1.553 ms` | `1.580 ms` | `1.194 ms` | saved the compact `x_norm` write |
+   | incoming full update | `3.315 ms` | `3.293 ms` | `3.038 ms` | `1.36x` vs padded CUEQ, `1.09x` vs current direct |
+   | outgoing producer-only | `1.566 ms` | `1.551 ms` | `1.199 ms` | same mechanism |
+   | outgoing full update | `3.392 ms` | `3.325 ms` | `3.063 ms` | `1.37x` vs padded CUEQ, `1.11x` vs current direct |
+
+   The finish-only subrange got slightly slower (`1.79-1.82 ms` current to
+   `1.80-1.86 ms` recompute) because the output kernel now reloads dense `z`
+   and repeats the input normalization arithmetic.  The net still wins because
+   the producer avoids the much larger compact activation store.  BF16-valid
+   parity stayed at the same scale as `fused_output` (`mean_abs ~3.06e-4`,
+   `max_abs 0.03125` on valid rows).
+
+   Full-block gate: commit `b5fad06` exposed the same finish in
+   `scripts/perf/pairformer_compact_segmented_triangle_update_probe.py`.  Job
+   `111143`, run `runs/pairformer_recompute_gate_b5fad06_20260705_002637`,
+   measured the long Sam-style v2 block (`B16/N220`, `c_z=256`,
+   `hidden_scale_up=True`, BF16, confidence-independent block harness):
+
+   | long v2 `PairformerBlock` | baseline CUEQ block | direct block | speedup vs baseline | valid-region drift |
+   | --- | ---: | ---: | ---: | --- |
+   | current finish | `25.982 ms` | `24.979 ms` | `1.040x` | `z mean 0.00230`, `z max 0.0625` |
+   | fused output | `25.903 ms` | `24.805 ms` | `1.044x` | `z mean 0.00350`, `z max 0.0625` |
+   | recompute gate | `25.911 ms` | `24.280 ms` | `1.067x` | `z mean 0.00351`, `z max 0.078125` |
+
+   Decision: keep `recompute_gate` as the best current direct-producer
+   benchmark path and use it as design evidence for the native v2 update.  It
+   is a real full-block movement (`~2.8%` faster than current direct and
+   `~6.7%` faster than padded CUEQ on the long bucket), unlike earlier local
+   fusions.  It is still not a production default until a same-output full
+   Protenix-v2 `N_sample=1` and `N_sample=5` gate confirms that the block win
+   survives the complete 48-block trunk, diffusion, confidence, and output
+   writing path.
+
    Pairformer CUDA graph follow-up: commit `75761ba` added
    `scripts/perf/pairformer_cudagraph_probe.py` to check whether launch/Python
    overhead is a large enough target before committing to native CuTe kernels.
@@ -5168,6 +5218,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Full dense `masked_fill` invalid-row zeroing in the direct producer-owned block probe | after caching setup outside timing, the short block improved (`1.24x`) but the long block still regressed (`0.96x`) because every compact update paid a dense padded-row materialization pass | precompute invalid row offsets and zero only padded rows; this turned the same direct block positive (`1.31x` short, repeated `1.019x` long before the later row-stat tiling), though still not enough for promotion |
 | One-row-per-program row statistics in the direct producer-owned probe | profiler-attributed scopes showed `_compact_row_stats_kernel` costing about `0.40 ms` per triangle update on the long v2 bucket; tiling eight compact rows per Triton program reduced repeated direct-update producer time from about `1.80 ms` to `1.55 ms` and moved the full long block from scalar-direct `25.39 ms` to tiled-direct `24.92 ms` | row-stat tiling is a real cleanup of the benchmark boundary and should be the default for future direct screens, but the long full-block win is still only `1.043x` versus padded CUEQ, so production promotion still needs a larger fused/native boundary |
 | Fusing direct output LayerNorm/gate/scatter in a benchmark kernel | direct short updates improved strongly (`~2.1x -> ~3.0x`) and long updates improved slightly (`~1.24x -> ~1.26x`), but the repeated long full-block gain over current direct was only `24.987 -> 24.887 ms`; valid-region mean drift was also higher (`z` mean `0.00230 -> 0.00349`) | useful evidence that the output boundary is fusible, but too small and numerically different to promote; keep it as an opt-in benchmark only |
+| Recomputing the output-gate input instead of storing compact `x_norm` | job `111092` showed the long direct-update producer dropped from `1.55-1.57 ms` to `1.19-1.20 ms`, full updates improved to `3.04-3.06 ms`, and job `111143` moved the long full block from current direct `24.979 ms` to `24.280 ms` (`1.067x` vs padded CUEQ) | this is the best current direct-producer benchmark path and proves the producer/output-gate boundary matters; still needs a full Protenix-v2 same-output gate before production promotion |
 | Native cuBLAS contraction plus native compact assembly using the current direct producer | job `110868` compiled and passed BF16-valid parity, but the actual full update lost to current direct: short `0.97-0.98x`, long `0.89-0.91x`; the post-producer native boundary looked plausible in isolation, but excluding producer cost was misleading | do not chase another standalone cuBLAS wrapper; the next native v2 attempt must own producer, contraction, output/residual, and invalid-row handling together |
 | Fusing exact-group update assembly with output row statistics | job `110899` showed the long v2 bucket regressed versus the existing fused output finish: incoming full update `3.292 -> 3.351 ms`, outgoing `3.324 -> 3.467 ms`; finish-only also regressed `1.717 -> 1.817 ms` and `1.757 -> 1.890 ms` | the saved row-stat pass is cheaper than the heavier fused assembly kernel; remove the flag and keep targeting a larger producer/contraction/output boundary |
 | Retuning the direct producer tile | job `110923` screened nearby long-bucket tiles; the existing `64x128x64`, 4-warp tile stayed best (`1.55-1.57 ms` producer, `3.33-3.38 ms` full), while `64x256`, `32x128`, `32x256`, and 8-warp variants were slower | direct producer cost is not an obvious local tile miss; remove the temporary knobs and target a larger native producer/contraction/output boundary |
@@ -5342,7 +5393,10 @@ Profiling and reproducibility helpers:
   producer materialization is excluded in this upper-bound script.  The optional
   `--finish fused_output` path tests a Protenix-owned output LayerNorm +
   gate/value + scatter boundary; it is useful for design evidence but not
-  promoted because the long full-block movement is too small.
+  promoted because the long full-block movement is too small.  The direct
+  producer script also uses this module's `recompute_gate` finish to test a
+  larger output boundary that rebuilds the gate input instead of reading compact
+  `x_norm`.
 - `scripts/perf/triangle_update_producer_owned_direct_probe.py`: direct
   producer-owned follow-up.  It makes the input LayerNorm + dual-GEMM producer
   write exact-length grouped contractor tensors itself, and validates both
@@ -5352,7 +5406,10 @@ Profiling and reproducibility helpers:
   bucket, with BF16-valid parity.  The row-stat tile defaults to eight compact
   rows per program because this was best in the H100 screen; use
   `--row-stats scalar` or `--row-stat-block-rows` to reproduce the scalar
-  baseline or hill-climb a new shape.
+  baseline or hill-climb a new shape.  The fastest current long-bucket mode is
+  `--finish recompute_gate`, which skips writing compact `x_norm` and improved
+  the long direct update to `3.04-3.06 ms` and the long full block to
+  `24.28 ms` in the paired H100 screens.
 - `scripts/perf/triangle_update_native_cublas_probe.py` and
   `scripts/perf/triangle_update_native_cublas_probe.cu`: first executable
   native slice after the v2 design note.  It consumes the direct producer's
@@ -5371,8 +5428,10 @@ Profiling and reproducibility helpers:
   rejected (`0.37-0.38x` short bucket, `0.21x` long bucket).  The newer direct
   producer-owned mode uses cached metadata/weights plus invalid-offset zeroing;
   with tiled row statistics it is a real block win (`1.31x` short bucket,
-  repeated `1.043x` long bucket) but still too small on the long v2 block to be
-  a production default without deeper fusion and end-to-end gates.
+  repeated `1.043x` long bucket).  With `--direct-finish recompute_gate`, the
+  long block improved further to `1.067x` versus padded CUEQ.  This is now the
+  preferred benchmark gate for direct-producer triangle-update ideas, but still
+  not a production default without full Protenix-v2 end-to-end gates.
 - `scripts/perf/pairformer_cudagraph_probe.py`: CUDA graph replay screen for
   v2-width Pairformer blocks/stacks.  It separates pure replay from realistic
   changed-input copies so graph launch-overhead wins are not confused with

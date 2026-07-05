@@ -9,9 +9,11 @@ mixed token lengths, confidence enabled, BF16, `c_z=256`, and
 The current best evidence says Python/Triton wrapper cleanup has reached
 diminishing returns.  The direct producer-owned benchmark is now positive, but
 the long bucket that dominates real v2 throughput only moves one full block by
-about four percent.  A production win now needs a native update boundary that
-owns the exact-length layout through producer, contraction, output gate, and
-residual store.
+about `4-7%` depending on how much of the output-gate boundary is owned.  The
+latest positive screen skips the producer's compact `x_norm` write and
+recomputes that gate input in the output kernel, which is the clearest sign
+that a production win needs a native update boundary that owns the exact-length
+layout through producer, contraction, output gate, and residual store.
 
 ## Current evidence
 
@@ -32,6 +34,7 @@ Important measured results:
 | Direct producer-owned update after tiled assembly and row-stat tiling | isolated update `~2.1x` | isolated update `~1.25x` | useful benchmark boundary |
 | Direct producer-owned full Pairformer block | `1.31x` | repeated `1.043x` | too small for production default |
 | Fused output finish benchmark | isolated short update `~3.0x` | isolated long update `~1.26x`, full long block `1.045x` | opt-in learning path only |
+| Recompute output-gate input instead of storing compact `x_norm` | not yet repeated | isolated long update `1.36-1.37x`, full long block `1.067x` | best current benchmark boundary; needs full v2 e2e gate |
 | Native cuBLAS contraction + native assembly with the current producer | full update `0.97-0.98x` vs current direct | full update `0.89-0.91x` vs current direct | reject as a deployable path; useful boundary evidence only |
 | Fusing update assembly with output row statistics | not tested after long-bucket rejection | long update `0.97x` incoming, `0.93x` outgoing vs fused output | reject; extra assembly-kernel work outweighed the saved stats pass |
 | Retuning the direct producer tile | not tested after long-bucket screen | no nearby tile beat `64x128x64`, 4 warps | reject; producer needs a larger native boundary, not local tile changes |
@@ -118,6 +121,50 @@ cheap escape hatch: the current direct producer is not under-tuned by an
 obvious local tile.  The producer-side win now requires changing the boundary
 itself, for example a native schedule that avoids writing both row-major
 `x_norm` and exact-group contraction inputs as separate global-memory products.
+
+### Recomputed output-gate result
+
+Commit `74c10e3` added a benchmark-only `recompute_gate` finish for the direct
+producer-owned path.  The mechanism is intentionally simple:
+
+1. the input producer still computes input LayerNorm row statistics;
+2. it writes exact-length grouped contraction inputs, but skips the row-major
+   compact `x_norm` activation;
+3. the fused output gate reloads dense `z` and rebuilds the gate input from
+   `z`, input mean/rstd, and input LayerNorm weights.
+
+This asks whether the compact `x_norm` global-memory write/read pair is worth
+more than the extra dense reload and normalization arithmetic.  On the long
+Sam-style bucket it was worth it.  Job `111092`
+(`runs/recompute_gate_74c10e3_retry_20260705_002327`) completed the JSON
+timing outputs on one H100:
+
+| long `B16/N220` direct update | current finish | recompute gate | interpretation |
+| --- | ---: | ---: | --- |
+| incoming producer-only | `1.553 ms` | `1.194 ms` | saved `x_norm` store |
+| incoming full update | `3.315 ms` | `3.038 ms` | `1.36x` vs padded CUEQ |
+| outgoing producer-only | `1.566 ms` | `1.199 ms` | same mechanism |
+| outgoing full update | `3.392 ms` | `3.063 ms` | `1.37x` vs padded CUEQ |
+
+The output finish itself became slightly slower because it now recomputes the
+gate input (`1.79-1.82 ms` current to `1.80-1.86 ms` recompute), but the
+producer-side traffic reduction more than paid for that.  Job `111143`
+(`runs/pairformer_recompute_gate_b5fad06_20260705_002637`) then wired the same
+finish into the full long v2 `PairformerBlock` gate:
+
+| long `B16/N220` block | baseline CUEQ | direct block | speedup |
+| --- | ---: | ---: | ---: |
+| current finish | `25.982 ms` | `24.979 ms` | `1.040x` |
+| fused output | `25.903 ms` | `24.805 ms` | `1.044x` |
+| recompute gate | `25.911 ms` | `24.280 ms` | `1.067x` |
+
+Decision: keep this as the best current benchmark boundary and make it the
+near-term shape of the native kernel.  The production kernel should not treat
+row-major `x_norm` as a required ABI product unless a full-model numerical or
+throughput gate later proves otherwise.  The remaining acceptance bar is a
+full Protenix-v2 same-output gate (`N_sample=1` and `5`, confidence enabled)
+because a one-block `6-7%` win can still dilute across the complete trunk,
+diffusion, confidence, and output-writing path.
 
 ## Boundary to own
 
@@ -227,9 +274,10 @@ a full fused update whose contraction mainloop is already too slow.
 ### Slice 3: fuse enough to beat the block
 
 Only after the native contraction is near `torch.bmm` speed should the output
-boundary be fused.  The current opt-in fused output finish proves the math is
-fusible, but the long full-block movement is only about `0.10 ms`.  A real
-native update needs to recover a much larger part of:
+boundary be fused.  The `recompute_gate` screen is the current best benchmark
+shape: it proves that avoiding compact `x_norm` as a separate producer output
+is more valuable than a local output-finish fusion alone.  A real native update
+still needs to recover a much larger part of:
 
 - producer row stats and input projections (`~1.55 ms/update` after tiling);
 - contraction and assembly (`~0.5-0.8 ms/update`, depending on shape);
@@ -246,11 +294,11 @@ successors:
 
 ```bash
 scripts/perf/triangle_update_producer_owned_direct_probe.py \
-  --preset long --direction both --warmup 5 --iters 30
+  --preset long --direction both --finish recompute_gate --warmup 5 --iters 30
 
 scripts/perf/pairformer_compact_segmented_triangle_update_probe.py \
   --lengths 136,136,160,160,172,172,184,184,196,196,208,208,216,216,220,220 \
-  --producer direct --warmup 5 --iters 30
+  --producer direct --direct-finish recompute_gate --warmup 5 --iters 30
 ```
 
 Minimum promotion bar for the first production candidate:
