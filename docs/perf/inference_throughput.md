@@ -367,6 +367,29 @@ large diffusion-token win would only move about half of the v2 mixed
 `N_sample=5` predict section, so the larger unresolved target remains
 v2 pairformer padding for variable token lengths.
 
+MPS-shape diffusion NCU follow-up: job `112644`, run
+`runs/v2_diffusion_b8_cached_bias_1block_ncu_20260705_030838_f724e8d`,
+repeated the same cached-bias capture at the actual current v2 MPS worker shape
+(`B=8`, `N_sample=5`, `N=220`, `c_z=256`, BF16 module weights).  A first
+attempt with `BLOCKS=24` (job `112475`) was cancelled as too broad after it
+started collecting hundreds of launches; one warmed block is the right unit for
+launch attribution.  The corrected one-block capture reported `0.778 ms` of
+kernel time:
+
+| B8 v2 diffusion block family | launches | total ms | roofline signal / interpretation |
+| --- | ---: | ---: | --- |
+| PyTorch vectorized elementwise kernels | 18 | `0.236` | largest aggregate, mostly memory-bound residual/gate plumbing |
+| BF16 SDPA | 1 | `0.131` | material but not dominant; cuDNN/CUTLASS-class kernel |
+| BF16 GEMM families | 14 | `0.296` | many medium projections; low tensor-pipe share, but no single bad GEMM |
+| direct copy / pad boundary | 1 | `0.078` | visible memory movement |
+| LayerNorm | 4 | `0.037` | small at this shape |
+
+Interpretation: reducing the per-worker batch from B16 to B8 makes the
+diffusion block more launch/memory-plumbing heavy, but it does not expose a
+single replacement kernel.  A useful diffusion-side kernel would need to fuse
+residual/gate/copy epilogues around the existing SDPA and projection GEMMs,
+rather than replacing the attention or matmul mainloops.
+
 Fast LayerNorm check: job `103979`
 (`runs/diffusion_profile_fastln_patched_B16_S5_N220_1block_20260704_1252_0ecd10c`)
 patched the compile helper locally to find CUDA 13 headers under the

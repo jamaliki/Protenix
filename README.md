@@ -407,6 +407,11 @@ the v2 transition path enabled.  The remaining cost is split between the wider
 pairformer and denoising work, so the next large win needs true
 ragged/segmented pairformer or broader block-boundary work rather than more
 queue bucket tuning or blindly adding MPS workers.
+The B8 diffusion-transformer NCU capture at the current v2 MPS worker shape
+reaches the same conclusion from the denoising side: remaining block time is
+split across memory-bound elementwise/residual plumbing, SDPA, medium BF16
+GEMMs, copy/pad traffic, and small LayerNorms, not a single obviously weak
+kernel.
 Seeing `token-trunk+diffusion-token-atom-batch` in the log means batching is
 working; it does not mean the run is using the exact-shape `7r6r` path.
 
