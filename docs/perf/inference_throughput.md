@@ -4164,6 +4164,40 @@ allocator reserve.  Unlocking another B8 worker requires lowering the actual
 per-worker model peak below about `7.8 GiB`, which is a model/kernel memory
 problem, not a queue configuration problem.
 
+Component-level memory attribution: commit `4697afc` added opt-in CUDA memory
+attribution around the input embedder, pairformer trunk, batched diffusion, and
+per-record finish path (`PROTENIX_PROFILE_CUDA_MEMORY=1`).  The instrumentation
+resets CUDA peak counters between components, so the usual outer
+`summary.json` peak is not meaningful while this flag is enabled; the
+`Batch CUDA memory` component log lines are the source of truth.
+
+Jobs `113287` and `113317` ran short `N_step=20`, single-worker, B8,
+Protenix-v2/wide-`z` memory probes on the same 32 mixed 40-220-token input:
+
+| case | run | input embedder peak alloc/reserved | pairformer peak alloc/reserved | batched diffusion peak alloc/reserved | finish peak alloc/reserved | interpretation |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| flat BF16 diffusion | `runs/v2_b8_cuda_memory_attribution_20260705_042929_4697afc` | `2827 / 3308 MiB` | `5943 / 6808 MiB` | `8310 / 8688 MiB` | `4969 / 5412 MiB` | B8 memory cliff is owned by batched diffusion |
+| explicit sample axis + rank-5 BF16 attention | `runs/v2_b8_sampleaxis_memory_attribution_20260705_043239_4697afc` | `2826 / 3292 MiB` | `5938 / 6572 MiB` | `7164 / 7508 MiB` | `4965 / 5312 MiB` | sample-axis saves about `1.1 GiB` of diffusion peak allocation |
+
+The sample-axis result is mechanistically useful but not a promoted preset.
+It keeps the pair bias on a record/sample-separated axis instead of fully
+flattening/repeating it, which is exactly the kind of state reduction needed to
+unlock higher MPS width.  But the existing rank-5 attention execution boundary
+does not preserve throughput under MPS.  Job `113368`
+(`runs/v2_mps_sampleaxis_nsample5_20260705_043853_4697afc`) tested the
+representative `N_step=200`, B8/9, 11% MPS path with sample-axis enabled.  The
+job was cancelled after `18:17` to avoid wasting the H100: it had not completed
+even the B8/9 case, while the flat B8/9 control completes at `4.183` generated
+samples/s.  Worker 0's completed timed batches were already `71.99s`,
+`142.55s`, and `247.13s` before the final `184-220` token bucket, and diffusion
+accounted for `60.1%`, `63.1%`, and `58.4%` of those completed timed batches.
+
+Decision: reject the current sample-axis/rank-5-attention path as a user-facing
+MPS throughput preset.  It is still a good design target for custom diffusion
+attention or pair-bias kernels: the memory win is real, but the existing
+PyTorch/cuDNN rank-5 boundary gives back too much compute throughput under
+concurrent workers.
+
 Decision: keep MPS documented as an operational option, but do not quote the
 old v2 `4.62` generated samples/s row as current without reproducing it.  The
 direct-recompute triangle path helped consistently under MPS (`~1.06x`), but

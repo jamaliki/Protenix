@@ -178,8 +178,11 @@ CUDA, and no-grad checks, so unsupported cases fall back to the original PyTorch
 path; set `PROTENIX_BF16_ATOM_ATTENTION=0` and `PROTENIX_TRITON_LOCAL_ATTN=0`
 when you need the old conservative atom path.  Do not enable
 `PROTENIX_DIFFUSION_TRANSFORMER_SAMPLE_AXIS=1` by default yet: it is useful for
-kernel experiments, but the full gate did not show a robust win over the
-flattened BF16 path.
+kernel and memory experiments, but the full gates did not show a robust
+throughput win over the flattened BF16 path.  In the Protenix-v2/wide-`z`
+MPS memory-cliff study it reduced the B8 diffusion component peak
+(`8310 -> 7164 MiB` allocated), but the follow-up `N_step=200` B8/9 MPS gate
+was far slower than the flat path and was stopped before trying B8/10.
 
 The CUEQ pairformer path also defaults to a contiguous ending-attention
 producer (`PROTENIX_CUEQ_ENDING_CONTIGUOUS_PRODUCER=1`).  This is a small
@@ -560,7 +563,11 @@ Important details:
   `8688 MiB` peak reserved per worker, so ten B8 workers would exceed an H100
   80 GB card even if allocator fragmentation were perfect.  Fixing B8/10 would
   require reducing the model's per-worker live peak, not just changing
-  `PYTORCH_CUDA_ALLOC_CONF`.
+  `PYTORCH_CUDA_ALLOC_CONF`.  Component attribution showed that this peak comes
+  from batched diffusion, not the pairformer trunk.  The rank-5 sample-axis
+  diffusion path lowered that peak to `7164 MiB`, but it made the representative
+  MPS throughput path much slower; keep it as a diagnostic/custom-kernel
+  stepping stone, not as a user-facing speed preset.
 - Start CUDA MPS with pipe and log directories on a node-local filesystem such
   as `/tmp`.  Do not put `CUDA_MPS_PIPE_DIRECTORY` on Lustre; the MPS control
   socket may fail there.
