@@ -4029,8 +4029,9 @@ Interpretation:
   as the practical knee.  For maximum base-checkpoint `N_sample=5` aggregate
   throughput, the best measured operational mode is **sixteen B4 workers at 6%
   each**.  Protenix-v2 has a wider pair representation and needs its own
-  operating point: the best measured v2 `N_sample=5` mode is **eight B8 workers
-  at 12% each**.
+  operating point: the current best measured v2 `N_sample=5` mode is **nine B8
+  workers at 11% each**.  Ten B8 workers OOMed on long-token records, and ten
+  B4 workers were memory-safe but slower.
 - Compared with the current single-process low-sample rate (`4.18` generated
   samples/s), the B4/sixteen-worker `6.720` generated samples/s result is a
   `1.61x` operational gain.  Compared with the original low-sample branch
@@ -4095,7 +4096,7 @@ the no-prefetch B8/8 gate on normal node `gpu-10`.
 | `111654`, canary | 8 | 12 | 8 | off | off | `3.67` | prefetch was not the cause |
 | `111654`, canary | 8 | 12 | 8 | off | on | `3.90` | `1.063x` vs paired off |
 | `112128`, `gpu-10` | 8 | 12 | 8 | off | off | `3.70` | normal node reproduced the slower rate |
-| `112128`, `gpu-10` | 8 | 12 | 8 | off | on | `3.94` | current best verified B8/8 v2 MPS point |
+| `112128`, `gpu-10` | 8 | 12 | 8 | off | on | `3.94` | current verified B8/8 v2 control; later B8/9 improved it |
 
 A direct-on shape scout on canary, job `111877`
 (`runs/v2_mps_direct_recompute_shape_scout_55c6974_20260705_014549`), also did
@@ -4123,13 +4124,34 @@ dual-GEMM guard.  Keep the transition path enabled for v2, and treat the old
 `4.62` row as stale or environment/run-definition-dependent until a current
 HEAD repeat reproduces it.
 
+Current-head B8/9 width scout: job `112657`, run
+`runs/v2_mps_untried_width_scout_20260705_031311_079efd1`, used the current
+v2 `N_sample=5` Sam-style gate with confidence enabled, direct triangle
+recompute on, CUEQ triangle kernels, one H100, and CUDA MPS sockets on `/tmp`.
+This was a same-run comparison of the untried worker-width region around the
+reproduced B8/8 point:
+
+| workers | MPS % | batch | generated samples | generated samples/s | interpretation |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 8 | 12 | 8 | 1280 | `3.930` | same-run B8/8 control; matches the lower current repeat |
+| 9 | 11 | 8 | 1440 | `4.182` | current best measured v2 point |
+| 10 | 10 | 8 | n/a | n/a | OOM on long-token records after 256 timed records |
+| 10 | 10 | 4 | 1600 | `4.059` | memory-safe but slower than B8/9 |
+
+Decision: for the actual Sam-style Protenix-v2/wide-`z` target, the current
+operational MPS preset is B8/9 at 11%, not the stale historical B8/8 row and
+not the base-checkpoint B4/16 recipe.  The B8/10 failure is a real memory cliff:
+worker logs showed CUDA OOMs with only tens of MiB free during long-token
+records.  Reducing the per-worker batch to B4 keeps B10 alive but gives back
+too much diffusion/atom batching efficiency.
+
 Decision: keep MPS documented as an operational option, but do not quote the
 old v2 `4.62` generated samples/s row as current without reproducing it.  The
 direct-recompute triangle path helped consistently under MPS (`~1.06x`), but
 the current wide-v2 MPS bottleneck is diffusion-heavy context contention, not
 the triangle boundary alone.  The current verified v2 `N_sample=5` MPS number
-is `3.94` generated samples/s, about `1.40x` over the current single-process
-direct-recompute gate (`2.82` generated samples/s) and about `8.1x` over the
+is `4.18` generated samples/s, about `1.48x` over the current single-process
+direct-recompute gate (`2.82` generated samples/s) and about `8.6x` over the
 matched upstream-compatible v2 wall baseline (`0.489` generated samples/s).
 
 Protenix-v2 mixed-token pairformer profile: jobs `105740` and `105741` captured
@@ -5412,7 +5434,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Parallel or async CIF/JSON dumping | per-batch parallel dumping improved one B32 dump section only `5.35s -> 5.09s` and total predict+dump only `47.75s -> 47.47s`; a stronger async writer pipeline on a 256-record/8-batch gate was also flat (`413.65s -> 412.36s` seed wall, all outputs present) | dumping looks idle from the GPU view, but writer threads contend with the same host/filesystem path that prepares later batches; do not carry default-off writer pools unless an end-to-end campaign gate moves |
 | CUDA graph replay of the diffusion-token transformer | exact and mildly faster in isolation (`1.07x` at `N=124`, `1.02x` at `N=220`), but the long-shape ceiling is under 2% e2e | launch overhead is not the meat of the remaining transformer bottleneck; revisit only as part of a larger full-denoising graph |
 | CUDA graph replay of the v2 Pairformer stack | exact and lower-memory, but throughput was too small/flat: short 48-block bucket `482.16 -> 465.80 ms` (`1.035x`), long 48-block bucket `1236.81 -> 1238.13 ms` (`0.999x`) | graph plumbing is not the main wide-`z` v2 lever; target the native segmented triangle-update/fused producer boundary instead |
-| Reusing the base-checkpoint B4/16 MPS recipe for Protenix-v2 | v2 B4/16 hit CUDA OOM in the diffusion transformer after the long-token warmup filled the GPU, and the narrower v2 width screen found B8/8 (`4.621` samples/s) slightly ahead of B4/10 (`4.576` samples/s) | Protenix-v2's wider `z` representation changes the concurrency knee; use v2-specific gates and do not quote base-model MPS numbers for Sam-style v2 predictions |
+| Reusing the base-checkpoint B4/16 MPS recipe for Protenix-v2 | v2 B4/16 hit CUDA OOM in the diffusion transformer after the long-token warmup filled the GPU.  A historical v2 screen found B8/8 (`4.621` samples/s) slightly ahead of B4/10 (`4.576` samples/s), but current-head repeats moved the v2 knee to B8/9 (`4.182` samples/s), with B8/10 OOMing and B4/10 slower (`4.059` samples/s) | Protenix-v2's wider `z` representation changes the concurrency knee; use current v2-specific gates and do not quote base-model MPS numbers for Sam-style v2 predictions |
 | Merging campaign JSONs before preprocessing | 64-file directory gate moved only from 197.54 s to 195.70 s (`1.009x`) and worsened preprocessing failure granularity | the remaining e2e gap is not mainly per-file JSON preprocessing |
 | Naive padded mixed-shape pairformer batching | valid-region differences accumulated over 48 blocks: FP32 `s/z` mean abs `0.012/0.006`, BF16 `0.236/0.168` for 245 -> 384 tokens | do not claim bitwise parity; the promoted path masks all token readers, sorts by length to reduce physical-shape drift/waste, and keeps exact mode available |
 
