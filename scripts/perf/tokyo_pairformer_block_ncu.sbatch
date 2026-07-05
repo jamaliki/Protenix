@@ -36,6 +36,7 @@ NCU=${NCU:-/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/env-nsight/bin/ncu}
 DEV_BIN=${DEV_BIN:-/mnt/lustre/users/kiarash-eitgbi/micromamba/envs/dev/bin}
 TOKENS=${TOKENS:-251}
 BATCH=${BATCH:-32}
+LENGTHS=${LENGTHS:-}
 C_S=${C_S:-384}
 C_Z=${C_Z:-128}
 N_HEADS=${N_HEADS:-16}
@@ -43,6 +44,18 @@ HIDDEN_SCALE_UP=${HIDDEN_SCALE_UP:-false}
 WARMUP=${WARMUP:-3}
 NCU_ITERS=${NCU_ITERS:-1}
 NCU_SET=${NCU_SET:-full}
+
+if [[ -n "$LENGTHS" ]]; then
+  IFS=',' read -ra LENGTH_ITEMS <<< "$LENGTHS"
+  BATCH=${#LENGTH_ITEMS[@]}
+  TOKENS=0
+  for ITEM in "${LENGTH_ITEMS[@]}"; do
+    ITEM=${ITEM//[[:space:]]/}
+    if (( ITEM > TOKENS )); then
+      TOKENS=$ITEM
+    fi
+  done
+fi
 
 cd "$PROTENIX_REPO"
 mkdir -p "$RUN_DIR" "$RUN_DIR/torchinductor_cache" "$RUN_DIR/triton_cache"
@@ -68,12 +81,25 @@ export TRITON_CACHE_DIR="$RUN_DIR/triton_cache"
 export PROTENIX_ATTENTION_FORCE_FP32=${PROTENIX_ATTENTION_FORCE_FP32:-0}
 export PROTENIX_TRITON_CUEQ_QKV_LAYOUT=${PROTENIX_TRITON_CUEQ_QKV_LAYOUT:-1}
 export PROTENIX_TRITON_TRIANGLE_ATTENTION_EPILOGUE=${PROTENIX_TRITON_TRIANGLE_ATTENTION_EPILOGUE:-1}
+export PROTENIX_TRITON_TRANSITION_DUAL_GEMM=${PROTENIX_TRITON_TRANSITION_DUAL_GEMM:-1}
+export PROTENIX_TRITON_TRIANGLE_DIRECT_RECOMPUTE_GATE=${PROTENIX_TRITON_TRIANGLE_DIRECT_RECOMPUTE_GATE:-0}
+
+PY_SHAPE_ARGS=(--batch "$BATCH" --tokens "$TOKENS")
+if [[ -n "$LENGTHS" ]]; then
+  # Mixed-token v2 profiling must use the real padding mask.  Dense BxNxN
+  # profiling disables the direct-recompute path and can point optimization at
+  # the wrong launches.
+  PY_SHAPE_ARGS=(--lengths "$LENGTHS")
+fi
+
+REPORT="$RUN_DIR/pairformer_block_B${BATCH}_N${TOKENS}_Cz${C_Z}_hsu${HIDDEN_SCALE_UP}_${NCU_SET}"
 
 echo "job_id=${SLURM_JOB_ID:-none} host=$(hostname) date_utc=$(date -u --iso-8601=seconds)"
 echo "repo=$(pwd) branch=$(git rev-parse --abbrev-ref HEAD) commit=$(git rev-parse HEAD)"
 echo "python=$("$PY" --version 2>&1)"
 echo "cc=$CC"
 echo "ncu=$("$NCU" --version | head -5 | tr '\n' '; ')"
+echo "shape=batch:$BATCH tokens:$TOKENS lengths:${LENGTHS:-dense} c_z:$C_Z hidden_scale_up:$HIDDEN_SCALE_UP direct_recompute:$PROTENIX_TRITON_TRIANGLE_DIRECT_RECOMPUTE_GATE"
 nvidia-smi
 
 "$NCU" \
@@ -81,10 +107,9 @@ nvidia-smi
   --set "$NCU_SET" \
   --target-processes all \
   --force-overwrite \
-  --export "$RUN_DIR/pairformer_block_B${BATCH}_N${TOKENS}_Cz${C_Z}_hsu${HIDDEN_SCALE_UP}_${NCU_SET}" \
+  --export "$REPORT" \
   "$PY" scripts/perf/pairformer_block_breakdown.py \
-    --batch "$BATCH" \
-    --tokens "$TOKENS" \
+    "${PY_SHAPE_ARGS[@]}" \
     --c-s "$C_S" \
     --c-z "$C_Z" \
     --n-heads "$N_HEADS" \
@@ -100,12 +125,12 @@ nvidia-smi
   2> "$RUN_DIR/ncu_stderr.txt"
 
 "$NCU" \
-  --import "$RUN_DIR/pairformer_block_B${BATCH}_N${TOKENS}_Cz${C_Z}_hsu${HIDDEN_SCALE_UP}_${NCU_SET}.ncu-rep" \
+  --import "$REPORT.ncu-rep" \
   --page summary \
   > "$RUN_DIR/ncu_summary.txt" 2>&1 || true
 
 "$NCU" \
-  --import "$RUN_DIR/pairformer_block_B${BATCH}_N${TOKENS}_Cz${C_Z}_hsu${HIDDEN_SCALE_UP}_${NCU_SET}.ncu-rep" \
+  --import "$REPORT.ncu-rep" \
   --csv --page raw \
   > "$RUN_DIR/ncu_raw.csv" 2> "$RUN_DIR/ncu_raw.err" || true
 

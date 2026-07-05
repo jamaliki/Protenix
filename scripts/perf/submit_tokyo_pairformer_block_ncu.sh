@@ -13,6 +13,7 @@ RUN_DIR=${RUN_DIR:-"$REPO/runs/pairformer_block_ncu_${STAMP}_${COMMIT}"}
 
 TOKENS=${TOKENS:-251}
 BATCH=${BATCH:-32}
+LENGTHS=${LENGTHS:-}
 C_S=${C_S:-384}
 C_Z=${C_Z:-128}
 N_HEADS=${N_HEADS:-16}
@@ -20,6 +21,22 @@ HIDDEN_SCALE_UP=${HIDDEN_SCALE_UP:-false}
 WARMUP=${WARMUP:-3}
 NCU_ITERS=${NCU_ITERS:-1}
 NCU_SET=${NCU_SET:-full}
+PROTENIX_TRITON_TRIANGLE_DIRECT_RECOMPUTE_GATE=${PROTENIX_TRITON_TRIANGLE_DIRECT_RECOMPUTE_GATE:-0}
+
+if [[ -n "$LENGTHS" ]]; then
+  # Keep the run labels honest for variable-length v2 buckets.  The Python
+  # harness also derives these values, but deriving them here makes the NCU
+  # report name match the actual profiled shape.
+  IFS=',' read -ra LENGTH_ITEMS <<< "$LENGTHS"
+  BATCH=${#LENGTH_ITEMS[@]}
+  TOKENS=0
+  for ITEM in "${LENGTH_ITEMS[@]}"; do
+    ITEM=${ITEM//[[:space:]]/}
+    if (( ITEM > TOKENS )); then
+      TOKENS=$ITEM
+    fi
+  done
+fi
 
 mkdir -p "$RUN_DIR/slurm_logs"
 
@@ -28,6 +45,7 @@ export PROTENIX_REPO=$REPO
 export RUN_DIR=$RUN_DIR
 export TOKENS=$TOKENS
 export BATCH=$BATCH
+export LENGTHS="$LENGTHS"
 export C_S=$C_S
 export C_Z=$C_Z
 export N_HEADS=$N_HEADS
@@ -35,6 +53,7 @@ export HIDDEN_SCALE_UP=$HIDDEN_SCALE_UP
 export WARMUP=$WARMUP
 export NCU_ITERS=$NCU_ITERS
 export NCU_SET=$NCU_SET
+export PROTENIX_TRITON_TRIANGLE_DIRECT_RECOMPUTE_GATE=$PROTENIX_TRITON_TRIANGLE_DIRECT_RECOMPUTE_GATE
 EOF
 
 JOB_ID=$(
