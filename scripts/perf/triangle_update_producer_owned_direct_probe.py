@@ -42,6 +42,7 @@ from scripts.perf.triangle_update_compact_segmented_probe import (
 from scripts.perf.triangle_update_producer_owned_finish_probe import (
     OwnedGroup,
     producer_owned_finish,
+    producer_owned_finish_recompute_gate,
 )
 
 
@@ -66,6 +67,7 @@ def _owned_group_ln_dual_gemm_kernel(
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
+    store_x_norm: tl.constexpr,
 ) -> None:
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -93,11 +95,12 @@ def _owned_group_ln_dual_gemm_kernel(
         bias = tl.load(norm_bias + k, mask=k_mask, other=0.0).to(tl.float32)
         values = (values - row_mean) * row_rstd * weight[None, :] + bias[None, :]
         values = values.to(tl.bfloat16)
-        tl.store(
-            x_norm + global_rows[:, None] * channels + k[None, :],
-            values,
-            mask=(pid_n == 0) & (offs_m[:, None] < group_rows) & k_mask[None, :],
-        )
+        if store_x_norm:
+            tl.store(
+                x_norm + global_rows[:, None] * channels + k[None, :],
+                values,
+                mask=(pid_n == 0) & (offs_m[:, None] < group_rows) & k_mask[None, :],
+            )
         gate_w = tl.load(
             gate_weight + offs_n[:, None] * channels + k[None, :],
             mask=(offs_n[:, None] < out_channels) & k_mask[None, :],
@@ -198,7 +201,7 @@ def grouped_dense_offsets(lengths: list[int]) -> torch.Tensor:
     return torch.tensor(offsets, device="cuda", dtype=torch.int64)
 
 
-def direct_owned_groups(
+def _direct_owned_groups(
     module: torch.nn.Module,
     z: torch.Tensor,
     dense_offsets: torch.Tensor,
@@ -207,7 +210,8 @@ def direct_owned_groups(
     *,
     row_stats: str = "tiled",
     row_stat_block_rows: int = 8,
-) -> tuple[torch.Tensor, list[OwnedGroup]]:
+    store_x_norm: bool = True,
+) -> tuple[torch.Tensor, list[OwnedGroup], torch.Tensor, torch.Tensor]:
     rows = dense_offsets.numel()
     mean = torch.empty(rows, device=z.device, dtype=torch.float32)
     rstd = torch.empty_like(mean)
@@ -231,7 +235,12 @@ def direct_owned_groups(
         )
     else:
         raise ValueError(f"unknown row_stats implementation: {row_stats!r}")
-    x_norm = torch.empty((rows, C_Z), device=z.device, dtype=z.dtype)
+    # The default finish consumes compact x_norm.  The recompute-gate screen
+    # deliberately avoids that write and later rebuilds the gate input from z
+    # plus these LayerNorm statistics.  A tiny dummy keeps the Triton signature
+    # stable while the constexpr mask removes the stores.
+    x_norm_rows = rows if store_x_norm else 1
+    x_norm = torch.empty((x_norm_rows, C_Z), device=z.device, dtype=z.dtype)
     groups: list[OwnedGroup] = []
     for start, length, count in group_spans(lengths):
         group_rows = count * length * length
@@ -258,11 +267,56 @@ def direct_owned_groups(
             64,
             128,
             64,
+            store_x_norm,
             num_warps=4,
             num_stages=3,
         )
         groups.append(OwnedGroup(length=length, start=start, count=count, lhs=lhs, rhs=rhs))
+    return x_norm, groups, mean, rstd
+
+
+def direct_owned_groups(
+    module: torch.nn.Module,
+    z: torch.Tensor,
+    dense_offsets: torch.Tensor,
+    lengths: list[int],
+    weights: dict[str, torch.Tensor],
+    *,
+    row_stats: str = "tiled",
+    row_stat_block_rows: int = 8,
+) -> tuple[torch.Tensor, list[OwnedGroup]]:
+    x_norm, groups, _, _ = _direct_owned_groups(
+        module,
+        z,
+        dense_offsets,
+        lengths,
+        weights,
+        row_stats=row_stats,
+        row_stat_block_rows=row_stat_block_rows,
+        store_x_norm=True,
+    )
     return x_norm, groups
+
+
+def _producer_owned_finish_for_mode(
+    module: torch.nn.Module,
+    z: torch.Tensor,
+    x_norm: torch.Tensor,
+    groups: list[OwnedGroup],
+    dense_offsets: torch.Tensor,
+    direction: str,
+    weights: dict[str, torch.Tensor],
+    finish: str,
+    input_mean: torch.Tensor | None = None,
+    input_rstd: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if finish == "recompute_gate":
+        if input_mean is None or input_rstd is None:
+            raise ValueError("recompute_gate finish requires input LayerNorm statistics")
+        return producer_owned_finish_recompute_gate(
+            module, z, groups, dense_offsets, direction, weights, input_mean, input_rstd
+        )
+    return producer_owned_finish(module, z, x_norm, groups, dense_offsets, direction, weights, finish)
 
 
 def direct_owned_update(
@@ -277,7 +331,8 @@ def direct_owned_update(
     row_stat_block_rows: int = 8,
     finish: str = "current",
 ) -> torch.Tensor:
-    x_norm, groups = direct_owned_groups(
+    store_x_norm = finish != "recompute_gate"
+    x_norm, groups, input_mean, input_rstd = _direct_owned_groups(
         module,
         z,
         dense_offsets,
@@ -285,9 +340,19 @@ def direct_owned_update(
         weights,
         row_stats=row_stats,
         row_stat_block_rows=row_stat_block_rows,
+        store_x_norm=store_x_norm,
     )
-    return producer_owned_finish(
-        module, z, x_norm, groups, dense_offsets, direction, weights, finish
+    return _producer_owned_finish_for_mode(
+        module,
+        z,
+        x_norm,
+        groups,
+        dense_offsets,
+        direction,
+        weights,
+        finish,
+        input_mean,
+        input_rstd,
     )
 
 
@@ -306,7 +371,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--row-stats", choices=["scalar", "tiled"], default="tiled")
     parser.add_argument("--row-stat-block-rows", type=int, default=8)
-    parser.add_argument("--finish", choices=["current", "fused_output"], default="current")
+    parser.add_argument(
+        "--finish",
+        choices=["current", "fused_output", "recompute_gate"],
+        default="current",
+    )
     parser.add_argument("--output-json")
     return parser.parse_args()
 
@@ -331,8 +400,9 @@ def main() -> None:
             args.warmup,
             args.iters,
         )
+        store_x_norm = args.finish != "recompute_gate"
         producer_out, producer_ms = cuda_time(
-            lambda: direct_owned_groups(
+            lambda: _direct_owned_groups(
                 module,
                 z,
                 dense_offsets,
@@ -340,11 +410,12 @@ def main() -> None:
                 weights,
                 row_stats=args.row_stats,
                 row_stat_block_rows=args.row_stat_block_rows,
+                store_x_norm=store_x_norm,
             ),
             args.warmup,
             args.iters,
         )
-        x_norm, groups = producer_out
+        x_norm, groups, input_mean, input_rstd = producer_out
         candidate, candidate_ms = cuda_time(
             lambda: direct_owned_update(
                 module,
@@ -361,7 +432,7 @@ def main() -> None:
             args.iters,
         )
         finish_only, finish_ms = cuda_time(
-            lambda: producer_owned_finish(
+            lambda: _producer_owned_finish_for_mode(
                 module,
                 z,
                 x_norm,
@@ -370,6 +441,8 @@ def main() -> None:
                 direction,
                 weights,
                 args.finish,
+                input_mean,
+                input_rstd,
             ),
             args.warmup,
             args.iters,

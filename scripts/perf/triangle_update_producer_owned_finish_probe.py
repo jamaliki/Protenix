@@ -241,6 +241,90 @@ def _output_dual_gemm_scatter_kernel(
     tl.store(out + ptr, delta + residual, mask=row_mask[:, None] & out_mask[None, :])
 
 
+@triton.jit
+def _output_dual_gemm_scatter_recompute_gate_kernel(
+    update,
+    z,
+    dense_offsets,
+    input_mean,
+    input_rstd,
+    output_mean,
+    output_rstd,
+    input_norm_weight,
+    input_norm_bias,
+    output_norm_weight,
+    output_norm_bias,
+    gate_weight,
+    value_weight,
+    out,
+    rows: tl.constexpr,
+    channels: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+) -> None:
+    # Benchmark-only larger fusion boundary: do not read producer-written
+    # compact x_norm.  Instead, rebuild the output-gate input from the original
+    # dense z rows and the already-computed input LayerNorm statistics.  If this
+    # wins, it means the compact x_norm write/read pair is real memory debt; if
+    # it loses, the extra z reload plus normalization arithmetic costs more than
+    # that saved traffic.
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    row = (pid_m * block_m + tl.arange(0, block_m)).to(tl.int64)
+    out_c = (pid_n * block_n + tl.arange(0, block_n)).to(tl.int64)
+    k_offsets = tl.arange(0, block_k).to(tl.int64)
+    row_mask = row < rows
+    out_mask = out_c < channels
+    dense_row = tl.load(dense_offsets + row, mask=row_mask, other=0).to(tl.int64)
+    in_mean = tl.load(input_mean + row, mask=row_mask, other=0.0)[:, None]
+    in_rstd = tl.load(input_rstd + row, mask=row_mask, other=1.0)[:, None]
+    out_mean = tl.load(output_mean + row, mask=row_mask, other=0.0)[:, None]
+    out_rstd = tl.load(output_rstd + row, mask=row_mask, other=1.0)[:, None]
+    acc_gate = tl.zeros((block_m, block_n), dtype=tl.float32)
+    acc_value = tl.zeros((block_m, block_n), dtype=tl.float32)
+
+    for k0 in range(0, channels, block_k):
+        k = k0 + k_offsets
+        k_mask = k < channels
+        raw_gate = tl.load(
+            z + dense_row[:, None] * channels + k[None, :],
+            mask=row_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        in_w = tl.load(input_norm_weight + k, mask=k_mask, other=0.0).to(tl.float32)
+        in_b = tl.load(input_norm_bias + k, mask=k_mask, other=0.0).to(tl.float32)
+        gate_x = (raw_gate - in_mean) * in_rstd * in_w[None, :] + in_b[None, :]
+        gate_x = gate_x.to(tl.bfloat16)
+
+        upd = tl.load(
+            update + row[:, None] * channels + k[None, :],
+            mask=row_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        out_w = tl.load(output_norm_weight + k, mask=k_mask, other=0.0).to(tl.float32)
+        out_b = tl.load(output_norm_bias + k, mask=k_mask, other=0.0).to(tl.float32)
+        upd = (upd - out_mean) * out_rstd * out_w[None, :] + out_b[None, :]
+
+        gate_w = tl.load(
+            gate_weight + out_c[:, None] * channels + k[None, :],
+            mask=out_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        value_w = tl.load(
+            value_weight + out_c[:, None] * channels + k[None, :],
+            mask=out_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        acc_gate += tl.dot(gate_x, tl.trans(gate_w))
+        acc_value += tl.dot(upd.to(tl.bfloat16), tl.trans(value_w))
+
+    ptr = dense_row[:, None] * channels + out_c[None, :]
+    residual = tl.load(z + ptr, mask=row_mask[:, None] & out_mask[None, :], other=0.0)
+    delta = (1.0 / (1.0 + tl.exp(-acc_gate))) * acc_value
+    tl.store(out + ptr, delta + residual, mask=row_mask[:, None] & out_mask[None, :])
+
+
 def compact_finish_from_update_fused_output(
     module: torch.nn.Module,
     z: torch.Tensor,
@@ -298,6 +382,60 @@ def compact_finish_from_update_fused_output(
     return out
 
 
+def compact_finish_from_update_recompute_gate(
+    module: torch.nn.Module,
+    z: torch.Tensor,
+    update: torch.Tensor,
+    dense_offsets: torch.Tensor,
+    weights: dict[str, torch.Tensor],
+    input_mean: torch.Tensor,
+    input_rstd: torch.Tensor,
+) -> torch.Tensor:
+    """Fuse output finish while rebuilding the gate input instead of reading x_norm."""
+
+    rows = dense_offsets.numel()
+    output_mean = torch.empty(rows, device=z.device, dtype=torch.float32)
+    output_rstd = torch.empty_like(output_mean)
+    stats_grid = (triton.cdiv(rows, 8),)
+    _update_row_stats_tiled_kernel[stats_grid](
+        update,
+        output_mean,
+        output_rstd,
+        rows,
+        C_Z,
+        1e-5,
+        8,
+        C_Z,
+        num_warps=8,
+    )
+    out = torch.empty_like(z)
+    grid = (triton.cdiv(rows, 64), triton.cdiv(C_Z, 128))
+    _output_dual_gemm_scatter_recompute_gate_kernel[grid](
+        update,
+        z,
+        dense_offsets,
+        input_mean,
+        input_rstd,
+        output_mean,
+        output_rstd,
+        module.layer_norm_in.weight,
+        module.layer_norm_in.bias,
+        module.layer_norm_out.weight,
+        module.layer_norm_out.bias,
+        weights["g_out"],
+        weights["p_out"],
+        out,
+        rows,
+        C_Z,
+        64,
+        128,
+        64,
+        num_warps=4,
+        num_stages=3,
+    )
+    return out
+
+
 def producer_owned_finish(
     module: torch.nn.Module,
     z: torch.Tensor,
@@ -317,6 +455,23 @@ def producer_owned_finish(
     if finish != "current":
         raise ValueError(f"unknown finish implementation: {finish!r}")
     return compact_finish_from_update(module, z, x_norm, update, dense_offsets, weights)
+
+
+def producer_owned_finish_recompute_gate(
+    module: torch.nn.Module,
+    z: torch.Tensor,
+    groups: list[OwnedGroup],
+    dense_offsets: torch.Tensor,
+    direction: str,
+    weights: dict[str, torch.Tensor],
+    input_mean: torch.Tensor,
+    input_rstd: torch.Tensor,
+) -> torch.Tensor:
+    contracted = contract_groups(groups, direction)
+    update = assemble_update(groups, contracted, dense_offsets.numel())
+    return compact_finish_from_update_recompute_gate(
+        module, z, update, dense_offsets, weights, input_mean, input_rstd
+    )
 
 
 def producer_owned_output_only(
