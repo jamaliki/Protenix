@@ -55,6 +55,9 @@ def run_direct_scoped(
     config: ContractConfig,
     plan: TriangleUpdatePlan,
     *,
+    direct_row_stats: str = "tiled",
+    direct_row_stat_block_rows: int = 8,
+    direct_finish: str = "current",
     sync_scopes: bool = False,
 ) -> TensorPair:
     def maybe_sync() -> None:
@@ -81,6 +84,9 @@ def run_direct_scoped(
             plan.dense_offsets,
             plan.descriptors,
             plan.invalid_offsets,
+            direct_row_stats,
+            direct_row_stat_block_rows,
+            direct_finish,
         )
         maybe_sync()
     with record_function("direct/triangle_mul_in"):
@@ -96,6 +102,9 @@ def run_direct_scoped(
             plan.dense_offsets,
             plan.descriptors,
             plan.invalid_offsets,
+            direct_row_stats,
+            direct_row_stat_block_rows,
+            direct_finish,
         )
         maybe_sync()
     with record_function("direct/triangle_attention_start"):
@@ -167,6 +176,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--randomize-zero-weights", type=str_bool, default=True)
+    parser.add_argument("--direct-row-stats", choices=["scalar", "tiled"], default="tiled")
+    parser.add_argument("--direct-row-stat-block-rows", type=int, default=8)
+    parser.add_argument(
+        "--direct-finish",
+        choices=["current", "fused_output", "recompute_gate"],
+        default="current",
+    )
     parser.add_argument("--top-rows", type=int, default=60)
     parser.add_argument("--output-dir", required=True)
     return parser.parse_args()
@@ -198,7 +214,6 @@ def main() -> None:
         )
         direct = profile_case(
             "direct_block",
-            lambda: run_direct_scoped(block, s, z, mask, args.lengths, args.config, plan),
             lambda: run_direct_scoped(
                 block,
                 s,
@@ -207,6 +222,21 @@ def main() -> None:
                 args.lengths,
                 args.config,
                 plan,
+                direct_row_stats=args.direct_row_stats,
+                direct_row_stat_block_rows=args.direct_row_stat_block_rows,
+                direct_finish=args.direct_finish,
+            ),
+            lambda: run_direct_scoped(
+                block,
+                s,
+                z,
+                mask,
+                args.lengths,
+                args.config,
+                plan,
+                direct_row_stats=args.direct_row_stats,
+                direct_row_stat_block_rows=args.direct_row_stat_block_rows,
+                direct_finish=args.direct_finish,
                 sync_scopes=True,
             ),
             out_dir,
