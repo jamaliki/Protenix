@@ -4134,13 +4134,14 @@ reproduced B8/8 point:
 | workers | MPS % | batch | generated samples | generated samples/s | interpretation |
 | ---: | ---: | ---: | ---: | ---: | --- |
 | 8 | 12 | 8 | 1280 | `3.930` | same-run B8/8 control; matches the lower current repeat |
-| 9 | 11 | 8 | 1440 | `4.182` | current best measured v2 point |
+| 9 | 11 | 8 | 1440 | `4.182` | best pre-compact measured v2 point |
 | 10 | 10 | 8 | n/a | n/a | OOM on long-token records after 256 timed records |
 | 10 | 10 | 4 | 1600 | `4.059` | memory-safe but slower than B8/9 |
 
-Decision: for the actual Sam-style Protenix-v2/wide-`z` target, the current
-operational MPS preset is B8/9 at 11%, not the stale historical B8/8 row and
-not the base-checkpoint B4/16 recipe.  The B8/10 failure is a real memory cliff:
+Decision at this pre-compact stage: for the actual Sam-style
+Protenix-v2/wide-`z` target, the operational MPS preset was B8/9 at 11%, not
+the stale historical B8/8 row and not the base-checkpoint B4/16 recipe.  The
+B8/10 failure was a real memory cliff:
 worker logs showed CUDA OOMs with only tens of MiB free during long-token
 records.  Reducing the per-worker batch to B4 keeps B10 alive but gives back
 too much diffusion/atom batching efficiency.
@@ -4154,7 +4155,7 @@ to the worker logs.
 
 | case | result | peak allocated / worker | peak reserved / worker | interpretation |
 | --- | ---: | ---: | ---: | --- |
-| B8/9, 11% MPS | `4.183` generated samples/s | `8310 MiB` | `8688 MiB` | reproduced the current best operating point |
+| B8/9, 11% MPS | `4.183` generated samples/s | `8310 MiB` | `8688 MiB` | reproduced the best pre-compact operating point |
 | B8/10, 10% MPS | OOM during long-token warmup | worker logs showed `~7.6-7.7 GiB` PyTorch-allocated per live process at failure | only `~136-138 MiB` PyTorch reserve slack in failing workers | not an allocator-cache artifact |
 
 Decision: do not chase B8/10 with `PYTORCH_CUDA_ALLOC_CONF` tweaks or
@@ -4198,14 +4199,59 @@ attention or pair-bias kernels: the memory win is real, but the existing
 PyTorch/cuDNN rank-5 boundary gives back too much compute throughput under
 concurrent workers.
 
+Compact-bias Triton attention follow-up: commit `5b67848` kept the fast flat
+q/k/v shape but changed the diffusion token-attention kernel so cached pair
+bias can remain compact at record granularity instead of being repeated across
+the `N_sample` lanes.  The benchmark-only kernel first cleared the isolated
+24-block diffusion-transformer screen on one H100:
+
+| `B8`, `N_sample=5`, `N=220`, v2 | time / 24-block screen | bias storage | interpretation |
+| --- | ---: | ---: | --- |
+| expanded rank-4 cuDNN SDPA | `34.31 ms` | `1418 MiB` | current fast execution boundary |
+| compact rank-5 cuDNN SDPA | `37.53 ms` | `284 MiB` | saves memory but loses throughput |
+| compact-bias Triton, `block_m=32` | `17.78 ms` | `284 MiB` | promising custom boundary; BF16-scale drift |
+
+Short model gate job `113434`
+(`runs/v2_compact_attention_n20_gate_20260705_051539_5b67848`) then compared
+the production flag off/on on the Sam-style mixed 40-220-token input,
+Protenix-v2, B8, `N_sample=5`, `N_step=20`, confidence enabled, direct triangle
+recompute on:
+
+| case | predict samples/s | summed model predict | wall samples/s | peak allocated / reserved | decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| flat expanded bias | `6.929` | `23.09s` | `2.876` | `8310 / 8688 MiB` | control |
+| compact-bias Triton | `7.080` | `22.60s` | `5.224` | `7173 / 7548 MiB` | memory win; short-gate speed inconclusive |
+
+Interpretation: do not quote the wall-speed jump as a model win because the
+second case benefits from warm input/model-state effects outside the measured
+model subtotal.  The robust evidence is narrower: compact-bias attention cuts
+about `1.1 GiB` from the per-worker peak and slightly improves model predict in
+this short gate.  Since `N_step=20` is dominated by the wide pairformer trunk,
+the decisive test was the real `N_step=200` MPS concurrency knee.  Job `113585`
+(`runs/v2_compact_attention_mps_n200_20260705_052445_5b67848`) ran B8/9
+control, compact B8/9, and compact B8/10 in one allocation:
+
+| case | workers / batch / MPS % | generated samples/s | summed predict | wall | peak allocated / reserved | decision |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| flat expanded bias | B8/9/11% | `4.146` | `3013.07s` | `347.34s` | `8310 / 8688 MiB` | reproduced current v2 knee |
+| compact-bias Triton | B8/9/11% | `5.087` | `2433.83s` | `283.10s` | `7173 / 7548 MiB` | new best v2 `N_sample=5` preset |
+| compact-bias Triton | B8/10/10% | `4.957` | `3088.84s` | `322.77s` | `7173 / 7548 MiB` | memory-safe but over-contended |
+
+Decision: promote compact-bias Triton attention as the maximum-throughput
+Protenix-v2 `N_sample=5` MPS preset, still guarded behind
+`PROTENIX_TRITON_COMPACT_DIFFUSION_ATTENTION=1` for conservative numerical
+bisects.  The useful operating point is B8/9 at 11%, not B8/10: compact
+attention fixes the memory cliff, but the tenth context loses more to
+contention than it gains in extra records.
+
 Decision: keep MPS documented as an operational option, but do not quote the
 old v2 `4.62` generated samples/s row as current without reproducing it.  The
-direct-recompute triangle path helped consistently under MPS (`~1.06x`), but
-the current wide-v2 MPS bottleneck is diffusion-heavy context contention, not
-the triangle boundary alone.  The current verified v2 `N_sample=5` MPS number
-is `4.18` generated samples/s, about `1.48x` over the current single-process
-direct-recompute gate (`2.82` generated samples/s) and about `8.6x` over the
-matched upstream-compatible v2 wall baseline (`0.489` generated samples/s).
+direct-recompute triangle path helped consistently under MPS (`~1.06x`), and
+compact diffusion attention now moves the current verified v2 `N_sample=5` MPS
+number to `5.09` generated samples/s.  That is about `1.80x` over the current
+single-process direct-recompute gate (`2.82` generated samples/s), `1.23x` over
+the same-run B8/9 MPS control, and about `10.4x` over the matched
+upstream-compatible v2 wall baseline (`0.489` generated samples/s).
 
 Protenix-v2 mixed-token pairformer profile: jobs `105740` and `105741` captured
 the two physical pairformer block shapes used by the sorted Sam-style
@@ -5487,7 +5533,7 @@ These failed because the real workload, not the isolated kernel, is the gate:
 | Parallel or async CIF/JSON dumping | per-batch parallel dumping improved one B32 dump section only `5.35s -> 5.09s` and total predict+dump only `47.75s -> 47.47s`; a stronger async writer pipeline on a 256-record/8-batch gate was also flat (`413.65s -> 412.36s` seed wall, all outputs present) | dumping looks idle from the GPU view, but writer threads contend with the same host/filesystem path that prepares later batches; do not carry default-off writer pools unless an end-to-end campaign gate moves |
 | CUDA graph replay of the diffusion-token transformer | exact and mildly faster in isolation (`1.07x` at `N=124`, `1.02x` at `N=220`), but the long-shape ceiling is under 2% e2e | launch overhead is not the meat of the remaining transformer bottleneck; revisit only as part of a larger full-denoising graph |
 | CUDA graph replay of the v2 Pairformer stack | exact and lower-memory, but throughput was too small/flat: short 48-block bucket `482.16 -> 465.80 ms` (`1.035x`), long 48-block bucket `1236.81 -> 1238.13 ms` (`0.999x`) | graph plumbing is not the main wide-`z` v2 lever; target the native segmented triangle-update/fused producer boundary instead |
-| Reusing the base-checkpoint B4/16 MPS recipe for Protenix-v2 | v2 B4/16 hit CUDA OOM in the diffusion transformer after the long-token warmup filled the GPU.  A historical v2 screen found B8/8 (`4.621` samples/s) slightly ahead of B4/10 (`4.576` samples/s), but current-head repeats moved the v2 knee to B8/9 (`4.182` samples/s), with B8/10 OOMing and B4/10 slower (`4.059` samples/s) | Protenix-v2's wider `z` representation changes the concurrency knee; use current v2-specific gates and do not quote base-model MPS numbers for Sam-style v2 predictions |
+| Reusing the base-checkpoint B4/16 MPS recipe for Protenix-v2 | v2 B4/16 hit CUDA OOM in the diffusion transformer after the long-token warmup filled the GPU.  A historical v2 screen found B8/8 (`4.621` samples/s) slightly ahead of B4/10 (`4.576` samples/s); pre-compact current-head repeats moved the v2 knee to B8/9 (`4.182` samples/s), with B8/10 OOMing and B4/10 slower (`4.059` samples/s); compact diffusion attention then moved the current v2 preset to B8/9 at `5.087` samples/s while B8/10 fit but remained slower (`4.957` samples/s) | Protenix-v2's wider `z` representation changes the concurrency knee; use the current compact v2-specific gate and do not quote base-model MPS numbers for Sam-style v2 predictions |
 | Merging campaign JSONs before preprocessing | 64-file directory gate moved only from 197.54 s to 195.70 s (`1.009x`) and worsened preprocessing failure granularity | the remaining e2e gap is not mainly per-file JSON preprocessing |
 | Naive padded mixed-shape pairformer batching | valid-region differences accumulated over 48 blocks: FP32 `s/z` mean abs `0.012/0.006`, BF16 `0.236/0.168` for 245 -> 384 tokens | do not claim bitwise parity; the promoted path masks all token readers, sorts by length to reduce physical-shape drift/waste, and keeps exact mode available |
 

@@ -183,6 +183,17 @@ throughput win over the flattened BF16 path.  In the Protenix-v2/wide-`z`
 MPS memory-cliff study it reduced the B8 diffusion component peak
 (`8310 -> 7164 MiB` allocated), but the follow-up `N_step=200` B8/9 MPS gate
 was far slower than the flat path and was stopped before trying B8/10.
+The newer experimental `PROTENIX_TRITON_COMPACT_DIFFUSION_ATTENTION=1` path
+keeps the fast flattened q/k/v execution while letting the attention kernel
+read cached pair bias from the compact record-level tensor instead of expanding
+it over every diffusion sample.  On a short Protenix-v2 B8/`N_sample=5` gate it
+lowered peak memory (`8310 -> 7173 MiB` allocated, `8688 -> 7548 MiB`
+reserved), but model predict time moved only `23.09s -> 22.60s` because
+`N_step=20` is dominated by the wide pairformer trunk.  The real `N_step=200`
+MPS gate then showed why the memory cut matters: B8/9 improved from `4.15` to
+`5.09` generated samples/s on one H100.  Use this flag for maximum
+Protenix-v2 `N_sample=5` campaign throughput; leave it off for conservative
+numerical bisects or unsupported shapes.
 
 The CUEQ pairformer path also defaults to a contiguous ending-attention
 producer (`PROTENIX_CUEQ_ENDING_CONTIGUOUS_PRODUCER=1`).  This is a small
@@ -374,7 +385,7 @@ dumping:
 | Same mixed-token `N_sample=1` workload, many campaign shards on one H100, base checkpoint | 0.166 records/s original low-sample boundary | 1.77 records/s with five `--batch_size 16` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20` | 10.7x per-GPU operational throughput |
 | Same mixed-token `N_sample=5` workload, many campaign shards on one H100, base checkpoint | 0.753 generated samples/s original low-sample boundary | 6.72 generated samples/s with sixteen `--batch_size 4` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=6` | 8.9x per-GPU operational throughput |
 | Same Protenix-v2 mixed-token workload, many campaign shards on one H100, `N_sample=1` | current v2 single-process reference: 0.796 records/s at `--batch_size 16`; a pristine original v2 default still needs measuring | 1.25 records/s with five `--batch_size 16` workers under CUDA MPS at 20% | 1.57x over current v2 single-process throughput |
-| Same Protenix-v2 mixed-token workload, many campaign shards on one H100, `N_sample=5` | current v2 single-process direct-recompute reference: 2.82 generated samples/s at `--batch_size 16`; the older 3.29 single-process row did not reproduce at current HEAD | current same-run scout: 4.18 generated samples/s with nine `--batch_size 8` workers under CUDA MPS at 11% plus `PROTENIX_TRITON_TRIANGLE_DIRECT_RECOMPUTE_GATE=1`; ten B8 workers OOMed, ten B4 workers were slower, and the older 4.62 MPS row remains historical until reproduced | 1.48x over current single-process direct-recompute throughput; about 8.6x over the executable upstream-compatible v2 wall baseline |
+| Same Protenix-v2 mixed-token workload, many campaign shards on one H100, `N_sample=5` | current v2 single-process direct-recompute reference: 2.82 generated samples/s at `--batch_size 16`; the older 3.29 single-process row did not reproduce at current HEAD | current same-run gate: 5.09 generated samples/s with nine `--batch_size 8` workers under CUDA MPS at 11%, `PROTENIX_TRITON_TRIANGLE_DIRECT_RECOMPUTE_GATE=1`, and `PROTENIX_TRITON_COMPACT_DIFFUSION_ATTENTION=1`; compact B8/10 fit but was slower at 4.96, and the older 4.62 MPS row is now superseded | 1.80x over current single-process direct-recompute throughput; about 10.4x over the executable upstream-compatible v2 wall baseline |
 
 The matched Protenix-v2 rows use an "upstream-compatible" control because the
 pristine upstream `fast_layer_norm_cuda_v2` extension currently fails to build
@@ -409,11 +420,15 @@ old MPS rate (`3.83` generated samples/s with direct recompute on), so leave
 the v2 transition path enabled.  A later width scout found the current best
 same-run v2 point at nine B8 workers and 11% MPS (`4.18` generated samples/s);
 ten B8 workers crossed the memory cliff on long-token records, and ten B4
-workers completed but were slower (`4.06` generated samples/s).  The remaining
-cost is split between the wider
-pairformer and denoising work, so the next large win needs true
-ragged/segmented pairformer or broader block-boundary work rather than more
-queue bucket tuning or blindly adding MPS workers.
+workers completed but were slower (`4.06` generated samples/s).  The compact
+diffusion-attention gate then moved the current v2 point to nine B8 workers at
+11% MPS and `5.09` generated samples/s.  Ten compact B8 workers now fit, but
+extra context contention made them slower (`4.96` generated samples/s), so the
+current best operating point remains B8/9 plus compact diffusion attention.
+The remaining cost is split between the wider pairformer and denoising work, so
+the next large win needs true ragged/segmented pairformer or broader
+block-boundary work rather than more queue bucket tuning or blindly adding MPS
+workers.
 The B8 diffusion-transformer NCU capture at the current v2 MPS worker shape
 reaches the same conclusion from the denoising side: remaining block time is
 split across memory-bound elementwise/residual plumbing, SDPA, medium BF16
@@ -430,11 +445,14 @@ campaign shards overlap on one H100, tune the worker shape to the checkpoint.
 For the base checkpoint the best `N_sample=5` gate so far is sixteen
 `--batch_size 4` workers at `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=6`.  For
 Protenix-v2, whose wider pairformer contends much more strongly, use nine
-`--batch_size 8` workers at 11% for the current measured `N_sample=5` knee.
-Ten B8 workers OOMed on the long-token records, ten B4 workers were slower,
-and the base B4/16 recipe OOMed for v2.  These are throughput-only settings: each
-individual shard is slower than the single-process B16 mode, but aggregate
-samples/sec per H100 is higher.
+`--batch_size 8` workers at 11% with
+`PROTENIX_TRITON_COMPACT_DIFFUSION_ATTENTION=1` for the current measured
+`N_sample=5` knee.  This reaches `5.09` generated samples/s.  Without compact
+diffusion attention, ten B8 workers OOMed on the long-token records; with it,
+ten B8 workers fit but were slower (`4.96` generated samples/s), and ten B4
+workers were also slower.  These are throughput-only settings: each individual
+shard is slower than the single-process B16 mode, but aggregate samples/sec per
+H100 is higher.
 
 For Sam-style Protenix-v2 work, treat the v2 rows above as the target workload,
 not the base-checkpoint headline.  The current matched upstream-compatible win
@@ -554,10 +572,10 @@ Important details:
   For maximum base-checkpoint `N_sample=5` aggregate throughput, the current
   best gate is `--batch_size 4` with sixteen workers at 6%.  For Protenix-v2
   `N_sample=5`, use `--batch_size 8` with nine workers at 11% for the current
-  same-run knee (`4.18` generated samples/s with the direct triangle flag on).
-  Ten B8 workers OOMed on the long-token records and ten B4 workers completed
-  but were slower (`4.06` generated samples/s).  Validate MPS on your target
-  node before quoting it as a maximum.
+  same-run knee (`5.09` generated samples/s with the direct triangle flag and
+  compact diffusion attention on).  Compact B8/10 is memory-safe but slower
+  (`4.96` generated samples/s), so the extra worker is not worth the context
+  contention.  Validate MPS on your target node before quoting it as a maximum.
 - The B8/10 Protenix-v2 failure is a real live-memory limit, not just allocator
   cache slack: the B8/9 control measured `8310 MiB` peak allocated and
   `8688 MiB` peak reserved per worker, so ten B8 workers would exceed an H100
@@ -568,6 +586,11 @@ Important details:
   diffusion path lowered that peak to `7164 MiB`, but it made the representative
   MPS throughput path much slower; keep it as a diagnostic/custom-kernel
   stepping stone, not as a user-facing speed preset.
+  The compact-bias Triton attention path is the useful memory-concurrency fix:
+  it preserved the flat q/k/v path while lowering peak reserved memory to
+  `7548 MiB`, moved B8/9 MPS from `4.15` to `5.09` generated samples/s, and
+  made B8/10 memory-safe.  B8/10 was still slower because of context
+  contention, so use compact B8/9 as the v2 throughput preset.
 - Start CUDA MPS with pipe and log directories on a node-local filesystem such
   as `/tmp`.  Do not put `CUDA_MPS_PIPE_DIRECTORY` on Lustre; the MPS control
   socket may fail there.
@@ -581,17 +604,18 @@ Important details:
   `--batch_size 4` workers at 6% reached `6.72` generated samples/s after the
   triangle LN+q/k/v default, about `1.61x` over the current single-process
   rate (`4.18` generated samples/s).  For Protenix-v2 `N_sample=5`, the older
-  best measured point was eight `--batch_size 8` workers at 12%, `4.62`
-  generated samples/s or `1.40x` over the then-current v2 single-process
-  reference.  The current same-run width scout reached `4.18` generated
-  samples/s with nine B8 workers at 11%, while B8/10 OOMed and B4/10 was slower;
-  quote this newer number unless you have reproduced the old MPS row locally.
-  Do not reuse the base-model `6.72` generated samples/s row for v2.
+  pre-compact best measured point was eight `--batch_size 8` workers at 12%,
+  `4.62` generated samples/s or `1.40x` over the then-current v2 single-process
+  reference.  Current HEAD moves the v2 recommendation to nine B8 workers at
+  11% with compact diffusion attention enabled, reaching `5.09` generated
+  samples/s.  Ten compact B8 workers fit but were slower (`4.96` generated
+  samples/s), so do not add the tenth worker or reuse the base-model `6.72`
+  generated samples/s row for v2.
 - Keep `PROTENIX_PREFETCH_DATALOADER=1` for long MPS campaigns if host memory
   allows it, but treat it as a modest host-overlap polish rather than the main
   speedup.  In paired five-worker MPS gates it added `1-2%` throughput while
-  leaving summed model-predict time essentially unchanged.  For the current v2
-  B8/8 MPS repeat, prefetch did not rescue throughput (`3.94` with it on and
+  leaving summed model-predict time essentially unchanged.  For the pre-compact
+  v2 B8/8 MPS repeat, prefetch did not rescue throughput (`3.94` with it on and
   `3.90` with it off under the direct triangle flag), so do not rely on
   prefetch to fix v2 MPS contention.
 - No-MPS multi-process concurrency helped only modestly (`4.19` generated
