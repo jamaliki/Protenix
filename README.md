@@ -401,10 +401,12 @@ current repeat at commit `55c6974`, however, did not reproduce that absolute
 MPS rate: the same B8/8 setting measured `3.70` generated samples/s with the
 direct triangle flag off and `3.94` with it on.  Treat `4.62` as historical
 until reproduced on your node; the direct triangle flag itself was consistent
-(`~1.06x` under MPS).  The remaining cost is split between the wider pairformer
-and denoising work, so the next large win needs true
-ragged/segmented pairformer work rather than more queue bucket tuning or
-blindly adding MPS workers.
+(`~1.06x` under MPS).  A transition-dual-GEMM-off bisect did not recover the
+old MPS rate (`3.83` generated samples/s with direct recompute on), so leave
+the v2 transition path enabled.  The remaining cost is split between the wider
+pairformer and denoising work, so the next large win needs true
+ragged/segmented pairformer or broader block-boundary work rather than more
+queue bucket tuning or blindly adding MPS workers.
 Seeing `token-trunk+diffusion-token-atom-batch` in the log means batching is
 working; it does not mean the run is using the exact-shape `7r6r` path.
 
@@ -499,6 +501,13 @@ layout copy.
 The direct producer tile was also hill-climbed around the current
 `64x128x64`, 4-warp choice; nearby `32`-row, `256`-column, and 8-warp variants
 were all flat or slower on the long v2 bucket.
+An exact mixed-length Nsight Compute capture of the long v2 direct-recompute
+block confirms why this is hard: after the direct triangle update, time is
+distributed across cuDNN SDPA, pair transition, direct producer/output kernels,
+LayerNorm, q/k/v layout, CUEQ/NVJET GEMMs, and many memory-bound elementwise
+launches.  There is no single weak matmul left to swap out; the next native
+boundary needs to remove broad memory/layout traffic while preserving the
+vendor-class attention and GEMM mainloops.
 Whole-Pairformer CUDA graph replay was also screened as a lower-risk
 launch-overhead fix.  It was exact and helped the short v2 bucket by about
 `3%`, but the full 48-block long bucket was flat (`~1.00x`) once changed

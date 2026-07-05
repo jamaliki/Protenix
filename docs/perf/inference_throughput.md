@@ -4084,6 +4084,22 @@ not find a better current MPS point:
 | 5 | 20 | 16 | `3.72` |
 | 6 | 16 | 12 | `3.66` |
 
+Transition dual-GEMM MPS bisect: job `112301`, run
+`runs/v2_mps_transition_off_direct_gate_cf6f072_20260705_023902`, repeated the
+current B8/8 v2 `N_sample=5` MPS point with
+`PROTENIX_TRITON_TRANSITION_DUAL_GEMM=0`.  This did not recover the historical
+`4.62` row:
+
+| transition dual-GEMM | direct recompute | generated samples/s | interpretation |
+| ---: | ---: | ---: | --- |
+| off | off | `3.60` | worse than current transition-on direct-off repeat (`3.70`) |
+| off | on | `3.83` | direct still helps (`1.063x`), but remains below transition-on direct-on (`3.94`) |
+
+Decision: the lower current MPS rate is not caused by the v2 transition
+dual-GEMM guard.  Keep the transition path enabled for v2, and treat the old
+`4.62` row as stale or environment/run-definition-dependent until a current
+HEAD repeat reproduces it.
+
 Decision: keep MPS documented as an operational option, but do not quote the
 old v2 `4.62` generated samples/s row as current without reproducing it.  The
 direct-recompute triangle path helped consistently under MPS (`~1.06x`), but
@@ -4845,6 +4861,39 @@ short-term implementation ladder is:
    `2.7-2.9s`.  The flag should therefore be treated as a useful opt-in v2
    throughput knob and as evidence for the native boundary, not as the final
    wide-z solution.
+
+   Exact mixed-length NCU follow-up: commit `90d83dd` taught the
+   `scripts/perf/submit_tokyo_pairformer_block_ncu.sh` wrapper to pass a
+   concrete `LENGTHS=` list through to `pairformer_block_breakdown.py`, so the
+   profiler can capture the actual Sam-style padded mask instead of a dense
+   BxNxN surrogate where direct recompute is disabled.  Job `112462`, run
+   `runs/v2_pairformer_varlen_direct_ncu_20260705_025623_90d83dd`, captured the
+   long v2 bucket (`B16`, lengths
+   `136,136,148,148,160,160,172,172,184,184,196,196,208,208,220,220`,
+   `c_z=256`, `hidden_scale_up=True`,
+   `PROTENIX_TRITON_TRIANGLE_DIRECT_RECOMPUTE_GATE=1`).  The raw export
+   summarized to `23.23 ms` of captured kernel time, matching the production
+   block timing closely enough for launch attribution:
+
+   | kernel family | launches | total ms | roofline signal / interpretation |
+   | --- | ---: | ---: | --- |
+   | cuDNN SDPA | 2 | `5.27` | large vendor attention mainloops; not a replacement target |
+   | pair transition dual-GEMM | 1 | `2.51` | material transition work, but a fused tensor-core path is already used |
+   | direct-recompute producer kernels | 16 | `2.02` | compact row production is now visible but not dominant alone |
+   | LayerNorm kernels | 6 | `1.93` | memory/layout-adjacent traffic remains material |
+   | direct output-gate kernels | 2 | `1.82` | residual gate boundary remains one of the larger custom kernels |
+   | CUEQ/NVJET triangle/token GEMMs | 10+ | `~3.4` across major families | fast vendor-class kernels; preserve mainloops when fusing |
+   | q/k/v layout kernels | 2 | `1.64` | high-DRAM layout traffic around attention |
+   | PyTorch elementwise/layout kernels | 49 | `1.81` | broad memory-bound tail, not one bad launch |
+
+   Interpretation: after direct recompute, the long v2 block is no longer
+   dominated by the old triangle-multiplication contraction alone.  The
+   residual cost is distributed across cuDNN attention, transition, direct
+   producer/output kernels, LayerNorm, q/k/v layout, and many memory-bound
+   elementwise kernels.  The next v2-wide kernel boundary must therefore fuse a
+   broader producer/attention/layout/epilogue region while preserving cuDNN,
+   CUEQ, and tensor-core GEMM mainloops; a naive custom "mega-kernel" that
+   replaces them is unlikely to win.
 
    Pairformer CUDA graph follow-up: commit `75761ba` added
    `scripts/perf/pairformer_cudagraph_probe.py` to check whether launch/Python
