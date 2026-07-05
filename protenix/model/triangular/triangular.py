@@ -38,6 +38,10 @@ from protenix.model.triangular.layers import (
     OpenfoldLinear,
     cuequivariance_triangular_attn,
 )
+from protenix.model.triangular.triangle_direct_recompute_gate_triton import (
+    triangle_update_direct_recompute_gate,
+    triton_triangle_direct_recompute_gate_enabled,
+)
 from protenix.model.triangular.ln_qkv_triton import (
     triton_ln_qkv_to_cueq_heads_first,
 )
@@ -593,6 +597,35 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
         # Therefore, we include a check here: if c != c_z, we fall back to using plain PyTorch.
         # This situation may occur in our template module.
         if triangle_multiplicative == "cuequivariance" and (self.c_z == self.c_hidden):
+            if (
+                _input_inplace_safe
+                and _add_with_inplace
+                and triton_triangle_direct_recompute_gate_enabled()
+            ):
+                weight_p, weight_g = self._triton_input_producer_weights(
+                    dtype=z.dtype,
+                    device=z.device,
+                )
+                weight_out_g, weight_out_z = self._triton_output_gate_weights(
+                    dtype=z.dtype,
+                    device=z.device,
+                )
+                direct_update = triangle_update_direct_recompute_gate(
+                    z,
+                    direction="outgoing" if self._outgoing else "incoming",
+                    mask=(z.new_ones(z.shape[:-1]) if mask is None else mask),
+                    norm_in_weight=self.layer_norm_in.weight,
+                    norm_in_bias=self.layer_norm_in.bias,
+                    p_in_weight=weight_p,
+                    g_in_weight=weight_g,
+                    norm_out_weight=self.layer_norm_out.weight,
+                    norm_out_bias=self.layer_norm_out.bias,
+                    p_out_weight=weight_out_z,
+                    g_out_weight=weight_out_g,
+                    eps=1e-5,
+                )
+                if direct_update is not None:
+                    return direct_update
             if (
                 _input_inplace_safe
                 and _add_with_inplace
