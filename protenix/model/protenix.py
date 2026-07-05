@@ -216,6 +216,10 @@ def _diffusion_transformer_sample_axis_enabled() -> bool:
     return _env_flag_enabled("PROTENIX_DIFFUSION_TRANSFORMER_SAMPLE_AXIS")
 
 
+def _triton_compact_diffusion_attention_enabled() -> bool:
+    return _env_flag_enabled("PROTENIX_TRITON_COMPACT_DIFFUSION_ATTENTION")
+
+
 def update_input_feature_dict(input_feature_dict: dict[str, Any]) -> dict[str, Any]:
     """
     Lines 1-3 of Algorithm 5 compute d_lm, v_lm, and pad_info utilized in the AtomAttentionEncoder.
@@ -1240,6 +1244,13 @@ class Protenix(nn.Module):
                 N_sample > 1 and _diffusion_transformer_sample_axis_enabled()
             )
             can_use_pair_bias_cache = cache_pair_bias
+            use_compact_triton_attention = (
+                can_use_pair_bias_cache
+                and not use_sample_axis_transformer
+                and N_sample > 1
+                and self.enable_efficient_fusion
+                and _triton_compact_diffusion_attention_enabled()
+            )
             if pair_bias_cache is not None and can_use_pair_bias_cache:
                 # Once the final per-block attention biases are cached, the
                 # transformer no longer reads z.  Pass the current pair tensor
@@ -1307,13 +1318,26 @@ class Protenix(nn.Module):
             pair_biases = None
             if can_use_pair_bias_cache:
                 if pair_bias_cache is None:
+                    # The compact Triton prototype keeps q/k/v flattened for
+                    # fast GEMMs but stores one pair bias per record.  Build the
+                    # same [record, 1, head, token, token] cache used by the
+                    # explicit sample-axis path, then let the attention kernel
+                    # map each flat sample lane back to its owning record.
+                    bias_has_sample_axis = (
+                        use_sample_axis_transformer or use_compact_triton_attention
+                    )
+                    token_mask_for_bias = (
+                        token_mask[:, None, :]
+                        if bias_has_sample_axis
+                        else token_mask_transformer
+                    )
                     with dm._diffusion_core_autocast(transformer_dtype):
                         pair_bias_cache = dm.diffusion_transformer.precompute_pair_biases(
                             z=z_batch,
-                            token_mask=token_mask_transformer,
+                            token_mask=token_mask_for_bias,
                             enable_efficient_fusion=self.enable_efficient_fusion,
                             z_sample_count=N_sample,
-                            z_sample_axis=use_sample_axis_transformer,
+                            z_sample_axis=bias_has_sample_axis,
                         )
                 pair_biases = pair_bias_cache
 

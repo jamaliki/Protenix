@@ -116,6 +116,28 @@ def _insert_sample_bias_axis(
     return bias[:, None]
 
 
+def _expand_compact_bias_for_flat_samples(
+    bias: torch.Tensor,
+    z_sample_count: Optional[int],
+) -> torch.Tensor:
+    """Materialize compact ``[B,1,H,N,N]`` bias for flat fallback attention."""
+
+    if z_sample_count is None or z_sample_count <= 1 or bias.dim() != 5:
+        return bias
+    if bias.shape[1] != 1:
+        return bias
+    return _repeat_bias_for_sample_lanes(bias[:, 0], z_sample_count)
+
+
+def triton_compact_diffusion_attention_enabled() -> bool:
+    return os.getenv("PROTENIX_TRITON_COMPACT_DIFFUSION_ATTENTION", "0").lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
 def fused_transition_residual_enabled() -> bool:
     return os.getenv("PROTENIX_TRITON_FUSED_TRANSITION_RESIDUAL", "0").lower() not in {
         "0",
@@ -347,9 +369,71 @@ class AttentionPairBias(nn.Module):
             )
 
         # Line 11: Multi-head attention with attention bias & gating.
+        compact_out = self._triton_compact_diffusion_attention(
+            q=q,
+            kv=kv,
+            bias=bias,
+            z_sample_count=z_sample_count,
+            z_sample_axis=z_sample_axis,
+        )
+        if compact_out is not None:
+            return compact_out
+
+        # The compact-bias cache is a memory optimization.  If the prototype
+        # attention kernel is disabled or rejects a shape, preserve correctness
+        # by expanding back to the current rank-4 SDPA ABI.
+        if not z_sample_axis and q.dim() == 3:
+            bias = _expand_compact_bias_for_flat_samples(bias, z_sample_count)
         q = self.attention(q_x=q, kv_x=kv, attn_bias=bias, inplace_safe=inplace_safe)
 
         return q
+
+    def _triton_compact_diffusion_attention(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        bias: torch.Tensor,
+        z_sample_count: Optional[int],
+        z_sample_axis: bool,
+    ) -> Optional[torch.Tensor]:
+        """Run the compact-bias Triton attention prototype when it is safe.
+
+        This is the production hook for the benchmarked boundary: keep
+        diffusion activations flattened as ``[record * sample, token, channel]``
+        so all linear layers stay on their fast path, but avoid materializing
+        the sample-repeated pair bias.  The Triton kernel maps each flat sample
+        lane back to its record when loading ``[record, head, token, token]``
+        bias.  It is opt-in until a full inference gate proves an end-to-end win.
+        """
+
+        if not triton_compact_diffusion_attention_enabled():
+            return None
+        if z_sample_axis or z_sample_count is None or z_sample_count <= 1:
+            return None
+        if q.dim() != 3 or kv.dim() != 3 or bias.dim() != 5 or bias.shape[1] != 1:
+            return None
+        try:
+            from protenix.model.modules.diffusion_attention_triton import (
+                triton_compact_bias_attention,
+            )
+        except Exception:
+            return None
+
+        q_proj, k_proj, v_proj = self.attention._prep_qkv(
+            q_x=q,
+            kv_x=kv,
+            apply_scale=True,
+        )
+        attn = triton_compact_bias_attention(
+            q_proj,
+            k_proj,
+            v_proj,
+            bias,
+            sample_count=z_sample_count,
+        )
+        if attn is None:
+            return None
+        return self.attention._wrap_up(attn.transpose(-2, -3), q)
 
     def project_pair_bias(
         self,
