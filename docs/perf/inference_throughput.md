@@ -4051,9 +4051,47 @@ Interpretation: the base-checkpoint high-width MPS result does not transfer to
 Protenix-v2.  V2's wider pairformer creates strong same-GPU contention during
 warmup and in the long token buckets, while timed denoising shifts substantial
 time into diffusion transformer/atom work under many concurrent contexts.
-Operational MPS still helps, but for Sam-style v2 predictions the honest
-headline is `4.62` generated samples/s at B8/8 (`1.40x` over current v2
-single-process), not the base-checkpoint `6.72` generated samples/s result.
+That historical gate showed MPS helping Sam-style v2 predictions, but even
+there the v2-specific headline was `4.62` generated samples/s at B8/8
+(`1.40x` over that commit's v2 single-process), not the base-checkpoint `6.72`
+generated samples/s result.
+
+Current-head repeat: after the production direct-recompute triangle path was
+added, commit `55c6974` repeated the v2 B8/8 MPS operating point rather than
+assuming the historical `4.62` row still held.  Jobs `111440`
+(`runs/v2_mps_direct_recompute_nsample5_55c6974_20260705_005857`) and `111654`
+(`runs/v2_mps_direct_recompute_nsample5_noprefetch_55c6974_20260705_012324`)
+ran on `gpu-canary-0`; job `112128`
+(`runs/v2_mps_direct_recompute_nsample5_gpu10_55c6974_20260705_020920`) repeated
+the no-prefetch B8/8 gate on normal node `gpu-10`.
+
+| run | workers | MPS % | batch | prefetch | direct recompute | generated samples/s | interpretation |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `111440`, canary | 8 | 12 | 8 | on | off | `3.71` | stale MPS row did not reproduce |
+| `111440`, canary | 8 | 12 | 8 | on | on | `3.94` | `1.062x` vs paired off, but still slow |
+| `111654`, canary | 8 | 12 | 8 | off | off | `3.67` | prefetch was not the cause |
+| `111654`, canary | 8 | 12 | 8 | off | on | `3.90` | `1.063x` vs paired off |
+| `112128`, `gpu-10` | 8 | 12 | 8 | off | off | `3.70` | normal node reproduced the slower rate |
+| `112128`, `gpu-10` | 8 | 12 | 8 | off | on | `3.94` | current best verified B8/8 v2 MPS point |
+
+A direct-on shape scout on canary, job `111877`
+(`runs/v2_mps_direct_recompute_shape_scout_55c6974_20260705_014549`), also did
+not find a better current MPS point:
+
+| workers | MPS % | batch | generated samples/s |
+| ---: | ---: | ---: | ---: |
+| 4 | 25 | 16 | `3.60` |
+| 5 | 20 | 16 | `3.72` |
+| 6 | 16 | 12 | `3.66` |
+
+Decision: keep MPS documented as an operational option, but do not quote the
+old v2 `4.62` generated samples/s row as current without reproducing it.  The
+direct-recompute triangle path helped consistently under MPS (`~1.06x`), but
+the current wide-v2 MPS bottleneck is diffusion-heavy context contention, not
+the triangle boundary alone.  The current verified v2 `N_sample=5` MPS number
+is `3.94` generated samples/s, about `1.40x` over the current single-process
+direct-recompute gate (`2.82` generated samples/s) and about `8.1x` over the
+matched upstream-compatible v2 wall baseline (`0.489` generated samples/s).
 
 Protenix-v2 mixed-token pairformer profile: jobs `105740` and `105741` captured
 the two physical pairformer block shapes used by the sorted Sam-style

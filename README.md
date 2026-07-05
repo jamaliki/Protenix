@@ -371,7 +371,7 @@ dumping:
 | Same mixed-token `N_sample=1` workload, many campaign shards on one H100, base checkpoint | 0.166 records/s original low-sample boundary | 1.77 records/s with five `--batch_size 16` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20` | 10.7x per-GPU operational throughput |
 | Same mixed-token `N_sample=5` workload, many campaign shards on one H100, base checkpoint | 0.753 generated samples/s original low-sample boundary | 6.72 generated samples/s with sixteen `--batch_size 4` workers under CUDA MPS using `/tmp` MPS sockets and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=6` | 8.9x per-GPU operational throughput |
 | Same Protenix-v2 mixed-token workload, many campaign shards on one H100, `N_sample=1` | current v2 single-process reference: 0.796 records/s at `--batch_size 16`; a pristine original v2 default still needs measuring | 1.25 records/s with five `--batch_size 16` workers under CUDA MPS at 20% | 1.57x over current v2 single-process throughput |
-| Same Protenix-v2 mixed-token workload, many campaign shards on one H100, `N_sample=5` | current v2 single-process reference: 3.29 generated samples/s at `--batch_size 16` | 4.62 generated samples/s with eight `--batch_size 8` workers under CUDA MPS at 12%; ten `--batch_size 4` workers were slightly slower and sixteen B4 workers OOMed | 1.40x over current v2 single-process throughput |
+| Same Protenix-v2 mixed-token workload, many campaign shards on one H100, `N_sample=5` | current v2 single-process direct-recompute reference: 2.82 generated samples/s at `--batch_size 16`; the older 3.29 single-process row did not reproduce at current HEAD | current repeat: 3.94 generated samples/s with eight `--batch_size 8` workers under CUDA MPS at 12% plus `PROTENIX_TRITON_TRIANGLE_DIRECT_RECOMPUTE_GATE=1`; an older 4.62 MPS row should be treated as historical until reproduced | 1.40x over current single-process direct-recompute throughput; about 8.1x over the executable upstream-compatible v2 wall baseline |
 
 The matched Protenix-v2 rows use an "upstream-compatible" control because the
 pristine upstream `fast_layer_norm_cuda_v2` extension currently fails to build
@@ -395,11 +395,14 @@ mixed-token, low-sample v2 campaigns, the matched upstream-compatible gate is
 now about `2.7-2.8x` end to end after skipping wasted strict-checkpoint weight
 initialization, not the base-checkpoint `5-6x` headline.  Older warmed
 current-only v2 gates reached `3.29-3.41` generated samples/s at
-`--batch_size 16` with `N_sample=5`, and same-GPU MPS raised that current-only
-rate to `4.62` generated samples/s with eight B8 workers; those are useful
-capacity numbers, but they are not matched speedups over upstream.  The
-remaining cost is split between the wider pairformer and denoising work, so the
-next large win needs true
+`--batch_size 16` with `N_sample=5`, and one same-GPU MPS gate raised that
+current-only rate to `4.62` generated samples/s with eight B8 workers.  A
+current repeat at commit `55c6974`, however, did not reproduce that absolute
+MPS rate: the same B8/8 setting measured `3.70` generated samples/s with the
+direct triangle flag off and `3.94` with it on.  Treat `4.62` as historical
+until reproduced on your node; the direct triangle flag itself was consistent
+(`~1.06x` under MPS).  The remaining cost is split between the wider pairformer
+and denoising work, so the next large win needs true
 ragged/segmented pairformer work rather than more queue bucket tuning or
 blindly adding MPS workers.
 Seeing `token-trunk+diffusion-token-atom-batch` in the log means batching is
@@ -528,8 +531,10 @@ Important details:
   mode and for `N_sample=1`, use `--batch_size 16` with five workers at 20%.
   For maximum base-checkpoint `N_sample=5` aggregate throughput, the current
   best gate is `--batch_size 4` with sixteen workers at 6%.  For Protenix-v2
-  `N_sample=5`, use `--batch_size 8` with eight workers at 12%; v2 B4/10 was
-  slightly slower and v2 B4/16 ran out of memory.
+  `N_sample=5`, the historical best was `--batch_size 8` with eight workers at
+  12%, but current HEAD repeated that setting at only `3.94` generated samples/s
+  with the direct triangle flag on.  Validate MPS on your target node before
+  quoting it as a maximum.
 - Start CUDA MPS with pipe and log directories on a node-local filesystem such
   as `/tmp`.  Do not put `CUDA_MPS_PIPE_DIRECTORY` on Lustre; the MPS control
   socket may fail there.
@@ -542,15 +547,20 @@ Important details:
   per-worker batches helped once MPS recovered occupancy: sixteen
   `--batch_size 4` workers at 6% reached `6.72` generated samples/s after the
   triangle LN+q/k/v default, about `1.61x` over the current single-process
-  rate (`4.18` generated samples/s).  For Protenix-v2 `N_sample=5`, the best
-  measured point is eight `--batch_size 8` workers at 12%, `4.62` generated
-  samples/s or `1.40x` over current v2 single-process.  This v2 result is the
-  right number to quote for Sam-style predictions; do not reuse the base-model
+  rate (`4.18` generated samples/s).  For Protenix-v2 `N_sample=5`, the older
+  best measured point was eight `--batch_size 8` workers at 12%, `4.62`
+  generated samples/s or `1.40x` over the then-current v2 single-process
+  reference.  The current repeat reached only `3.94` generated samples/s with
+  `PROTENIX_TRITON_TRIANGLE_DIRECT_RECOMPUTE_GATE=1`, so quote the newer number
+  unless you have reproduced the old MPS row locally; do not reuse the base-model
   `6.72` generated samples/s row for v2.
 - Keep `PROTENIX_PREFETCH_DATALOADER=1` for long MPS campaigns if host memory
   allows it, but treat it as a modest host-overlap polish rather than the main
   speedup.  In paired five-worker MPS gates it added `1-2%` throughput while
-  leaving summed model-predict time essentially unchanged.
+  leaving summed model-predict time essentially unchanged.  For the current v2
+  B8/8 MPS repeat, prefetch did not rescue throughput (`3.94` with it on and
+  `3.90` with it off under the direct triangle flag), so do not rely on
+  prefetch to fix v2 MPS contention.
 - No-MPS multi-process concurrency helped only modestly (`4.19` generated
   samples/s at four workers), so use MPS if you choose this operational mode.
 
