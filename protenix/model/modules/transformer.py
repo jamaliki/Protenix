@@ -379,9 +379,9 @@ class AttentionPairBias(nn.Module):
         if compact_out is not None:
             return compact_out
 
-        # The compact-bias cache is a memory optimization.  If the prototype
-        # attention kernel is disabled or rejects a shape, preserve correctness
-        # by expanding back to the current rank-4 SDPA ABI.
+        # Compact bias is a memory optimization, not a semantic change.  If the
+        # specialized Triton kernel is disabled or rejects a shape, expand the
+        # cached record-level bias back to the normal rank-4 SDPA ABI.
         if not z_sample_axis and q.dim() == 3:
             bias = _expand_compact_bias_for_flat_samples(bias, z_sample_count)
         q = self.attention(q_x=q, kv_x=kv, attn_bias=bias, inplace_safe=inplace_safe)
@@ -396,14 +396,15 @@ class AttentionPairBias(nn.Module):
         z_sample_count: Optional[int],
         z_sample_axis: bool,
     ) -> Optional[torch.Tensor]:
-        """Run the compact-bias Triton attention prototype when it is safe.
+        """Run compact-bias Triton attention when the profiled contract matches.
 
-        This is the production hook for the benchmarked boundary: keep
+        This is the production hook for the benchmarked v2 boundary: keep
         diffusion activations flattened as ``[record * sample, token, channel]``
         so all linear layers stay on their fast path, but avoid materializing
         the sample-repeated pair bias.  The Triton kernel maps each flat sample
         lane back to its record when loading ``[record, head, token, token]``
-        bias.  It is opt-in until a full inference gate proves an end-to-end win.
+        bias.  The path remains opt-in because it is narrower than SDPA and is
+        BF16-close rather than bitwise identical.
         """
 
         if not triton_compact_diffusion_attention_enabled():

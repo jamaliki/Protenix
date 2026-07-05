@@ -5571,6 +5571,17 @@ Production code touched by the throughput stack:
   Triton gate kernels with PyTorch fallbacks, including the 64-bit-indexed
   split-aware `silu(first_half) * second_half` consumer for concatenated
   transition projections.
+- `protenix/model/modules/transition_dual_gemm_triton.py`: inference-only
+  dual-GEMM `silu(y @ Wa.T) * (y @ Wb.T)` producer for large Pairformer
+  transition row batches.  This is a generic gated-MLP boundary, but the current
+  launch policy is tuned for the Protenix base/v2 hidden sizes.
+- `protenix/model/modules/diffusion_attention_triton.py`: compact-bias
+  full-token attention for repeated samples.  It keeps q/k/v flattened as
+  `[record * sample, head, token, head_dim]` while loading additive attention
+  bias from `[record, head, token, token]`.  This is the cleanest reusable
+  kernel from the v2 MPS work because the idea is not protein-specific:
+  sampling/ensembling workloads often repeat q/k/v lanes while the mask or
+  conditioning bias is invariant across samples.
 - `protenix/model/layer_norm/layer_norm.py`: dispatches to the Triton/PyTorch
   LayerNorm fallback when the C++ fast LayerNorm extension is unavailable.
 - `protenix/model/layer_norm/layer_norm_triton.py`: low-precision
@@ -5590,6 +5601,12 @@ Production code touched by the throughput stack:
   dual gated GEMM for short physical pair buckets.  It is guarded by dtype,
   no-grad CUDA, `c_z=256`, and a default <=300k physical-row cap because the
   same boundary loses on the long Sam-style bucket.
+- `protenix/model/triangular/triangle_direct_recompute_gate_triton.py`:
+  default-off v2 triangle-update schedule that groups exact-token buckets,
+  writes CUEQ contraction inputs directly, and recomputes the output gate input
+  instead of storing/reloading a compact normalized tensor.  This is a useful
+  HBM-vs-recompute lesson, but it is tightly coupled to Protenix-v2's triangle
+  multiplication module and should not be treated as a general-purpose kernel.
 - `protenix/model/modules/confidence.py` and `protenix/model/protenix.py`:
   confidence-logit chunk iteration, streaming summary consumption, and the
   mixed-token diffusion sampler that pads/masks conditioning, token-transformer,
@@ -5604,6 +5621,18 @@ Production code touched by the throughput stack:
   `runner/inference.py` also contains the opt-in
   `PROTENIX_PREFETCH_DATALOADER=1` background prefetch queue that overlaps
   featurization of the next CPU batch with current GPU prediction.
+
+Kernel portability inventory:
+
+| category | count | kernels | outside-repo value |
+| --- | ---: | --- | --- |
+| Broadly reusable with a small wrapper | 4 | compact-bias repeated-sample attention, dual-GEMM gated-MLP producer, simple fused elementwise gates, inference LayerNorm fallback | These are ordinary GPU patterns that can be lifted into other PyTorch inference systems if their shape guards match. |
+| Pattern reusable but consumer-specific | 3 | fixed-window atom local attention, local-attention bias producer, CUEQ q/k/v layout producer | The mechanisms are general, but each needs a matching consumer layout/window. |
+| Protenix/CUEQ-specific | 4 | triangle LN+q/k/v producer, triangle LN+dual-GEMM producer, triangle output-gate residual fusion, direct v2 triangle recompute gate | Keep these as repo kernels or as design notes; the assumptions are mostly AF3/Protenix triangle-update structure. |
+
+So the honest answer is: about four kernels are reusable outside Protenix as
+kernel primitives, about seven are useful as transferable optimization patterns,
+and the remaining production kernels are valuable mainly inside Protenix.
 
 Profiling and reproducibility helpers:
 

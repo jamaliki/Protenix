@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Triton prototype for diffusion token attention with compact pair bias.
+"""Triton diffusion token attention with compact sample-invariant pair bias.
 
 The production low-sample diffusion path flattens records and samples before
 token attention:
@@ -20,14 +20,16 @@ token attention:
     q/k/v: [record * sample, head, token, head_dim]
 
 That shape keeps PyTorch/cuDNN SDPA on its fast rank-4 schedule, but the pair
-bias is sample-invariant and must currently be materialized as
-``[record * sample, head, token, token]``.  At the v2 MPS memory cliff this
-sample repeat is a real cost.
+bias is sample-invariant.  Materializing it as
+``[record * sample, head, token, token]`` repeats the same bias for every
+sample lane and was the live-memory cliff in the Protenix-v2 MPS gate.
 
-This module is deliberately not enabled in model code yet.  It provides the
-smallest reusable kernel for a benchmark: keep the fast flat q/k/v ABI, but load
-bias from compact ``[record, head, token, token]`` by mapping
-``record = flat_batch // sample_count`` inside the attention program.
+This kernel keeps the fast flat q/k/v ABI, but loads bias from compact
+``[record, head, token, token]`` storage by mapping
+``record = flat_batch // sample_count`` inside the attention program.  It is
+still shape-specialized: one Triton program owns a query tile and the full key
+axis, so it is meant for the short diffusion-token lengths used here rather
+than arbitrary long-sequence attention.
 """
 
 from __future__ import annotations
@@ -44,6 +46,34 @@ except ImportError:  # pragma: no cover - optional runtime dependency.
 
 def _next_power_of_2(value: int) -> int:
     return 1 << (value - 1).bit_length()
+
+
+_SUPPORTED_DTYPES = {torch.bfloat16, torch.float16}
+_MAX_TOKENS = 256
+_MAX_HEAD_DIM = 64
+_DEFAULT_BLOCK_M = 16
+_DEFAULT_NUM_WARPS = 4
+
+
+def _is_power_of_2(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _compact_bias_4d(bias: torch.Tensor) -> torch.Tensor | None:
+    """Normalize accepted compact bias layouts to ``[record, head, query, key]``.
+
+    Model code caches compact diffusion bias as ``[record, 1, head, N, N]`` so
+    ordinary SDPA can broadcast the singleton sample axis if this Triton path is
+    disabled.  The kernel itself only needs the squeezed rank-4 view.
+    """
+
+    if bias.dim() == 5:
+        if bias.shape[1] != 1:
+            return None
+        return bias[:, 0]
+    if bias.dim() == 4:
+        return bias
+    return None
 
 
 if triton is not None and tl is not None:
@@ -154,16 +184,22 @@ def triton_compact_bias_attention(
     bias: torch.Tensor,
     *,
     sample_count: int,
-    block_m: int = 16,
+    block_m: int = _DEFAULT_BLOCK_M,
     block_n: int | None = None,
-    num_warps: int = 4,
+    num_warps: int = _DEFAULT_NUM_WARPS,
     dot_input_precision: str = "tf32",
 ) -> torch.Tensor | None:
     """Return attention output for flat q/k/v and compact record-level bias.
 
-    The result has the same shape/layout as ``q``.  ``None`` means the guard
-    rejected the shape, so callers can fall back to PyTorch SDPA without
-    changing model semantics.
+    ``q``, ``k``, and ``v`` are shaped
+    ``[record * sample_count, head, token, head_dim]``.  ``bias`` is shaped
+    either ``[record, head, token, token]`` or
+    ``[record, 1, head, token, token]``.  The result has the same shape/layout
+    as ``q``.
+
+    Return ``None`` when the shape is outside this specialized kernel's
+    contract.  Callers should then fall back to the normal SDPA path, expanding
+    compact bias if necessary, so correctness does not depend on this kernel.
     """
 
     if triton is None or tl is None:
@@ -174,25 +210,24 @@ def triton_compact_bias_attention(
         return None
     if q.dim() != 4 or k.shape != q.shape or v.shape != q.shape:
         return None
-    if bias.dim() == 5:
-        if bias.shape[1] != 1:
-            return None
-        bias = bias[:, 0]
-    if bias.dim() != 4:
+    bias = _compact_bias_4d(bias)
+    if bias is None:
         return None
-    if q.dtype not in {torch.bfloat16, torch.float16}:
+    if q.dtype not in _SUPPORTED_DTYPES:
         return None
 
     flat_batch, heads, n_tokens, head_dim = q.shape
+    if n_tokens <= 0 or head_dim <= 0:
+        return None
     if flat_batch % sample_count != 0:
         return None
     if bias.shape != (flat_batch // sample_count, heads, n_tokens, n_tokens):
         return None
-    if head_dim > 64 or n_tokens > 256:
+    if head_dim > _MAX_HEAD_DIM or n_tokens > _MAX_TOKENS:
         return None
 
     block_n = _next_power_of_2(n_tokens) if block_n is None else block_n
-    if block_n < n_tokens:
+    if block_m <= 0 or not _is_power_of_2(block_n) or block_n < n_tokens:
         return None
     block_d = _next_power_of_2(head_dim)
     out = torch.empty_like(q)
